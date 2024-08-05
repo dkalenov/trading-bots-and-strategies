@@ -24,14 +24,14 @@ def get_klines(symbol, interval):
 
 # get close data
 def get_close_data(klines):
-    close = [float(i[4] for i in klines)]
+    close = [float(i[4]) for i in klines]
     close = close[::-1] # at Bybit the newest candle is the first but talib expects to get the first candle as the oldest one so we need to reverse the list (Binace is oldest to newest)
     close = np.array(close)
     return close
 
 # SMA
 def get_sma(close):
-    SMA = abstract.Fuction('sma') 
+    SMA = abstract.Function('sma') 
     data = SMA(close, timeperiod=25) # 25 periods, we can add some more periods if needed
     return data
 
