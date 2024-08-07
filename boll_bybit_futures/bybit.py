@@ -49,7 +49,7 @@ class BybitApi:
             sign = self.gen_signature(params_get_string, timestamp)
             self.headers['X-BAPI-SIGN'] = sign
             self.headers['X-BAPI-TIMESTAMP'] = timestamp
-            response = requests.get(url=self.BASE_LINK + endpoint, data=json.dumps(params), headers=self.headers)
+            response = requests.post(url=self.BASE_LINK + endpoint, data=json.dumps(params), headers=self.headers)
 
         else:
             print('This method is not supported')
