@@ -129,4 +129,49 @@ class Bot:
             self.place_tp_order(symbol, price, t_position_amt, direction)
 
     def run(self):
-        pass
+        while True:
+            x = client.futures_get_open_orders(symbol=self.symbol)
+            df1 = pd.DataFrame(x)
+            if len(df1) == 0:
+                self.draw_grid(self.n)
+            y = client.futures_position_information(symbol=self.symbol)
+            df2 = pd.DataFrame(y)
+            df2 = df2.loc[df2["positionAmt"] != "0.000"]
+            if len(df2) > 0:
+                direction = self.get_direction(self.symbol)
+                try:
+                    if direction == "LONG":
+                        print("close buy")
+                        self.close_sell_orders(self.symbol)
+                    if direction == "SHORT":
+                        print("close sell")
+                        self.close_buy_orders(self.symbol)
+                except:
+                    pass
+                price0, amount0 = self.cal_tp_level(self.symbol, self.tp)
+                self.place_tp_order(self.symbol, price0, amount0, direction)
+                is_ok = True
+                while is_ok:
+                    try:
+                        price1, amount1 = self.cal_tp_level(self.symbol, self.tp)
+                        print(f"price: {price1} amount: {amount1}")
+                        if price1 != price0 or amount1 != amount0:
+                            if direction == "LONG":
+                                self.close_sell_orders(self.symbol)
+                            if direction == "SHORT":
+                                self.close_buy_orders(self.symbol)
+                            self.place_tp_order(self.symbol, price1, amount1, direction)
+                            price0 = price1
+                            amount0 = amount1
+                    except:
+                        pass
+
+                    y = client.futures_position_information(symbol=self.symbol)
+                    df2 = pd.DataFrame(y)
+                    df2 = df2.loc[df2["positionAmt"] != "0.000"]
+                    if len(df2) == 0:
+                        try:
+                            self.close_orders(self.symbol)
+                            is_ok = False
+                        except:
+                            pass
