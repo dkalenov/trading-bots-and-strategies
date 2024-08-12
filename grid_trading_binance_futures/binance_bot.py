@@ -81,3 +81,52 @@ class Bot:
         x = client.get_symbol_ticker(symbol=symbol)
         price = float(x["price"])
         return price
+
+    def draw_grid(self, n):
+        pct_change = 1
+        adj_sell = 1.2
+        current_price = self.get_mark_price(self.symbol)
+        for i in range(n):
+            sell_price = float(
+                round(((pct_change / 100) * current_price * adj_sell * self.proportion) + current_price, self.no_of_decimals))
+            self.sell_limit(self.symbol, self.volume, sell_price)
+            pct_change += 1
+            adj_sell += 0.2
+
+        pct_change = -1
+        adj_buy = 1.2
+        current_price = self.get_mark_price(self.symbol)
+        for i in range(n):
+            buy_price = float(
+                round(((pct_change / 100) * current_price * adj_sell * self.proportion) + current_price, self.no_of_decimals))
+            self.buy_limit(self.symbol, self.volume, buy_price)
+            pct_change -= 1
+            adj_buy += 0.2
+
+    def cal_tp_level(self, symbol, tp):
+        try:
+            x = client.futures_position_information(symbol=symbol)
+            df = pd.DataFrame(x)
+            df = df.loc[df["positionAmt"] != "0.000"]
+            t_margin = (float(df["entryPrice"][0]) * abs(float(df["positionAmt"][0]))) / float(df["leverage"][0])
+            profit = float(t_margin * tp * 0.01)
+            price = round((profit / float(df["positionAmt"][0])) + float(df["entryPrice"][0]), self.no_of_decimals)
+            t_position_amt = 0
+            for index in df.index:
+                t_position_amt += abs(float(df["positionAmt"][index]))
+            return price, t_position_amt
+
+        except:
+            pass
+
+    def place_tp_order(self, symbol, price, t_position_amt, direction):
+        try:
+            if direction == "LONG":
+                self.sell_limit(symbol, t_position_amt, price)
+            if direction == "SHORT":
+                self.buy_limit(symbol, t_position_amt, price)
+        except:
+            self.place_tp_order(symbol, price, t_position_amt, direction)
+
+    def run(self):
+        pass
