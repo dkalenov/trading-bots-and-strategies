@@ -1,1 +1,2 @@
-
+api = 'YOUR BINANCE API'
+api_secret = 'YOUR BINANCE SECRET API'
