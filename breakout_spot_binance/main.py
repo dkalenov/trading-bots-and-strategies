@@ -1,3 +1,4 @@
+
 from config import api_key, secret_key
 import requests
 from binance.client import Client
@@ -58,3 +59,23 @@ def sort_list(list):
     df = df[df.symbol.str.contains('USDT')]
     getted_list = df['symbol'].to_list()
     return getted_list
+
+def get_klines(symbol_list):
+    global volume_dict
+    global extremum_dict
+    df = pd.DataFrame(columns=[symbol_list], index=['high', 'low'])
+    for symbol in symbol_list:
+        kline = client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_1DAY, limit=1)
+        df.loc['high', symbol] = float(kline[0][2]) # add high kline to the first row
+        df.loc['low', symbol] = float(kline[0][3]) # add low kline to the second row
+        volume_dict[symbol] = None
+
+    df = df.T
+    data_dict = df.to_dict()
+    for symbol, value_dict in data_dict.items():
+        for key in value_dict.keys():
+            extremum_dict[key[0]] = {'high': data_dict['high'][key], 'low': data_dict['low'][key]}
+    print(extremum_dict)
+
+#sorted_list = sort_list(get_spot_list())
+#get_klines(sorted_list)
