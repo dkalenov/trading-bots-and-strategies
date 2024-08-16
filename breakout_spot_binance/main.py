@@ -79,3 +79,59 @@ def get_klines(symbol_list):
 
 #sorted_list = sort_list(get_spot_list())
 #get_klines(sorted_list)
+
+async def socket(symbol_list):
+        global volume_dict
+
+        url = "wss://stream.binance.com:9443/stream?streams="
+        
+        async with websockets.connect(url, ping_interval=None) as websocket:
+            message = {
+                    "method": "SUBSCRIBE",
+                    "params": [f"{symbol.lower()}@kline_1d" for symbol in symbol_list],
+                    "id": 1
+                }
+            print(message)
+            await websocket.send(json.dumps(message))
+            data = json.loads(await websocket.recv())
+            async for message in websocket:
+                data = json.loads(message)
+                # print(data)
+
+                symbol = data.get('data', {}).get('k', {}).get('s', None)
+                close_price = float(data.get('data', {}).get('k', {}).get('c', None))
+                volume = float(data.get('data', {}).get('k', {}).get('q', None))
+                kline_close = data.get('data', {}).get('k', {}).get('x', None)
+
+                if kline_close == True or volume_dict[symbol] == None:
+                    volume_dict[symbol] = volume
+                    print(volume_dict)
+                compare_price_df(close_price, symbol, volume)
+
+def compare_price_df(price, symbol, volume):
+    global volume_dict
+    high = extremum_dict[symbol]['high']
+    low = extremum_dict[symbol]['low']
+    try:
+        delta_volume = int(volume / volume_dict[symbol])
+    except:
+        delta_volume = 0
+
+    if (price <= 1.005*high and price >= high) and (delta_volume >= X):
+        print(f"found situation on {symbol}. High is {high}")
+        orders(price, symbol)
+    elif (price >= 0.955*low and price <= low) and (delta_volume >= X):
+        print("for futures trading")
+    if price >= 1.005*high or price <= low*0.995:
+        pass
+        print('delete extremum and add new')
+
+def cut_zeros(n):
+    n = str(n)
+    dec_part = n.split('0')
+    return dec_part
+
+def count(n):
+    num_str = str(n)
+    decimal_count = len(num_str.split('.')[1])
+    return decimal_count
