@@ -1,4 +1,3 @@
-
 from config import api_key, secret_key
 import requests
 from binance.client import Client
@@ -135,3 +134,85 @@ def count(n):
     num_str = str(n)
     decimal_count = len(num_str.split('.')[1])
     return decimal_count
+
+def getPrecision(symbol):
+    spot_info = client.get_exchange_info()
+    for x in range(0, len(spot_info['symbols'])):
+        symbol_info = spot_info['symbols'][x]['symbol']
+        if symbol_info == symbol:
+            limit_precision = spot_info['symbols'][x]['filters'][0]['minPrice']
+            order_ava = spot_info['symbols'][x]['orderTypes']
+            print(order_ava)
+            qty = spot_info['symbols'][x]['filters'][1]['minQty']
+            limit_precision = cut_zeros(limit_precision)
+            qty = cut_zeros(qty)
+            qty = count(qty)
+            limit_precision = count(limit_precision)
+            return qty, limit_precision
+        
+
+def orders(price, symbol):
+    qty, precision = getPrecision(symbol)
+    print(qty, precision) 
+    quantity = round(budget / price, qty)
+    print(quantity)
+
+    buy_order = client.create_order(symbol=symbol, 
+                                    side='BUY', 
+                                    type='MARKET', 
+                                    quantity=quantity
+                                    )
+    
+    print(buy_order)
+    stopPrice = price * stop
+
+    stop_loss = client.create_order(symbol=symbol, 
+                                    side='SELL', 
+                                    type='STOP_LOSS_LIMIT', 
+                                    quantity=quantity,
+                                    price=round(stopPrice, precision),
+                                    stopPrice=round(stopPrice, precision),
+                                    timeInForce='GTC'
+                                    )
+    print(stop_loss)
+    binsocket(symbol, price, quantity)
+    return
+
+def binsocket(symbol, buy_price, quantity):
+    socket = unicorn_binance_websocket_api.BinanceWebSocketApiManager(exchange='binance.com')
+    socket.create_stream(['kline_1d'], symbol, output='UnicornFy')
+    while True:
+        data = socket.pop_stream_data_from_stream_buffer()
+        if data:
+            try:
+                price = float(data['kline']['close_price'])
+                print(f"price:\t{price}")
+                if price > buy_price:
+                    buy_price = price
+                trailing_stop = buy_price * trailing_stop_factor
+                print(f"buy price:\t{buy_price}")
+                print('****************************')
+                if price < trailing_stop:
+                    sell_order = client.create_order(symbol=symbol,
+                                                    side='SELL',
+                                                    type='MARKET',
+                                                    quantity=quantity
+                                                    )
+                    print(sell_order)
+                    return
+            except:
+                pass
+
+if __name__ == "__main__":
+    get_spot_list()
+    get_futures_list()
+    
+    getted_list = [item for item in spot_list if item not in futures_list]
+
+    sorted_list = sort_list(getted_list)
+    
+    get_klines(sorted_list)
+    
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(socket(sorted_list))
+
