@@ -1,6 +1,27 @@
 import numpy as np
 
 
+def ATR_numpy(candles, period=14):
+    candles_np = np.array(candles).astype(float)
+    close = candles_np[:, 4]
+    high = candles_np[:, 2]
+    low = candles_np[:, 3]
+
+    prev_close = np.roll(close, 1)
+    tr1 = high - low
+    tr2 = np.abs(high - prev_close)
+    tr3 = np.abs(low - prev_close)
+    tr = np.maximum(np.maximum(tr1, tr2), tr3)
+
+    atr = np.zeros_like(close)
+    atr[period] = np.mean(tr[:period])
+    for i in range(period + 1, len(close)):
+        atr[i] = ((period - 1) * atr[i - 1] + tr[i]) / period
+
+    return atr
+
+
+
 def SuperTrend_numpy(candles, period=10, multiplier=3):
     """
     Computes the Supertrend indicator given the OHLC data (open, high, low, close).
