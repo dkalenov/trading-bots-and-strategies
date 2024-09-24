@@ -216,58 +216,58 @@ async def handle_kline(ws, msg):
         print(f"Error handling kline: {e}")
 
 
+#  check the function 
 
+# def calculate_indicator(indicator_func, candles, results_queue, index):
+#     """
+#     Функция для вычисления индикатора в отдельном потоке.
+#     :param indicator_func: Функция для расчета индикатора
+#     :param candles: Данные для расчета
+#     :param results_queue: Очередь для результатов
+#     :param index: Индекс результата
+#     """
+#     result = indicator_func(candles)
+#     results_queue.put((index, result))
 
-def calculate_indicator(indicator_func, candles, results_queue, index):
-    """
-    Функция для вычисления индикатора в отдельном потоке.
-    :param indicator_func: Функция для расчета индикатора
-    :param candles: Данные для расчета
-    :param results_queue: Очередь для результатов
-    :param index: Индекс результата
-    """
-    result = indicator_func(candles)
-    results_queue.put((index, result))
+# async def calculate_indicators(symbol, candles):
+#     try:
+#         results_queue = queue.Queue()
 
-async def calculate_indicators(symbol, candles):
-    try:
-        results_queue = queue.Queue()
+#         # Запуск расчетов индикаторов в отдельных потоках
+#         threads = [
+#             threading.Thread(target=calculate_indicator, args=(SuperTrend_numpy, candles, results_queue, 0)),
+#             threading.Thread(target=calculate_indicator, args=(ATR_numpy, candles, results_queue, 1)),
+#             threading.Thread(target=calculate_indicator, args=(ADX_numpy, candles, results_queue, 2))
+#         ]
 
-        # Запуск расчетов индикаторов в отдельных потоках
-        threads = [
-            threading.Thread(target=calculate_indicator, args=(SuperTrend_numpy, candles, results_queue, 0)),
-            threading.Thread(target=calculate_indicator, args=(ATR_numpy, candles, results_queue, 1)),
-            threading.Thread(target=calculate_indicator, args=(ADX_numpy, candles, results_queue, 2))
-        ]
+#         for thread in threads:
+#             thread.start()
 
-        for thread in threads:
-            thread.start()
+#         for thread in threads:
+#             thread.join()
 
-        for thread in threads:
-            thread.join()
+#         results = [None] * 3
+#         for _ in range(3):
+#             index, result = results_queue.get()
+#             results[index] = result
 
-        results = [None] * 3
-        for _ in range(3):
-            index, result = results_queue.get()
-            results[index] = result
+#         supertrend_result, atr_result, adx_result = results
 
-        supertrend_result, atr_result, adx_result = results
+#         # Добавляем отладку для проверки значений
+#         print(f"Symbol: {symbol}")
+#         print(f"Supertrend result: {supertrend_result[-5:]}")
+#         print(f"ATR result: {atr_result[-5:]}")
+#         print(f"ADX result: {adx_result[-5:]}")
 
-        # Добавляем отладку для проверки значений
-        print(f"Symbol: {symbol}")
-        print(f"Supertrend result: {supertrend_result[-5:]}")
-        print(f"ATR result: {atr_result[-5:]}")
-        print(f"ADX result: {adx_result[-5:]}")
-
-        return {
-            'symbol': symbol,
-            'supertrend': supertrend_result,
-            'atr': atr_result,
-            'adx': adx_result
-        }
-    except Exception as e:
-        print(f"Error calculating indicators for {symbol}: {e}")
-        return None
+#         return {
+#             'symbol': symbol,
+#             'supertrend': supertrend_result,
+#             'atr': atr_result,
+#             'adx': adx_result
+#         }
+#     except Exception as e:
+#         print(f"Error calculating indicators for {symbol}: {e}")
+#         return None
 
 
 
