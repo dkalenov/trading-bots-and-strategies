@@ -1,1 +1,2 @@
+Supertrend Bot
 
