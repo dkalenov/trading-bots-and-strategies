@@ -85,3 +85,45 @@ class ConfigInfo:
                     pass
             # присваиваем значение значению класса
             setattr(self, key, value)
+
+async def connect(host, port, user, password, db_name):
+    # глобальная переменная сессии
+    global Session
+    # создаем асинхронный движок для работы с БД используя конфигурацию из config.py
+    engine = create_async_engine(f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{db_name}")
+    async with engine.begin() as conn:
+        # создаем таблицы
+        await conn.run_sync(Base.metadata.create_all)
+    # создаем сессию, expire_on_commit=False - чтобы она не уничтожалась после коммита
+    Session = async_sessionmaker(engine, expire_on_commit=False)
+    # возвращаем сессию
+    return Session
+
+
+async def load_config():
+    # создаем пустые поля в БД
+    for key in ConfigInfo.__annotations__.keys():
+        try:
+            async with Session() as s:
+                s.add(Config(key=key, value=None))
+                await s.commit()
+        except:
+            pass
+    # создание сессии для работы с БД
+    async with Session() as session:
+        # загрузка конфигурации
+        result = (await session.execute(select(Config))).scalars().all()
+        # преобразование данных
+        data = {row.key: row.value for row in result}
+        # возвращаем результат
+        return ConfigInfo(data)
+
+
+# функция для получения настроек для символа
+async def get_symbol_conf(symbol):
+    # создание сессии для работы с БД
+    async with Session() as s:
+        # получение настроек для символа
+        symbols = await s.execute(select(SymbolsSettings).where(SymbolsSettings.symbol == symbol))
+        # берем одну строку и возвращаем результат
+        return symbols.scalars().one()
