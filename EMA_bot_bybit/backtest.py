@@ -67,3 +67,16 @@ for month in months:
                     klines['Low'].append(float(row[3]))
                     klines['Close'].append(float(row[4]))
                     klines['Volume'].append(float(row[5]))
+
+
+df = pd.DataFrame(klines)
+print(df.tail())
+
+# класс стратегии
+class EMA(backtesting.Strategy):
+    
+    def init(self):
+        pass
+
+    def next(self):
+        pass
