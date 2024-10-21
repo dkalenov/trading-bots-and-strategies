@@ -1,0 +1,39 @@
+                            Date     Open     High      Low    Close    Volume
+499675 2024-09-30 23:35:00+00:00  63150.2  63261.0  63040.0  63055.7  2069.814
+499676 2024-09-30 23:40:00+00:00  63055.7  63079.8  62825.0  62952.1  5026.293
+499677 2024-09-30 23:45:00+00:00  62952.6  63231.3  62948.0  63217.0  3702.670
+499678 2024-09-30 23:50:00+00:00  63217.1  63276.1  63126.5  63263.2  1121.058
+499679 2024-09-30 23:55:00+00:00  63263.2  63340.0  63263.2  63309.1   773.551
+<ipython-input-5-80f4eed8e5a2>:97: UserWarning: Data index is not datetime. Assuming simple periods, but `pd.DateTimeIndex` is advised.
+  bt = backtesting.Backtest(df, EMA, cash=1000000, commission=.002)
+Start                                     0.0
+End                                  499679.0
+Duration                             499679.0
+Exposure Time [%]                    6.913024
+Equity Final [$]                          0.0
+Equity Peak [$]                 1604239.65232
+Return [%]                             -100.0
+Buy & Hold Return [%]              782.326051
+Return (Ann.) [%]                         0.0
+Volatility (Ann.) [%]                     NaN
+Sharpe Ratio                              NaN
+Sortino Ratio                             NaN
+Calmar Ratio                              0.0
+Max. Drawdown [%]                      -100.0
+Avg. Drawdown [%]                   -6.893581
+Max. Drawdown Duration               478917.0
+Avg. Drawdown Duration           18503.037037
+# Trades                                 10.0
+Win Rate [%]                             80.0
+Best Trade [%]                      33.534696
+Worst Trade [%]                   -101.391308
+Avg. Trade [%]                            0.0
+Max. Trade Duration                   20706.0
+Avg. Trade Duration                   13028.4
+Profit Factor                        1.093389
+Expectancy [%]                       1.459226
+SQN                                 -0.184394
+_strategy                                 EMA
+_equity_curve                        Equit...
+_trades                      Size  EntryBa...
+dtype: object
