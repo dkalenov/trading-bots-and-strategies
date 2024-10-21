@@ -72,11 +72,27 @@ for month in months:
 df = pd.DataFrame(klines)
 print(df.tail())
 
-# класс стратегии
+# класс стратегии на основе пересечения двух EMA
 class EMA(backtesting.Strategy):
+    # параметры стратегии
+    fast_ema_period = 12  # короткая EMA
+    slow_ema_period = 26  # длинная EMA
     
     def init(self):
-        pass
-
+        # инициализируем скользящие средние
+        self.fast_ema = self.I(ta.ema, self.data.Close, self.fast_ema_period)
+        self.slow_ema = self.I(ta.ema, self.data.Close, self.slow_ema_period)
+    
     def next(self):
-        pass
+        # если быстрая EMA пересекает медленную вверх, открываем длинную позицию
+        if crossover(self.fast_ema, self.slow_ema):
+            self.buy()
+        # если быстрая EMA пересекает медленную вниз, закрываем позицию
+        elif crossover(self.slow_ema, self.fast_ema):
+            self.sell()
+
+# запуск бэктеста
+bt = backtesting.Backtest(df, EMA, cash=10000, commission=.002)
+stats = bt.run()
+print(stats)
+bt.plot()
