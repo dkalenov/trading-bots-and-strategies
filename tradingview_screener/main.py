@@ -4,7 +4,7 @@ from binance.um_futures import UMFutures
 from tradingview_ta import TA_Handler, Interval, Exchange
 from config import TELEGRAM_TOKEN, TELEGRAM_CHANNEL
 
-INTERVAL = Interval.INTERVAL_1_DAY
+INTERVAL = Interval.INTERVAL_1_MINUTE
 client = UMFutures()
 
 def get_data(symbol):
@@ -22,11 +22,11 @@ def get_symbols():
     tickers = client.mark_price()
     symbols = []
     for ticker in tickers:
-        symbols.append(ticker['symbol'])  
+        symbols.append(ticker['symbol'])
     return symbols
 
 def send_message(message):
-    res = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
+    res = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
                        params={"chat_id": TELEGRAM_CHANNEL, "text": message})
 
 symbols = get_symbols()
@@ -39,9 +39,11 @@ def first_data():
     for symbol in symbols:
         try:
             data = get_data(symbol)
-            if data.get('RECOMMENDATION') == 'STRONG BUY':
+            print(data)
+            if data.get('RECOMMENDATION') == 'STRONG_BUY':
                 longs.append(symbol)
-            elif data.get('RECOMMENDATION') == 'STRONG SELL':
+                print(data['SYMBOL'], 'BUY')
+            elif data.get('RECOMMENDATION') == 'STRONG_SELL':
                 shorts.append(symbol)
             time.sleep(0.01)
         except:
@@ -60,18 +62,19 @@ while True:
     for symbol in symbols:
         try:
             data = get_data(symbol)
-            if (data.get('RECOMMENDATION') == 'STRONG BUY') and (symbol not in longs):
+            # print(data)
+            if (data.get('RECOMMENDATION') == 'STRONG_BUY') and (symbol not in longs):
                 print(symbol, 'BUY')
                 message = symbol + ' BUY'
                 send_message(message)
                 longs.append(symbol)
-            
-            if (data.get('RECOMMENDATION') == 'STRONG SELL') and (symbol not in shorts):
+
+            if (data.get('RECOMMENDATION') == 'STRONG_SELL') and (symbol not in shorts):
                 print(symbol, 'SELL')
                 message = symbol + ' SELL'
                 send_message(message)
                 shorts.append(symbol)
-            time.sleep(0.1)
+            time.sleep(0.01)
         except:
             pass
-    time.sleep(300)
+    time.sleep(3)
