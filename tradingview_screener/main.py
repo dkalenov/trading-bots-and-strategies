@@ -7,7 +7,7 @@ from tradingview_ta import TA_Handler, Interval, Exchange
 from config import TELEGRAM_TOKEN, TELEGRAM_CHANNEL
 from db import save_signal
 
-TIMEFRAMES = ["5m", "15m"]
+TIMEFRAMES = ["1h", "4h"]
 INTERVAL_MAPPING = {
     "1m": Interval.INTERVAL_1_MINUTE,
     "5m": Interval.INTERVAL_5_MINUTES,
@@ -150,14 +150,13 @@ def monitor_timeframe(timeframe):
         symbols = get_symbols()
         process_symbols(symbols, timeframe)
 
-        if timeframe == TIMEFRAMES[-1]:  # Отправка сообщений после завершения последнего таймфрейма
-            messages = format_signals()
-            for msg in messages:
-                send_message(msg)
+        # if timeframe == TIMEFRAMES[-1]:
+        messages = format_signals()
+        for msg in messages:
+            send_message(msg)
 
-            # Очищаем сигналы для всех таймфреймов
-            for tf in TIMEFRAMES:
-                signals[tf] = {"longs": {}, "shorts": {}}
+        for tf in TIMEFRAMES:
+            signals[tf] = {"longs": {}, "shorts": {}}
 
 
 if __name__ == "__main__":
