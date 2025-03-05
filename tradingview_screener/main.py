@@ -89,12 +89,14 @@ def process_symbols(symbols, timeframe):
                 # BTC и ETH записываем всегда (даже если сигнал НЕ "STRONG_BUY"/"STRONG_SELL")
                 if symbol in IMPORTANT_SYMBOLS:
                     save_signal(symbol, timeframe, signal, entry_price)
-                    signals[timeframe][
-                        "longs" if signal == "STRONG_BUY" else "shorts"
-                    ][symbol] = (signal, entry_price)
+                    # В signals записываем только если сигнал действительно STRONG_BUY / STRONG_SELL
+                    if signal in {"STRONG_BUY", "STRONG_SELL"}:
+                        signals[timeframe]["longs" if signal == "STRONG_BUY" else "shorts"][symbol] = (
+                        signal, entry_price)
 
                 # Остальные монеты записываем ТОЛЬКО если сигнал "STRONG_BUY" / "STRONG_SELL"
                 elif signal in {"STRONG_BUY", "STRONG_SELL"}:
+                    save_signal(symbol, timeframe, signal, entry_price)
                     signals[timeframe]["longs" if signal == "STRONG_BUY" else "shorts"][symbol] = (signal, entry_price)
 
             except Exception as e:
@@ -127,7 +129,7 @@ def format_signals():
                     sub_signal = signals[sub_tf]["longs"][symbol][0]
                     msg += f"{symbol}: {signal} at {price} ({sub_signal} on {sub_tf})\n"
                 else:
-                    msg += f"{symbol}: {signal} at {price}\n"
+                    msg += f"{symbol}: price {price}\n"
 
         # Shorts
         if signals[tf]["shorts"]:
@@ -137,7 +139,7 @@ def format_signals():
                     sub_signal = signals[sub_tf]["shorts"][symbol][0]
                     msg += f"{symbol}: {signal} at {price} ({sub_signal} on {sub_tf})\n"
                 else:
-                    msg += f"{symbol}: {signal} at {price}\n"
+                    msg += f"{symbol}: price {price}\n"
 
         messages.append(msg)
 
@@ -150,16 +152,19 @@ def monitor_timeframe(timeframe):
         symbols = get_symbols()
         process_symbols(symbols, timeframe)
 
-        # if timeframe == TIMEFRAMES[-1]:
+        # if timeframe == TIMEFRAMES[-1]:  # Отправка сообщений после завершения последнего таймфрейма
         messages = format_signals()
         for msg in messages:
             send_message(msg)
 
+        # Очищаем сигналы для всех таймфреймов
         for tf in TIMEFRAMES:
             signals[tf] = {"longs": {}, "shorts": {}}
 
 
 if __name__ == "__main__":
+    print('START')
+    send_message('START')
     with ThreadPoolExecutor(max_workers=len(TIMEFRAMES)) as executor:
         executor.map(monitor_timeframe, TIMEFRAMES)
 
