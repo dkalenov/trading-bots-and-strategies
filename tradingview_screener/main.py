@@ -7,7 +7,7 @@ from tradingview_ta import TA_Handler, Interval, Exchange
 from config import TELEGRAM_TOKEN, TELEGRAM_CHANNEL
 from db import save_signal
 
-TIMEFRAMES = ["1h", "4h"]
+TIMEFRAMES = ['30m', '1h', '4h']
 INTERVAL_MAPPING = {
     "1m": Interval.INTERVAL_1_MINUTE,
     "5m": Interval.INTERVAL_5_MINUTES,
@@ -23,7 +23,7 @@ VIETNAM_TZ = timezone(timedelta(hours=7))
 IMPORTANT_SYMBOLS = {"BTCUSDT", "ETHUSDT"}
 
 signals = {tf: {"longs": {}, "shorts": {}} for tf in TIMEFRAMES}
-
+important_signals = {}
 
 def get_data(symbol, timeframe):
     interval = INTERVAL_MAPPING[timeframe]
@@ -86,15 +86,13 @@ def process_symbols(symbols, timeframe):
                 signal = data.get("RECOMMENDATION", "NEUTRAL")
                 entry_price = float(client.mark_price(symbol)["markPrice"])
 
-                # BTC и ETH записываем всегда (даже если сигнал НЕ "STRONG_BUY"/"STRONG_SELL")
                 if symbol in IMPORTANT_SYMBOLS:
                     save_signal(symbol, timeframe, signal, entry_price)
-                    # В signals записываем только если сигнал действительно STRONG_BUY / STRONG_SELL
+                    important_signals[symbol] = (signal, entry_price)  # Добавляем в отдельный словарь
                     if signal in {"STRONG_BUY", "STRONG_SELL"}:
                         signals[timeframe]["longs" if signal == "STRONG_BUY" else "shorts"][symbol] = (
                         signal, entry_price)
 
-                # Остальные монеты записываем ТОЛЬКО если сигнал "STRONG_BUY" / "STRONG_SELL"
                 elif signal in {"STRONG_BUY", "STRONG_SELL"}:
                     save_signal(symbol, timeframe, signal, entry_price)
                     signals[timeframe]["longs" if signal == "STRONG_BUY" else "shorts"][symbol] = (signal, entry_price)
@@ -104,42 +102,30 @@ def process_symbols(symbols, timeframe):
             time.sleep(0.01)
 
 
-
 def format_signals():
     messages = []
 
     for i, tf in enumerate(TIMEFRAMES):
-        if not signals[tf]["longs"] and not signals[tf]["shorts"]:
+        if not signals[tf]["longs"] and not signals[tf]["shorts"] and not important_signals:
             continue
 
-        sub_tf = TIMEFRAMES[i - 1] if i > 0 else None
         msg = f"📊 Signals for {tf} timeframe:\n"
 
-        # BTC и ETH
-        for symbol in IMPORTANT_SYMBOLS:
-            if symbol in signals[tf]["longs"] or symbol in signals[tf]["shorts"]:
-                signal, price = signals[tf]["longs"].get(symbol, signals[tf]["shorts"].get(symbol))
-                msg += f"{symbol}: {signal} at {price}\n"
+        # BTC и ETH всегда в начале
+        for symbol, (signal, price) in important_signals.items():
+            msg += f"{symbol}: {signal} at {price}\n"
 
         # Longs
         if signals[tf]["longs"]:
             msg += "\n🚀 **Longs:**\n"
             for symbol, (signal, price) in signals[tf]["longs"].items():
-                if sub_tf and symbol in signals.get(sub_tf, {}).get("longs", {}):
-                    sub_signal = signals[sub_tf]["longs"][symbol][0]
-                    msg += f"{symbol}: {signal} at {price} ({sub_signal} on {sub_tf})\n"
-                else:
-                    msg += f"{symbol}: price {price}\n"
+                msg += f"{symbol}: price {price}\n"
 
         # Shorts
         if signals[tf]["shorts"]:
             msg += "\n📉 **Shorts:**\n"
             for symbol, (signal, price) in signals[tf]["shorts"].items():
-                if sub_tf and symbol in signals.get(sub_tf, {}).get("shorts", {}):
-                    sub_signal = signals[sub_tf]["shorts"][symbol][0]
-                    msg += f"{symbol}: {signal} at {price} ({sub_signal} on {sub_tf})\n"
-                else:
-                    msg += f"{symbol}: price {price}\n"
+                msg += f"{symbol}: price {price}\n"
 
         messages.append(msg)
 
@@ -152,15 +138,14 @@ def monitor_timeframe(timeframe):
         symbols = get_symbols()
         process_symbols(symbols, timeframe)
 
-        # if timeframe == TIMEFRAMES[-1]:  # Отправка сообщений после завершения последнего таймфрейма
+        # if timeframe == TIMEFRAMES[-1]:
         messages = format_signals()
         for msg in messages:
             send_message(msg)
 
-        # Очищаем сигналы для всех таймфреймов
+
         for tf in TIMEFRAMES:
             signals[tf] = {"longs": {}, "shorts": {}}
-
 
 if __name__ == "__main__":
     print('START')
