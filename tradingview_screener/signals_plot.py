@@ -249,103 +249,177 @@ import mplfinance as mpf
 #     save_candlestick_plot(df, signals_df, symbol, interval)
 
 
-import os
+import requests
 import pandas as pd
+import os
 import matplotlib.pyplot as plt
 import mplfinance as mpf
+from matplotlib.dates import AutoDateLocator, DateFormatter
 
 # === Чтение данных свечей ===
 df = pd.read_csv("klines_data.csv", parse_dates=['Date'], index_col='Date')
 df.index = pd.to_datetime(df.index, utc=True)
 
 # Проверка необходимых столбцов
-ohlc_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+ohlc_columns = ['Open', 'High', 'Low', 'Close', 'Volume', 'Symbol']
 if not all(col in df.columns for col in ohlc_columns):
-    raise ValueError("❌ В DataFrame отсутствуют необходимые столбцы: 'Open', 'High', 'Low', 'Close', 'Volume'")
+    raise ValueError(
+        "❌ В DataFrame отсутствуют необходимые столбцы: 'Open', 'High', 'Low', 'Close', 'Volume', 'Symbol'")
 
 # === Чтение данных сигналов ===
 signals_df = pd.read_csv("tradingview_signals_server.csv")
 signals_df['Date'] = pd.to_datetime(signals_df['utc_time'], errors='coerce', utc=True)
 
-# Проверяем на ошибки
 if signals_df['Date'].isna().any():
     raise ValueError("❌ Ошибка: В столбце 'utc_time' есть некорректные значения.")
 
 
 # === Функция для создания графика ===
+import os
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
+# def save_candlestick_plot(df, signals_df, symbol, interval):
+#     df_symbol = df[df['Symbol'] == symbol].copy()
+#     df_symbol = df_symbol.drop(columns=['Symbol'])
+#
+#     # Проверка корректности данных
+#     print(f"Доступные даты в данных для {symbol}: {df_symbol.index.min()} — {df_symbol.index.max()}")
+#
+#     # Фильтруем сигналы
+#     signals_filtered = signals_df[(signals_df['symbol'] == symbol) & (signals_df['timeframe'] == interval)]
+#     signals_filtered = signals_filtered[signals_filtered['Date'].between(df_symbol.index.min(), df_symbol.index.max())]
+#
+#     if signals_filtered.empty:
+#         print(f"⚠️ Нет сигналов для {symbol} ({interval})")
+#     else:
+#         print(f"✅ Найдено {len(signals_filtered)} сигналов для {symbol} ({interval})")
+#
+#     # Создаём график
+#     fig, ax = plt.subplots(figsize=(18, 8))
+#
+#     # Рисуем свечной график вручную
+#     for i in range(len(df_symbol)):
+#         open_, high, low, close = df_symbol.iloc[i][['Open', 'High', 'Low', 'Close']]
+#         color = 'green' if close >= open_ else 'red'
+#
+#         # Тень свечи
+#         ax.plot([df_symbol.index[i], df_symbol.index[i]], [low, high], color='black', linewidth=1)
+#
+#         # Тело свечи
+#         ax.plot([df_symbol.index[i], df_symbol.index[i]], [open_, close], color=color, linewidth=5)
+#
+#     # Добавляем сигналы
+#     for _, row in signals_filtered.iterrows():
+#         color = 'green' if row['signal'] == 'STRONG_BUY' else 'red'
+#         marker = '^' if row['signal'] == 'STRONG_BUY' else 'v'
+#         ax.scatter(row['Date'], row['entry_price'], color=color, marker=marker, s=120, edgecolors='black', zorder=3)
+#         ax.text(row['Date'], row['entry_price'], row['signal'].replace("STRONG_", ""),
+#                 fontsize=10, verticalalignment='bottom' if row['signal'] == 'STRONG_BUY' else 'top',
+#                 color=color, bbox=dict(facecolor='white', edgecolor=color, boxstyle='round,pad=0.3'))
+#
+#     # Настраиваем оси
+#     ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+#     ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %d, %H:%M'))
+#     plt.xticks(rotation=30)
+#     plt.grid(True, linestyle='--', alpha=0.5)
+#
+#     # Сохраняем график
+#     base_dir = "plots"
+#     os.makedirs(base_dir, exist_ok=True)
+#     plot_path = os.path.join(base_dir, f"{symbol}_{interval}.png")
+#     plt.savefig(plot_path, dpi=300)
+#     plt.close()
+#
+#     print(f"✅ График сохранён: {plot_path}")
+
+
+import os
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
+
 def save_candlestick_plot(df, signals_df, symbol, interval):
-    # Фильтрация по символу
     df_symbol = df[df['Symbol'] == symbol].copy()
     df_symbol = df_symbol.drop(columns=['Symbol'])
 
-    # Фильтрация сигналов по символу и интервалу
-    signals_filtered = signals_df[
-        (signals_df['symbol'] == symbol) &
-        (signals_df['timeframe'] == interval) &
-        (signals_df['Date'].between(df_symbol.index.min(), df_symbol.index.max()))
-        ]
+    # Группируем данные по дням
+    df_symbol['date_only'] = df_symbol.index.date
+    unique_dates = df_symbol['date_only'].unique()
+
+    # Проверка корректности данных
+    print(f"Доступные даты в данных для {symbol}: {df_symbol.index.min()} — {df_symbol.index.max()}")
+
+    # Фильтруем сигналы
+    signals_filtered = signals_df[(signals_df['symbol'] == symbol) & (signals_df['timeframe'] == interval)]
+    signals_filtered = signals_filtered[signals_filtered['Date'].between(df_symbol.index.min(), df_symbol.index.max())]
 
     if signals_filtered.empty:
         print(f"⚠️ Нет сигналов для {symbol} ({interval})")
     else:
         print(f"✅ Найдено {len(signals_filtered)} сигналов для {symbol} ({interval})")
 
-    # Создаём папку для хранения графиков
-    base_dir = "plots"
+    # Создаём папки для хранения графиков
+    base_dir = os.path.join("plots", symbol, f"{symbol}_{interval}")
     os.makedirs(base_dir, exist_ok=True)
-    plot_path = os.path.join(base_dir, f"{symbol}_{interval}.png")
 
-    # === Создание графика ===
-    fig, (ax, ax_volume) = plt.subplots(2, figsize=(14, 8), gridspec_kw={'height_ratios': [3, 1]}, sharex=True)
+    for date in unique_dates:
+        df_day = df_symbol[df_symbol['date_only'] == date]
 
-    # Рисуем свечной график + объемы
-    mpf.plot(df_symbol, type='candle', ax=ax, volume=ax_volume, ylabel="Price", ylabel_lower="Volume")
+        if df_day.empty:
+            continue
 
-    # Добавляем сигналы на график
-    # Добавляем сигналы на график
-    for _, row in signals_filtered.iterrows():
-        color = 'green' if row['signal'] == 'STRONG_BUY' else 'red'
-        marker = '^' if row['signal'] == 'STRONG_BUY' else 'v'
+        signals_day = signals_filtered[signals_filtered['Date'].dt.date == date]
 
-        # Выводим каждую точку, чтобы убедиться, что они правильно вычисляются
-        print(f"📍 Сигнал: {row['signal']}, Дата: {row['Date']}, Цена: {row['entry_price']}")
+        # Создаём график
+        fig, ax = plt.subplots(figsize=(18, 8))
 
-        ax.scatter(row['Date'], row['entry_price'], color=color, marker=marker, s=120, edgecolors='black', zorder=3)
-        ax.text(row['Date'], row['entry_price'], row['signal'].replace("STRONG_", ""),
-                fontsize=10, verticalalignment='bottom' if row['signal'] == 'STRONG_BUY' else 'top',
-                color=color, bbox=dict(facecolor='white', edgecolor=color, boxstyle='round,pad=0.3'))
+        # Рисуем свечной график вручную
+        for i in range(len(df_day)):
+            open_, high, low, close = df_day.iloc[i][['Open', 'High', 'Low', 'Close']]
+            color = 'green' if close >= open_ else 'red'
 
-    # Форматирование оси X
-    plt.xticks(rotation=30)
-    plt.grid(True, linestyle='--', alpha=0.5)
+            # Тень свечи
+            ax.plot([df_day.index[i], df_day.index[i]], [low, high], color='black', linewidth=1)
 
-    plt.savefig(plot_path, dpi=300)
-    plt.close()
-    print(f"✅ График сохранён: {plot_path}")
+            # Тело свечи
+            ax.plot([df_day.index[i], df_day.index[i]], [open_, close], color=color, linewidth=5)
+
+        # Добавляем сигналы
+        for _, row in signals_day.iterrows():
+            color = 'green' if row['signal'] == 'STRONG_BUY' else 'red'
+            marker = '^' if row['signal'] == 'STRONG_BUY' else 'v'
+
+            ax.scatter(row['Date'], row['entry_price'], color=color, marker=marker, s=120, edgecolors='black', zorder=3)
+
+            # Текст с сигналом и ценой входа
+            ax.text(row['Date'], row['entry_price'],
+                    f"{row['signal'].replace('STRONG_', '')}\n{row['entry_price']:.2f}",
+                    fontsize=10, verticalalignment='bottom' if row['signal'] == 'STRONG_BUY' else 'top',
+                    color=color, bbox=dict(facecolor='white', edgecolor=color, boxstyle='round,pad=0.3'))
+
+        # Настраиваем оси
+        ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+        plt.xticks(rotation=30)
+        plt.grid(True, linestyle='--', alpha=0.5)
+        plt.title(f"{symbol} {interval} — {date}")
+
+        # Сохраняем график
+        plot_path = os.path.join(base_dir, f"{symbol}_{interval}_{date}.png")
+        plt.savefig(plot_path, dpi=300)
+        plt.close()
+
+        print(f"✅ График сохранён: {plot_path}")
 
 
 # === Генерация графиков ===
 symbols = df['Symbol'].unique()
 interval = "1h"
 
-for symbol in df['Symbol'].unique():
-    print(f"\n🔎 Проверяем символ: {symbol}")
-
-    # Фильтруем данные по символу
-    df_symbol = df[df.index.notna()].copy()  # Убираем NaN, если есть
-    signals_filtered = signals_df[(signals_df['symbol'] == symbol) & (signals_df['timeframe'] == interval)]
-
-    # Проверяем диапазон дат
-    print(f"📅 Диапазон дат свечей: {df_symbol.index.min()} - {df_symbol.index.max()}")
-    print(f"📅 Диапазон дат сигналов: {signals_filtered['Date'].min()} - {signals_filtered['Date'].max()}")
-
-    # Проверяем наличие сигналов
-    if signals_filtered.empty:
-        print("⚠️ Нет сигналов для этого символа.")
-    else:
-        print(f"✅ Найдено {len(signals_filtered)} сигналов.")
-        print(signals_filtered[['Date', 'signal', 'entry_price']].head())  # Выводим первые 5 сигналов
-
+for symbol in symbols:
     save_candlestick_plot(df, signals_df, symbol, interval)
 
 
