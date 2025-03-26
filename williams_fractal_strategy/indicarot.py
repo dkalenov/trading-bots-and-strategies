@@ -49,7 +49,7 @@ for i in range(2, len(df) - 2):
             df.loc[df.index[i], 'max2_date'] = date_last_max2
 
             # Reset if max2 is higher than max1
-            if last_max2 > last_max1: 
+            if last_max2 > last_max1:
                 last_max1 = last_min1 = last_max2 = None
                 date_last_max1 = date_last_min1 = date_last_max2 = None
             elif last_max2 < last_min1:
@@ -69,14 +69,15 @@ for i in range(2, len(df) - 2):
             df.loc[df.index[i], 'min2'] = last_min2
             df.loc[df.index[i], 'min2_date'] = date_last_min2
 
-            # Reset if min2 is higher than min1
-            if last_min2 > last_min1:
-                last_max1 = last_min1 = last_max2 = last_min2 = None
-                date_last_max1 = date_last_min1 = date_last_max2 = date_last_min2 = None
-            elif last_min2 > last_max1:
-                last_min1, date_last_min1 = last_min2, date_last_min2
-                last_max1 = last_min2 = None
-                date_last_max1 = date_last_min2 = None
+            if last_min2 is not None and last_min1 is not None:
+                # Reset if min2 is higher than min1
+                if last_min2 > last_min1:
+                    last_max1 = last_min1 = last_max2 = last_min2 = None
+                    date_last_max1 = date_last_min1 = date_last_max2 = date_last_min2 = None
+                elif last_min2 > last_max1:
+                    last_min1, date_last_min1 = last_min2, date_last_min2
+                    last_max1 = last_min2 = None
+                    date_last_max1 = date_last_min2 = None
 
     # Long signal: breakout of the last minimum
     if last_max1 is not None and last_min1 is not None and last_max2 is not None:
