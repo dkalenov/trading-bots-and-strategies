@@ -8,10 +8,9 @@ from tradingview_ta import TA_Handler, Interval, Exchange
 from config import TELEGRAM_TOKEN, TELEGRAM_CHANNEL
 from db import save_signal
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-TIMEFRAMES = ['30m', '1h', '4h']
+TIMEFRAMES = ['5m', '15m', '30m']
 INTERVAL_MAPPING = {
     "1m": Interval.INTERVAL_1_MINUTE,
     "5m": Interval.INTERVAL_5_MINUTES,
@@ -29,7 +28,48 @@ IMPORTANT_SYMBOLS = {"BTCUSDT", "ETHUSDT"}
 signals = {tf: {"longs": {}, "shorts": {}} for tf in TIMEFRAMES}
 signals["important"] = {}
 
+
+import json
+import os
+
+CACHE_FILE = "tradingview_symbols.json"
+
+def get_available_symbols():
+    """ Получает список доступных символов на TradingView и сохраняет его в JSON """
+    binance_symbols = get_symbols()  # Загружаем список всех символов с Binance
+    available_symbols = []
+
+    for symbol in binance_symbols:
+        try:
+            # Проверяем, доступен ли символ на TradingView
+            handler = TA_Handler(symbol=symbol, exchange="Binance", screener="crypto", interval=Interval.INTERVAL_1_HOUR)
+            handler.get_analysis()
+            available_symbols.append(symbol)
+        except:
+            continue  # Если ошибка, значит символа нет на TV
+
+    # Сохраняем в JSON
+    with open(CACHE_FILE, "w") as f:
+        json.dump(available_symbols, f)
+
+    return available_symbols
+
+
+def load_cached_symbols():
+    """ Загружает символы из кэша, если файл существует """
+    if os.path.exists(CACHE_FILE):
+        with open(CACHE_FILE, "r") as f:
+            symbols = json.load(f)
+            logging.info(f"Загружено {len(symbols)} символов из {CACHE_FILE}")
+            return symbols
+    logging.warning("Файл кэша символов не найден, получаем заново.")
+    return None
+
+
+
+
 def get_data(symbol, timeframe, retries=3):
+    """ Получает данные с TradingView с повторными попытками """
     interval = INTERVAL_MAPPING[timeframe]
     for attempt in range(retries):
         try:
@@ -47,6 +87,7 @@ def get_data(symbol, timeframe, retries=3):
 
 
 def get_symbols():
+    """ Получает список доступных символов с Binance """
     try:
         tickers = client.mark_price()
         return [ticker['symbol'] for ticker in tickers if 'USDC' not in ticker['symbol'] and 'USDT' in ticker['symbol']]
@@ -56,6 +97,7 @@ def get_symbols():
 
 
 def send_message(message):
+    """ Отправляет сообщение в Telegram с учетом лимита 4096 символов """
     max_length = 4000
     messages = []
 
@@ -92,6 +134,7 @@ def send_message(message):
 
 
 def format_signals(signals):
+    """ Форматирует сигналы для Telegram в виде HTML """
     messages = []
 
     for tf in TIMEFRAMES:
@@ -122,10 +165,19 @@ def format_signals(signals):
 
 
 def process_symbols(symbols, timeframe):
+    """ Обрабатывает символы и сохраняет сигналы """
     start_time = time.time()
     global signals
 
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    # Загружаем кэшированный список символов
+    available_symbols = load_cached_symbols()
+    if not available_symbols:
+        available_symbols = get_available_symbols()  # Если нет кэша, загружаем заново
+
+    # Оставляем только символы, которые есть в TradingView
+    symbols = [s for s in symbols if s in available_symbols]
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
         futures = {executor.submit(get_data, symbol, timeframe): symbol for symbol in symbols}
         for future in as_completed(futures):
             symbol = futures[future]
@@ -159,7 +211,9 @@ def process_symbols(symbols, timeframe):
     logging.info(f"Обработка {len(symbols)} символов заняла {time.time() - start_time:.2f} секунд")
 
 
+
 def wait_for_next_candle(timeframe):
+    """ Ожидает открытия следующей свечи """
     now_utc = datetime.now(timezone.utc)
     if "h" in timeframe:
         tf_hours = int(timeframe[:-1])
@@ -178,14 +232,21 @@ def wait_for_next_candle(timeframe):
 
 def monitor_timeframe(timeframe):
     global signals
+
+    # Загружаем кэш символов перед началом мониторинга
+    available_symbols = load_cached_symbols()
+    if not available_symbols:
+        available_symbols = get_available_symbols()  # Если кэша нет, создаем его
+
+    # ⚡ Немедленный запуск обработки, чтобы отправить сигналы сразу
+    process_symbols(available_symbols, timeframe)
+
     while True:
         wait_for_next_candle(timeframe)
-        symbols = get_symbols()
-        process_symbols(symbols, timeframe)  # Уже отправляет сообщения
+        process_symbols(available_symbols, timeframe)
 
-        # Очистка сигналов после обработки
-        for tf in TIMEFRAMES:
-            signals[tf] = {"longs": {}, "shorts": {}}
+        # Очистка сигналов только для текущего таймфрейма
+        signals[timeframe] = {"longs": {}, "shorts": {}}
 
 
 
