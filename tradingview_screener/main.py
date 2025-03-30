@@ -3,10 +3,14 @@ import logging
 import requests
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from binance.um_futures import UMFutures
 from tradingview_ta import TA_Handler, Interval, Exchange
 from config import TELEGRAM_TOKEN, TELEGRAM_CHANNEL
 from db import save_signal
+from binance_data import *
+import json
+import os
+
+
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -22,37 +26,40 @@ INTERVAL_MAPPING = {
     "1d": Interval.INTERVAL_1_DAY,
 }
 
-client = UMFutures()
 VIETNAM_TZ = timezone(timedelta(hours=7))
 IMPORTANT_SYMBOLS = {"BTCUSDT", "ETHUSDT"}
 
 signals = {tf: {"longs": {}, "shorts": {}} for tf in TIMEFRAMES}
 signals["important"] = {}
 
-
-import json
-import os
-
 CACHE_FILE = "tradingview_symbols.json"
 
+
 def get_available_symbols():
-    """ Получает список доступных символов на TradingView и сохраняет его в JSON """
-    binance_symbols = get_symbols()  # Загружаем список всех символов с Binance
+    """ Получает список доступных символов на TradingView и Binance Futures и сохраняет его в JSON """
+    binance_symbols = get_binance_symbols()
     available_symbols = []
 
     for symbol in binance_symbols:
         try:
-            # Проверяем, доступен ли символ на TradingView
+            # Проверяем, доступен ли символ на TradingView (Binance Spot)
             handler = TA_Handler(symbol=symbol, exchange="Binance", screener="crypto", interval=Interval.INTERVAL_1_HOUR)
             handler.get_analysis()
-            available_symbols.append(symbol)
-        except:
-            continue  # Если ошибка, значит символа нет на TV
+
+            # Проверяем, доступен ли символ на Binance Futures
+            futures_info = client.mark_price(symbol)
+            if futures_info:  # Если Binance вернул данные, значит символ есть в фьючерсах
+                available_symbols.append(symbol)
+
+        except Exception as e:
+            logging.warning(f"Символ {symbol} пропущен: {e}")
+            continue  # Если ошибка, значит символа нет
 
     # Сохраняем в JSON
     with open(CACHE_FILE, "w") as f:
         json.dump(available_symbols, f)
 
+    logging.info(f"Сохранено {len(available_symbols)} символов в {CACHE_FILE}")
     return available_symbols
 
 
@@ -65,8 +72,6 @@ def load_cached_symbols():
             return symbols
     logging.warning("Файл кэша символов не найден, получаем заново.")
     return None
-
-
 
 
 def get_data(symbol, timeframe, retries=3):
@@ -84,17 +89,6 @@ def get_data(symbol, timeframe, retries=3):
             logging.warning(f"Ошибка получения данных {symbol} ({timeframe}), попытка {attempt+1}: {e}")
             time.sleep(1)
     return None
-
-
-
-def get_symbols():
-    """ Получает список доступных символов с Binance """
-    try:
-        tickers = client.mark_price()
-        return [ticker['symbol'] for ticker in tickers if 'USDC' not in ticker['symbol'] and 'USDT' in ticker['symbol']]
-    except Exception as e:
-        logging.error(f"Ошибка получения списка символов: {e}")
-        return []
 
 
 def send_message(message):
@@ -166,17 +160,12 @@ def format_signals(signals):
 
 
 def process_symbols(symbols, timeframe):
-    """ Обрабатывает символы и сохраняет сигналы """
+    """Обрабатывает символы и сохраняет сигналы"""
     start_time = time.time()
     global signals
 
-    # Загружаем кэшированный список символов
-    available_symbols = load_cached_symbols()
-    if not available_symbols:
-        available_symbols = get_available_symbols()  # Если нет кэша, загружаем заново
-
-    # Оставляем только символы, которые есть в TradingView
-    symbols = [s for s in symbols if s in available_symbols]
+    # Получаем все цены разом
+    prices = get_prices_binance(symbols)
 
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = {executor.submit(get_data, symbol, timeframe): symbol for symbol in symbols}
@@ -187,7 +176,11 @@ def process_symbols(symbols, timeframe):
                 if not data:
                     continue
                 signal = data.get("RECOMMENDATION", "NEUTRAL")
-                entry_price = float(client.mark_price(symbol)["markPrice"])
+                entry_price = prices.get(symbol)  # Берем цену из заранее загруженного списка
+
+                if entry_price is None:
+                    logging.warning(f"Цена для {symbol} не найдена, пропускаем")
+                    continue
 
                 # Сохраняем сигналы
                 if signal in {"STRONG_BUY"}:
@@ -210,7 +203,6 @@ def process_symbols(symbols, timeframe):
         send_message(msg)
 
     logging.info(f"Обработка {len(symbols)} символов заняла {time.time() - start_time:.2f} секунд")
-
 
 
 def wait_for_next_candle(timeframe):
@@ -242,8 +234,6 @@ def monitor_timeframe(timeframe):
         wait_for_next_candle(timeframe)
         process_symbols(available_symbols, timeframe)  # Запускаем обработку только в нужное время
 
-
-
         # Очищаем сигналы для всех таймфреймов
         for tf in TIMEFRAMES:
             signals[tf] = {"longs": {}, "shorts": {}}
@@ -255,7 +245,6 @@ if __name__ == "__main__":
 
     with ThreadPoolExecutor(max_workers=len(TIMEFRAMES)) as executor:
         futures = {executor.submit(monitor_timeframe, tf): tf for tf in TIMEFRAMES}
-
         try:
             for future in as_completed(futures):
                 tf = futures[future]
