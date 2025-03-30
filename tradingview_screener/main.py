@@ -8,9 +8,10 @@ from tradingview_ta import TA_Handler, Interval, Exchange
 from config import TELEGRAM_TOKEN, TELEGRAM_CHANNEL
 from db import save_signal
 
+# Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-TIMEFRAMES = ['5m', '15m', '30m']
+TIMEFRAMES = ['30m', '1h', '4h']
 INTERVAL_MAPPING = {
     "1m": Interval.INTERVAL_1_MINUTE,
     "5m": Interval.INTERVAL_5_MINUTES,
@@ -232,22 +233,20 @@ def wait_for_next_candle(timeframe):
 
 def monitor_timeframe(timeframe):
     global signals
-
-    # Загружаем кэш символов перед началом мониторинга
-    available_symbols = load_cached_symbols()
-    if not available_symbols:
-        available_symbols = get_available_symbols()  # Если кэша нет, создаем его
-
-    # ⚡ Немедленный запуск обработки, чтобы отправить сигналы сразу
-    process_symbols(available_symbols, timeframe)
-
     while True:
+        # Загружаем кэш символов перед началом мониторинга
+        available_symbols = load_cached_symbols()
+        if not available_symbols:
+            available_symbols = get_available_symbols()
+
         wait_for_next_candle(timeframe)
-        process_symbols(available_symbols, timeframe)
+        process_symbols(available_symbols, timeframe)  # Запускаем обработку только в нужное время
 
-        # Очистка сигналов только для текущего таймфрейма
-        signals[timeframe] = {"longs": {}, "shorts": {}}
 
+
+        # Очищаем сигналы для всех таймфреймов
+        for tf in TIMEFRAMES:
+            signals[tf] = {"longs": {}, "shorts": {}}
 
 
 if __name__ == "__main__":
@@ -269,4 +268,3 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             logging.info("Program stopped (Ctrl+C)")
             send_message("⛔ Program stopped (Ctrl+C)")
-
