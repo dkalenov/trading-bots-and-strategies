@@ -1,14 +1,15 @@
-import time
-import logging
-import requests
 from datetime import datetime, timezone, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from tradingview_ta import TA_Handler, Interval, Exchange
 from config import TELEGRAM_TOKEN, TELEGRAM_CHANNEL
 from db import save_signal
 from binance_data import *
 import json
 import os
+import pandas as pd
+import requests
+import time
+from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 
@@ -32,7 +33,9 @@ IMPORTANT_SYMBOLS = {"BTCUSDT", "ETHUSDT"}
 signals = {tf: {"longs": {}, "shorts": {}} for tf in TIMEFRAMES}
 signals["important"] = {}
 
+
 CACHE_FILE = "tradingview_symbols.json"
+SUCCESS_FILE = "successful_signals_4h_BTC.csv"
 
 
 def get_available_symbols():
@@ -61,6 +64,7 @@ def get_available_symbols():
 
     logging.info(f"Сохранено {len(available_symbols)} символов в {CACHE_FILE}")
     return available_symbols
+
 
 
 def load_cached_symbols():
@@ -113,19 +117,26 @@ def send_message(message):
         messages.append(message)
 
     for msg in messages:
-        try:
-            response = requests.get(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                params={
-                    "chat_id": TELEGRAM_CHANNEL,
-                    "text": msg,
-                    "parse_mode": "HTML"  # Используем HTML для форматирования
-                }
-            )
-            if response.status_code != 200:
-                logging.error(f"Ошибка отправки в Telegram: {response.text}")
-        except Exception as e:
-            logging.error(f"Ошибка отправки сообщения в Telegram: {e}")
+        while True:
+            try:
+                response = requests.get(
+                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                    params={
+                        "chat_id": TELEGRAM_CHANNEL,
+                        "text": msg,
+                        "parse_mode": "HTML"
+                    }
+                )
+                if response.status_code == 429:  # Слишком много запросов
+                    retry_after = response.json().get("parameters", {}).get("retry_after", 5)
+                    logging.error(f"Flood control, ждём {retry_after} секунд...")
+                    time.sleep(retry_after + 1)
+                else:
+                    break
+            except Exception as e:
+                logging.error(f"Ошибка отправки сообщения в Telegram: {e}")
+                time.sleep(5)
+
 
 
 def format_signals(signals):
@@ -159,50 +170,198 @@ def format_signals(signals):
     return messages
 
 
+
+# Функция загрузки свечей (1h, 4h, 30m и т.д.)
+def fetch_klines(symbol, interval="4h", limit=150):
+    try:
+        klines = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
+        df = pd.DataFrame(klines, columns=[
+            "time", "Open", "High", "Low", "Close", "Volume", "_", "_", "_", "_", "_", "_"
+        ])
+        df = df[["time", "Open", "High", "Low", "Close", "Volume"]].astype(float)
+        df["Date"] = pd.to_datetime(df["time"], unit="ms", utc=True)
+        df.set_index("Date", inplace=True)
+        return df
+    except Exception as e:
+        logging.error(f"Ошибка загрузки свечей для {symbol}: {e}")
+        return pd.DataFrame()
+
+# Функция расчёта ATR вручную (как в TA-Lib)
+def calculate_atr(df, period=14):
+    if df.empty:
+        return df  # Возвращаем пустой DataFrame, если данных нет
+
+    df["H-L"] = df["High"] - df["Low"]
+    df["H-C"] = abs(df["High"] - df["Close"].shift(1))
+    df["L-C"] = abs(df["Low"] - df["Close"].shift(1))
+    df["TR"] = df[["H-L", "H-C", "L-C"]].max(axis=1)
+
+    df["ATR"] = df["TR"].rolling(window=period, min_periods=1).mean()  # min_periods=1 позволяет избежать NaN
+    return df.drop(columns=["H-L", "H-C", "L-C", "TR"])
+
+
+# Функция расчёта Stop-Loss и Take-Profit
+def calculate_stop_take(df, entry_price_col="Close", atr_col="ATR"):
+    df["SL"] = df[entry_price_col] - (df[atr_col] * 0.45)
+    df["TP"] = df[entry_price_col] + (df[atr_col] * 1.25)
+    return df
+
+# Проверка успешных сигналов
+def load_successful_symbols():
+    try:
+        success_df = pd.read_csv(SUCCESS_FILE)
+        return set(success_df["symbol"].tolist())
+    except Exception as e:
+        logging.error(f"Ошибка загрузки файла успешных сигналов: {e}")
+        return set()
+
+
+def load_successful_symbols():
+    try:
+        success_df = pd.read_csv(SUCCESS_FILE )
+        return set(success_df["symbol"].tolist())
+    except Exception as e:
+        logging.error(f"Ошибка загрузки {SUCCESS_FILE }: {e}")
+        return set()
+
+# Функция отправки сообщения с ATR, SL, TP
+def format_atr_signals_message(atr_signals):
+    """Форматирует сигналы ATR, SL, TP в одно сообщение"""
+    signals_summary = []
+
+    for symbol, data in atr_signals.items():
+        direction = "LONG" if data["signal"] == "STRONG_BUY" else "SHORT"
+        msg = (f"<b>{symbol} {direction} {data['timeframe']}</b>\n"
+               f"📍 Вход: {data['entry_price']}\n"
+               f"📉 ATR: {data['ATR']:.4f}\n"
+               f"🛑 SL: {data['SL']:.4f}\n"
+               f"🎯 TP: {data['TP']:.4f}\n")
+        signals_summary.append(msg)
+
+    return "\n".join(signals_summary) if signals_summary else None
+
+
+import time
+import logging
+import pandas as pd
+import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 def process_symbols(symbols, timeframe):
-    """Обрабатывает символы и сохраняет сигналы"""
     start_time = time.time()
     global signals
 
-    # Получаем все цены разом
+    logging.info(f"Запуск process_symbols для {len(symbols)} символов на {timeframe}")
+
     prices = get_prices_binance(symbols)
+    success_symbols = load_successful_symbols()
+    btc_signal = get_data("BTCUSDT", timeframe).get("RECOMMENDATION", "NEUTRAL")
+
+    btc_long_signals = {"NEUTRAL", "BUY", "STRONG_BUY"}
+    btc_short_signals = {"NEUTRAL", "SELL", "STRONG_SELL"}
 
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = {executor.submit(get_data, symbol, timeframe): symbol for symbol in symbols}
+
         for future in as_completed(futures):
             symbol = futures[future]
             try:
                 data = future.result()
                 if not data:
+                    logging.warning(f"{symbol}: Данных нет, пропускаем.")
                     continue
+
                 signal = data.get("RECOMMENDATION", "NEUTRAL")
-                entry_price = prices.get(symbol)  # Берем цену из заранее загруженного списка
+                entry_price = prices.get(symbol)
 
                 if entry_price is None:
                     logging.warning(f"Цена для {symbol} не найдена, пропускаем")
                     continue
 
-                # Сохраняем сигналы
-                if signal in {"STRONG_BUY"}:
+                if signal == "STRONG_BUY":
                     signals[timeframe]["longs"][symbol] = (signal, entry_price)
-                elif signal in {"STRONG_SELL"}:
+                elif signal == "STRONG_SELL":
                     signals[timeframe]["shorts"][symbol] = (signal, entry_price)
 
-                # Важные символы
-                if symbol in IMPORTANT_SYMBOLS:
-                    signals["important"][symbol] = (signal, entry_price)
+                df = fetch_klines(symbol, interval=timeframe, limit=150)
 
-                if symbol in IMPORTANT_SYMBOLS or signal in {"STRONG_BUY", "STRONG_SELL"}:
-                    save_signal(symbol, timeframe, signal, entry_price)
+                if df.empty:
+                    logging.warning(f"{symbol}: DataFrame пуст, пропускаем")
+                    continue
+
+                required_cols = ["High", "Low", "Close"]
+                if not all(col in df.columns for col in required_cols):
+                    logging.warning(f"{symbol}: Отсутствуют нужные колонки {required_cols}, пропускаем")
+                    continue
+
+                df = calculate_atr(df)
+
+                if df is None or "ATR" not in df.columns:
+                    logging.warning(f"{symbol}: Функция calculate_atr не вернула ATR, пропускаем.")
+                    continue
+
+                if df.shape[0] < 2:
+                    logging.error(f"{symbol}: Недостаточно данных после calculate_atr, пропускаем.")
+                    continue
+
+                last_row = df.iloc[-1]
+
+                if any(pd.isna(last_row[col]) for col in ["High", "Low", "Close", "ATR"]):
+                    logging.warning(f"{symbol}: В последней строке есть NaN, пропускаем. Данные:\n{last_row}")
+                    continue
+
+                atr = float(last_row["ATR"])
+                if pd.isna(atr):
+                    logging.warning(f"{symbol}: ATR оказался NaN или None, пропускаем сохранение.")
+                    continue
+
+                logging.info(f"Сохраняем сигнал: {symbol}, {timeframe}, {signal}, {entry_price}, {atr}")
+                save_signal(symbol, timeframe, signal, entry_price, atr)
+
+                if symbol in success_symbols:
+                    if (signal == "STRONG_BUY" and btc_signal not in btc_long_signals) or \
+                            (signal == "STRONG_SELL" and btc_signal not in btc_short_signals):
+                        logging.info(f"{symbol}: Отклонён из-за BTCUSDT ({btc_signal})")
+                        continue
+
+                    # Вычисляем стоп-лосс и тейк-профит только если символ успешный
+                    df = calculate_stop_take(df, entry_price_col="Close", atr_col="ATR")
+
+                    if "SL" in df.columns and "TP" in df.columns:
+                        stop_loss = df["SL"].iloc[-1]
+                        take_profit = df["TP"].iloc[-1]
+                        logging.info(f"Стоп-лосс: {stop_loss}, Тейк-профит: {take_profit}")
+                    else:
+                        stop_loss = take_profit = None
+                        logging.warning(f"{symbol}: Не удалось вычислить стоп-лосс или тейк-профит.")
+
+                    # Форматируем сообщение для отправки в Telegram
+                    atr_signal_data = {
+                        "signal": signal,
+                        "timeframe": timeframe,
+                        "entry_price": entry_price,
+                        "ATR": atr,
+                        "SL": stop_loss,
+                        "TP": take_profit
+                    }
+                    signals[timeframe].setdefault("atr_signals", {})[symbol] = atr_signal_data
+
 
             except Exception as e:
-                logging.error(f"Ошибка обработки {symbol}: {e}")
+                logging.error(f"Ошибка обработки {symbol}: {e}\n{traceback.format_exc()}")
+                logging.error(f"{symbol}: Ошибка при обработке, последние данные:\n{df.tail() if 'df' in locals() else 'DataFrame не найден'}")
 
     formatted_messages = format_signals(signals)
     for msg in formatted_messages:
         send_message(msg)
 
+    if "atr_signals" in signals[timeframe]:
+        message = format_atr_signals_message(signals[timeframe]["atr_signals"])
+        if message:
+            send_message(message)
+
     logging.info(f"Обработка {len(symbols)} символов заняла {time.time() - start_time:.2f} секунд")
+
 
 
 def wait_for_next_candle(timeframe):
@@ -245,6 +404,7 @@ if __name__ == "__main__":
 
     with ThreadPoolExecutor(max_workers=len(TIMEFRAMES)) as executor:
         futures = {executor.submit(monitor_timeframe, tf): tf for tf in TIMEFRAMES}
+
         try:
             for future in as_completed(futures):
                 tf = futures[future]
