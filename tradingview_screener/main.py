@@ -200,11 +200,32 @@ def calculate_atr(df, period=14):
     return df.drop(columns=["H-L", "H-C", "L-C", "TR"])
 
 
-# Функция расчёта Stop-Loss и Take-Profit
-def calculate_stop_take(df, entry_price_col="Close", atr_col="ATR"):
-    df["SL"] = df[entry_price_col] - (df[atr_col] * 0.45)
-    df["TP"] = df[entry_price_col] + (df[atr_col] * 1.25)
-    return df
+
+def calculate_stop(signal, close_price, atr):
+    # Лонг: SL ниже входа
+    if signal == "STRONG_BUY":
+        stop = round(close_price - (atr * 0.45), 8)
+
+    # Шорт: SL выше входа
+    else:
+        stop = round(close_price + (atr * 0.45), 8)
+
+    return stop
+
+
+def calculate_take(signal, close_price, atr):
+    # Лонг: SL ниже входа, TP выше входа
+
+    if signal == "STRONG_BUY":
+        take = round(close_price + (atr * 1.25), 8)
+
+    # Шорт: SL выше входа
+    else:
+        take = round(close_price - (atr * 1.25), 8)
+
+    return take
+
+
 
 # Проверка успешных сигналов
 def load_successful_symbols():
@@ -231,11 +252,17 @@ def format_atr_signals_message(atr_signals):
 
     for symbol, data in atr_signals.items():
         direction = "LONG" if data["signal"] == "STRONG_BUY" else "SHORT"
+
+        # Исправляем форматирование, чтобы избежать ошибки
+        sl_value = f"{data['SL']:.4f}" if data["SL"] is not None else "N/A"
+        tp_value = f"{data['TP']:.4f}" if data["TP"] is not None else "N/A"
+
         msg = (f"<b>{symbol} {direction} {data['timeframe']}</b>\n"
                f"📍 Вход: {data['entry_price']}\n"
                f"📉 ATR: {data['ATR']:.4f}\n"
-               f"🛑 SL: {data['SL']:.4f}\n"
-               f"🎯 TP: {data['TP']:.4f}\n")
+               f"🛑 SL: {sl_value}\n"
+               f"🎯 TP: {tp_value}\n")
+
         signals_summary.append(msg)
 
     return "\n".join(signals_summary) if signals_summary else None
@@ -272,16 +299,22 @@ def process_symbols(symbols, timeframe):
                     continue
 
                 signal = data.get("RECOMMENDATION", "NEUTRAL")
+                print('SIGNAL', signal)
                 entry_price = prices.get(symbol)
 
                 if entry_price is None:
                     logging.warning(f"Цена для {symbol} не найдена, пропускаем")
                     continue
 
-                if signal == "STRONG_BUY":
+                if signal in {"STRONG_BUY"}:
                     signals[timeframe]["longs"][symbol] = (signal, entry_price)
-                elif signal == "STRONG_SELL":
+                elif signal in {"STRONG_SELL"}:
                     signals[timeframe]["shorts"][symbol] = (signal, entry_price)
+
+                # Важные символы
+                if symbol in IMPORTANT_SYMBOLS:
+                    signals["important"][symbol] = (signal, entry_price)
+
 
                 df = fetch_klines(symbol, interval=timeframe, limit=150)
 
@@ -310,30 +343,26 @@ def process_symbols(symbols, timeframe):
                     logging.warning(f"{symbol}: В последней строке есть NaN, пропускаем. Данные:\n{last_row}")
                     continue
 
-                atr = float(last_row["ATR"])
+                atr = atr = round(float(last_row["ATR"]), 8)
                 if pd.isna(atr):
                     logging.warning(f"{symbol}: ATR оказался NaN или None, пропускаем сохранение.")
                     continue
 
                 logging.info(f"Сохраняем сигнал: {symbol}, {timeframe}, {signal}, {entry_price}, {atr}")
-                save_signal(symbol, timeframe, signal, entry_price, atr)
 
-                if symbol in success_symbols:
+
+                if symbol in IMPORTANT_SYMBOLS or signal in {"STRONG_BUY", "STRONG_SELL"}:
+                    save_signal(symbol, timeframe, signal, entry_price, atr)
+
+                if timeframe == '4h' and (symbol in signals[timeframe]["longs"] or symbol in signals[timeframe]["shorts"]) and symbol in success_symbols:
                     if (signal == "STRONG_BUY" and btc_signal not in btc_long_signals) or \
                             (signal == "STRONG_SELL" and btc_signal not in btc_short_signals):
                         logging.info(f"{symbol}: Отклонён из-за BTCUSDT ({btc_signal})")
                         continue
 
-                    # Вычисляем стоп-лосс и тейк-профит только если символ успешный
-                    df = calculate_stop_take(df, entry_price_col="Close", atr_col="ATR")
+                    take_profit = calculate_take(signal=signal, close_price=entry_price, atr=atr)
+                    stop_loss = calculate_stop(signal=signal, close_price=entry_price, atr=atr)
 
-                    if "SL" in df.columns and "TP" in df.columns:
-                        stop_loss = df["SL"].iloc[-1]
-                        take_profit = df["TP"].iloc[-1]
-                        logging.info(f"Стоп-лосс: {stop_loss}, Тейк-профит: {take_profit}")
-                    else:
-                        stop_loss = take_profit = None
-                        logging.warning(f"{symbol}: Не удалось вычислить стоп-лосс или тейк-профит.")
 
                     # Форматируем сообщение для отправки в Telegram
                     atr_signal_data = {
@@ -355,7 +384,7 @@ def process_symbols(symbols, timeframe):
     for msg in formatted_messages:
         send_message(msg)
 
-    if "atr_signals" in signals[timeframe]:
+    if timeframe == '4h' and "atr_signals" in signals[timeframe]:
         message = format_atr_signals_message(signals[timeframe]["atr_signals"])
         if message:
             send_message(message)
