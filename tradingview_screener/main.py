@@ -5,13 +5,8 @@ from db import save_signal
 from binance_data import *
 import json
 import os
-import pandas as pd
 import requests
-import time
 from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -205,7 +200,6 @@ def calculate_stop(signal, close_price, atr):
     # Лонг: SL ниже входа
     if signal == "STRONG_BUY":
         stop = round(close_price - (atr * 0.45), 8)
-
     # Шорт: SL выше входа
     else:
         stop = round(close_price + (atr * 0.45), 8)
@@ -215,10 +209,8 @@ def calculate_stop(signal, close_price, atr):
 
 def calculate_take(signal, close_price, atr):
     # Лонг: SL ниже входа, TP выше входа
-
     if signal == "STRONG_BUY":
         take = round(close_price + (atr * 1.25), 8)
-
     # Шорт: SL выше входа
     else:
         take = round(close_price - (atr * 1.25), 8)
@@ -299,7 +291,7 @@ def process_symbols(symbols, timeframe):
                     continue
 
                 signal = data.get("RECOMMENDATION", "NEUTRAL")
-                print('SIGNAL', signal)
+                # print('SIGNAL', signal)
                 entry_price = prices.get(symbol)
 
                 if entry_price is None:
@@ -348,21 +340,22 @@ def process_symbols(symbols, timeframe):
                     logging.warning(f"{symbol}: ATR оказался NaN или None, пропускаем сохранение.")
                     continue
 
-                logging.info(f"Сохраняем сигнал: {symbol}, {timeframe}, {signal}, {entry_price}, {atr}")
+                # logging.info(f"Сохраняем сигнал: {symbol}, {timeframe}, {signal}, {entry_price}, {atr}")
 
 
                 if symbol in IMPORTANT_SYMBOLS or signal in {"STRONG_BUY", "STRONG_SELL"}:
                     save_signal(symbol, timeframe, signal, entry_price, atr)
 
-                if timeframe == '4h' and (symbol in signals[timeframe]["longs"] or symbol in signals[timeframe]["shorts"]) and symbol in success_symbols:
+                if (symbol in signals[timeframe]["longs"] or symbol in signals[timeframe]["shorts"]) and symbol in success_symbols:
                     if (signal == "STRONG_BUY" and btc_signal not in btc_long_signals) or \
                             (signal == "STRONG_SELL" and btc_signal not in btc_short_signals):
                         logging.info(f"{symbol}: Отклонён из-за BTCUSDT ({btc_signal})")
                         continue
 
                     take_profit = calculate_take(signal=signal, close_price=entry_price, atr=atr)
+                    # print('TAKE', take_profit)
                     stop_loss = calculate_stop(signal=signal, close_price=entry_price, atr=atr)
-
+                    # print('STOP', stop_loss)
 
                     # Форматируем сообщение для отправки в Telegram
                     atr_signal_data = {
@@ -384,7 +377,7 @@ def process_symbols(symbols, timeframe):
     for msg in formatted_messages:
         send_message(msg)
 
-    if timeframe == '4h' and "atr_signals" in signals[timeframe]:
+    if "atr_signals" in signals[timeframe]:
         message = format_atr_signals_message(signals[timeframe]["atr_signals"])
         if message:
             send_message(message)
