@@ -8,6 +8,9 @@ import os
 import requests
 from datetime import datetime, timezone
 
+
+
+
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -376,11 +379,13 @@ def process_symbols(symbols, timeframe):
     formatted_messages = format_signals(signals)
     for msg in formatted_messages:
         send_message(msg)
+        time.sleep(1)
 
     if "atr_signals" in signals[timeframe]:
         message = format_atr_signals_message(signals[timeframe]["atr_signals"])
         if message:
             send_message(message)
+            time.sleep(1)
 
     logging.info(f"Обработка {len(symbols)} символов заняла {time.time() - start_time:.2f} секунд")
 
