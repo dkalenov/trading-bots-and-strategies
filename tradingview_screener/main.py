@@ -7,14 +7,17 @@ import json
 import os
 import requests
 from datetime import datetime, timezone
-
-
+import time
+import logging
+import pandas as pd
+import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-TIMEFRAMES = ['30m', '1h', '4h']
+TIMEFRAMES = ['4h', '30m', '1h']
 INTERVAL_MAPPING = {
     "1m": Interval.INTERVAL_1_MINUTE,
     "5m": Interval.INTERVAL_5_MINUTES,
@@ -33,7 +36,11 @@ signals["important"] = {}
 
 
 CACHE_FILE = "tradingview_symbols.json"
-SUCCESS_FILE = "successful_signals_4h_BTC.csv"
+# SUCCESS_FILE = "successful_signals_4h_BTC.csv"
+
+
+success_symbols_df = pd.read_csv("successful_signals_4h_BTC.csv")
+success_symbols = success_symbols_df['symbol'].unique().tolist()
 
 
 def get_available_symbols():
@@ -221,53 +228,47 @@ def calculate_take(signal, close_price, atr):
     return take
 
 
+import html
 
-# Проверка успешных сигналов
-def load_successful_symbols():
-    try:
-        success_df = pd.read_csv(SUCCESS_FILE)
-        return set(success_df["symbol"].tolist())
-    except Exception as e:
-        logging.error(f"Ошибка загрузки файла успешных сигналов: {e}")
-        return set()
-
-
-def load_successful_symbols():
-    try:
-        success_df = pd.read_csv(SUCCESS_FILE )
-        return set(success_df["symbol"].tolist())
-    except Exception as e:
-        logging.error(f"Ошибка загрузки {SUCCESS_FILE }: {e}")
-        return set()
-
-# Функция отправки сообщения с ATR, SL, TP
 def format_atr_signals_message(atr_signals):
-    """Форматирует сигналы ATR, SL, TP в одно сообщение"""
-    signals_summary = []
+    """Форматирует сигналы ATR, SL, TP в список сообщений Telegram (< 4000 символов)"""
+    max_length = 4000
+    messages = []
+    current_msg = ""
 
     for symbol, data in atr_signals.items():
-        direction = "LONG" if data["signal"] == "STRONG_BUY" else "SHORT"
+        direction = "LONG" if data.get("signal") == "STRONG_BUY" else "SHORT"
 
-        # Исправляем форматирование, чтобы избежать ошибки
-        sl_value = f"{data['SL']:.4f}" if data["SL"] is not None else "N/A"
-        tp_value = f"{data['TP']:.4f}" if data["TP"] is not None else "N/A"
+        try:
+            entry = data.get("entry_price", "N/A")
+            atr = f"{data.get('ATR', 0):.4f}"
+            sl = f"{data.get('SL', 0):.4f}" if data.get("SL") is not None else "N/A"
+            tp = f"{data.get('TP', 0):.4f}" if data.get("TP") is not None else "N/A"
+            tf = data.get("timeframe", "N/A")
 
-        msg = (f"<b>{symbol} {direction} {data['timeframe']}</b>\n"
-               f"📍 Вход: {data['entry_price']}\n"
-               f"📉 ATR: {data['ATR']:.4f}\n"
-               f"🛑 SL: {sl_value}\n"
-               f"🎯 TP: {tp_value}\n")
+            msg = (
+                f"<b>{html.escape(symbol)} {direction} {tf}</b>\n"
+                f"📍 Вход: {entry}\n"
+                f"📉 ATR: {atr}\n"
+                f"🛑 SL: {sl}\n"
+                f"🎯 TP: {tp}\n\n"
+            )
 
-        signals_summary.append(msg)
+            # Разбиение на части по размеру
+            if len(current_msg) + len(msg) > max_length:
+                messages.append(current_msg)
+                current_msg = msg
+            else:
+                current_msg += msg
 
-    return "\n".join(signals_summary) if signals_summary else None
+        except Exception as e:
+            logging.error(f"Ошибка форматирования сигнала для {symbol}: {e}")
 
+    if current_msg:
+        messages.append(current_msg)
 
-import time
-import logging
-import pandas as pd
-import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
+    return messages
+
 
 def process_symbols(symbols, timeframe):
     start_time = time.time()
@@ -276,7 +277,7 @@ def process_symbols(symbols, timeframe):
     logging.info(f"Запуск process_symbols для {len(symbols)} символов на {timeframe}")
 
     prices = get_prices_binance(symbols)
-    success_symbols = load_successful_symbols()
+    # success_symbols = load_successful_symbols()
     btc_signal = get_data("BTCUSDT", timeframe).get("RECOMMENDATION", "NEUTRAL")
 
     btc_long_signals = {"NEUTRAL", "BUY", "STRONG_BUY"}
@@ -349,18 +350,26 @@ def process_symbols(symbols, timeframe):
                 if symbol in IMPORTANT_SYMBOLS or signal in {"STRONG_BUY", "STRONG_SELL"}:
                     save_signal(symbol, timeframe, signal, entry_price, atr)
 
-                if (symbol in signals[timeframe]["longs"] or symbol in signals[timeframe]["shorts"]) and symbol in success_symbols:
-                    if (signal == "STRONG_BUY" and btc_signal not in btc_long_signals) or \
-                            (signal == "STRONG_SELL" and btc_signal not in btc_short_signals):
-                        logging.info(f"{symbol}: Отклонён из-за BTCUSDT ({btc_signal})")
+                if signal in {"STRONG_BUY", "STRONG_SELL"} and symbol in success_symbols:
+                    # Сигналы по BTC
+                    is_btc_long = btc_signal in btc_long_signals
+                    is_btc_short = btc_signal in btc_short_signals
+
+                    # Если BTC даёт STRONG_BUY, то разрешаем только лонги по альтам
+                    if signal == "STRONG_BUY" and not is_btc_long:
+                        logging.info(f"{symbol}: отклонён, т.к. BTC сигнал не Long ({btc_signal})")
                         continue
 
-                    take_profit = calculate_take(signal=signal, close_price=entry_price, atr=atr)
-                    # print('TAKE', take_profit)
-                    stop_loss = calculate_stop(signal=signal, close_price=entry_price, atr=atr)
-                    # print('STOP', stop_loss)
+                    # Если BTC даёт STRONG_SELL, то разрешаем только шорты по альтам
+                    if signal == "STRONG_SELL" and not is_btc_short:
+                        logging.info(f"{symbol}: отклонён, т.к. BTC сигнал не Short ({btc_signal})")
+                        continue
 
-                    # Форматируем сообщение для отправки в Telegram
+                    # Вычисляем TP и SL
+                    take_profit = calculate_take(signal=signal, close_price=entry_price, atr=atr)
+                    stop_loss = calculate_stop(signal=signal, close_price=entry_price, atr=atr)
+
+                    # Сохраняем сигнал
                     atr_signal_data = {
                         "signal": signal,
                         "timeframe": timeframe,
@@ -369,6 +378,7 @@ def process_symbols(symbols, timeframe):
                         "SL": stop_loss,
                         "TP": take_profit
                     }
+
                     signals[timeframe].setdefault("atr_signals", {})[symbol] = atr_signal_data
 
 
@@ -379,13 +389,13 @@ def process_symbols(symbols, timeframe):
     formatted_messages = format_signals(signals)
     for msg in formatted_messages:
         send_message(msg)
-        time.sleep(1)
+        time.sleep(3.5)
 
     if "atr_signals" in signals[timeframe]:
         message = format_atr_signals_message(signals[timeframe]["atr_signals"])
         if message:
             send_message(message)
-            time.sleep(1)
+            time.sleep(3.5)
 
     logging.info(f"Обработка {len(symbols)} символов заняла {time.time() - start_time:.2f} секунд")
 
