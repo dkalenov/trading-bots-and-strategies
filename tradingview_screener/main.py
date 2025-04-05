@@ -350,36 +350,30 @@ def process_symbols(symbols, timeframe):
                 if symbol in IMPORTANT_SYMBOLS or signal in {"STRONG_BUY", "STRONG_SELL"}:
                     save_signal(symbol, timeframe, signal, entry_price, atr)
 
-                if signal in {"STRONG_BUY", "STRONG_SELL"} and symbol in success_symbols:
-                    # Сигналы по BTC
+                if (symbol in signals[timeframe]["longs"] or symbol in signals[timeframe]["shorts"]) and symbol in success_symbols:
+                # if signal in {"STRONG_BUY", "STRONG_SELL"} and symbol in success_symbols:
+
+                # Сигналы по BTC
                     is_btc_long = btc_signal in btc_long_signals
                     is_btc_short = btc_signal in btc_short_signals
 
                     # Если BTC даёт STRONG_BUY, то разрешаем только лонги по альтам
-                    if signal == "STRONG_BUY" and not is_btc_long:
-                        logging.info(f"{symbol}: отклонён, т.к. BTC сигнал не Long ({btc_signal})")
-                        continue
-
-                    # Если BTC даёт STRONG_SELL, то разрешаем только шорты по альтам
-                    if signal == "STRONG_SELL" and not is_btc_short:
-                        logging.info(f"{symbol}: отклонён, т.к. BTC сигнал не Short ({btc_signal})")
-                        continue
-
+                    if signal == "STRONG_BUY" and is_btc_long or signal == "STRONG_SELL" and is_btc_short:
                     # Вычисляем TP и SL
-                    take_profit = calculate_take(signal=signal, close_price=entry_price, atr=atr)
-                    stop_loss = calculate_stop(signal=signal, close_price=entry_price, atr=atr)
+                        take_profit = calculate_take(signal=signal, close_price=entry_price, atr=atr)
+                        stop_loss = calculate_stop(signal=signal, close_price=entry_price, atr=atr)
 
-                    # Сохраняем сигнал
-                    atr_signal_data = {
-                        "signal": signal,
-                        "timeframe": timeframe,
-                        "entry_price": entry_price,
-                        "ATR": atr,
-                        "SL": stop_loss,
-                        "TP": take_profit
-                    }
+                        # Сохраняем сигнал
+                        atr_signal_data = {
+                            "signal": signal,
+                            "timeframe": timeframe,
+                            "entry_price": entry_price,
+                            "ATR": atr,
+                            "SL": stop_loss,
+                            "TP": take_profit
+                        }
 
-                    signals[timeframe].setdefault("atr_signals", {})[symbol] = atr_signal_data
+                        signals[timeframe].setdefault("atr_signals", {})[symbol] = atr_signal_data
 
 
             except Exception as e:
