@@ -28,8 +28,8 @@ class Trades(Base):
     order_size = Column(Float)
     side = Column(Boolean)
     status = Column(String)
-    open_time = BigInteger()
-    close_time = BigInteger()
+    open_time = Column(BigInteger)
+    close_time = Column(BigInteger)
     entry_price = Column(Float)
     quantity = Column(Float)
     take1_price = Column(Float)
@@ -52,6 +52,14 @@ class Orders(Base):
     reduce = Column(Boolean)
     price = Column(Float)
     quantity = Column(Float)
+
+
+class Symbols(Base):
+    __tablename__ = 'symbols'
+    binance_symbol = Column(String, primary_key=True, nullable=False)
+    tradingview_symbol = Column(Boolean)
+    trade_mode = Column(Boolean, default=False)
+    last_update = Column(DateTime)
 
 class ConfigInfo:
     api_key: str
@@ -96,3 +104,8 @@ async def load_config():
 
     result = await s.execute(select(Config))
     data = {row.key: row.value for row in result.scalars()}
+
+
+# async def get_all_symbols():
+#     async with Session as s:
+#         return (await s.execute(select(SymbolsSettings))).scalars().all()
