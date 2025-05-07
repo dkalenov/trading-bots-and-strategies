@@ -20,6 +20,10 @@ client: binance.Futures
 all_symbols: dict[str, binance.SymbolFutures] = {}
 
 
+IMPORTANT_SYMBOLS = {'BTCUSDT', 'ETHUSDT'}
+VALID_SIGNALS = {'STRONG_BUY', 'STRONG_SELL'}
+
+
 # Интервалы TradingView
 INTERVAL_MAPPING = {
     "1m": Interval.INTERVAL_1_MINUTE,
@@ -47,12 +51,17 @@ async def main():
     while True:
         try:
             symbols = await load_symbols(client)
-            await daily_update_symbols(symbols)
+            # await daily_update_symbols(symbols)
+            await collect_signals()
             logging.info("Обновление завершено. Спим 24 часа...")
         except Exception as e:
             logging.error(f"Ошибка в основном цикле: {e}")
 
-        await asyncio.sleep(86400)  # 24 часа
+        # await asyncio.sleep(86400)  # 24 часа
+
+
+
+
 
 async def load_symbols(client):
     global all_symbols
@@ -119,6 +128,65 @@ async def daily_update_symbols(symbols, timeframe='4h'):
         except Exception as e:
             logging.error(f"Ошибка при обновлении символов: {e}")
             await s.rollback()
+
+
+
+
+async def collect_signals(timeframe='4h'):
+    async with session() as s:
+        # Получаем символы из БД
+        result = await s.execute(
+            select(db.Symbols).where(db.Symbols.tradingview_symbol == True)
+        )
+        symbols = result.scalars().all()
+        symbol_names = [s.binance_symbol for s in symbols]
+
+        # Получаем mark price
+        try:
+            prices_raw = await client.mark_price()
+            prices = {item['symbol']: float(item['markPrice']) for item in prices_raw}
+        except Exception as e:
+            logging.error(f"Ошибка при получении mark_price: {e}")
+            return  # Без цен нет смысла продолжать
+
+        signals_to_insert = []
+
+        for symbol in symbol_names:
+            try:
+                data = await get_tradingview_data(symbol, timeframe)
+                if not data:
+                    continue
+
+                entry_price = prices.get(symbol)
+                if entry_price is None:
+                    logging.warning(f"Цена не найдена для {symbol}")
+                    continue
+
+                if symbol in ['BTCUSDT', 'ETHUSDT'] or data['RECOMMENDATION'] in ['STRONG_BUY', 'STRONG_SELL']:
+                    logging.info(f"Сигнал {symbol}: {data['RECOMMENDATION']} по цене {entry_price}")
+
+                    signals_to_insert.append({
+                        "symbol": symbol,
+                        "interval": timeframe,
+                        "signal": data['RECOMMENDATION'],
+                        "entry_price": entry_price,
+                        "utc_time": datetime.utcnow()
+                    })
+
+            except Exception as e:
+                logging.warning(f"Ошибка сигнала {symbol}: {e}")
+
+        if signals_to_insert:
+            stmt = insert(db.TradingviewSignals).values(signals_to_insert)
+            await s.execute(stmt)
+            await s.commit()
+            logging.info(f"Вставлено сигналов: {len(signals_to_insert)}")
+        else:
+            logging.info("Нет сигналов для вставки.")
+
+
+
+
 
 if __name__ == '__main__':
     config = configparser.ConfigParser()
