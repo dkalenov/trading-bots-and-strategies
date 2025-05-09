@@ -2,14 +2,16 @@ import asyncio
 import configparser
 import logging
 import datetime
-
 from tradingview_ta import TA_Handler, Interval
 from sqlalchemy import update
 from sqlalchemy.dialects.postgresql import insert
-
 import binance
 import db
 from symbols_manager import *
+from sqlalchemy import insert
+from datetime import datetime, timezone  # для timezone-aware времени
+
+
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -20,8 +22,8 @@ client: binance.Futures
 all_symbols: dict[str, binance.SymbolFutures] = {}
 
 
-IMPORTANT_SYMBOLS = {'BTCUSDT', 'ETHUSDT'}
-VALID_SIGNALS = {'STRONG_BUY', 'STRONG_SELL'}
+IMPORTANT_SYMBOLS = ['BTCUSDT', 'ETHUSDT']
+VALID_SIGNALS = ['STRONG_BUY', 'STRONG_SELL']
 
 
 # Интервалы TradingView
@@ -134,24 +136,25 @@ async def daily_update_symbols(symbols, timeframe='4h'):
 
 async def collect_signals(timeframe='4h'):
     async with session() as s:
-        # Получаем символы из БД
         result = await s.execute(
             select(db.Symbols).where(db.Symbols.tradingview_symbol == True)
         )
         symbols = result.scalars().all()
         symbol_names = [s.binance_symbol for s in symbols]
 
-        # Получаем mark price
         try:
             prices_raw = await client.mark_price()
             prices = {item['symbol']: float(item['markPrice']) for item in prices_raw}
         except Exception as e:
             logging.error(f"Ошибка при получении mark_price: {e}")
-            return  # Без цен нет смысла продолжать
+            return
 
-        signals_to_insert = []
+        # sort symbols to preprocess IMPORTANT_SYMBOLS
+        other_symbols = [s for s in symbol_names if s not in IMPORTANT_SYMBOLS]
+        symbols_ordered = IMPORTANT_SYMBOLS + other_symbols
 
-        for symbol in symbol_names:
+        # for symbol in symbol_names:
+        for symbol in symbols_ordered:
             try:
                 data = await get_tradingview_data(symbol, timeframe)
                 if not data:
@@ -162,27 +165,23 @@ async def collect_signals(timeframe='4h'):
                     logging.warning(f"Цена не найдена для {symbol}")
                     continue
 
-                if symbol in ['BTCUSDT', 'ETHUSDT'] or data['RECOMMENDATION'] in ['STRONG_BUY', 'STRONG_SELL']:
-                    logging.info(f"Сигнал {symbol}: {data['RECOMMENDATION']} по цене {entry_price}")
+                is_important = symbol in IMPORTANT_SYMBOLS
+                is_valid = data['RECOMMENDATION'] in VALID_SIGNALS
 
-                    signals_to_insert.append({
-                        "symbol": symbol,
-                        "interval": timeframe,
-                        "signal": data['RECOMMENDATION'],
-                        "entry_price": entry_price,
-                        "utc_time": datetime.utcnow()
-                    })
+                if is_important or is_valid:
+                    logging.info(f"Сигнал {symbol}: {data['RECOMMENDATION']} по цене {entry_price}")
+                    stmt = insert(db.TradingviewSignals).values(
+                        symbol=symbol,
+                        interval=timeframe,
+                        signal=data['RECOMMENDATION'],
+                        entry_price=entry_price,
+                        utc_time=datetime.utcnow()
+                    )
+                    await s.execute(stmt)
+                    await s.commit()  # сразу сохраняем в БД
 
             except Exception as e:
                 logging.warning(f"Ошибка сигнала {symbol}: {e}")
-
-        if signals_to_insert:
-            stmt = insert(db.TradingviewSignals).values(signals_to_insert)
-            await s.execute(stmt)
-            await s.commit()
-            logging.info(f"Вставлено сигналов: {len(signals_to_insert)}")
-        else:
-            logging.info("Нет сигналов для вставки.")
 
 
 
