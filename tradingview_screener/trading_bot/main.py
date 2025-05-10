@@ -4,13 +4,12 @@ import logging
 import datetime
 from tradingview_ta import TA_Handler, Interval
 from sqlalchemy import update
-from sqlalchemy.dialects.postgresql import insert
 import binance
 import db
 from symbols_manager import *
 from sqlalchemy import insert
 from datetime import datetime, timezone  # для timezone-aware времени
-
+from sqlalchemy.dialects.postgresql import insert
 
 
 # Настройка логирования
@@ -110,6 +109,8 @@ async def get_tradingview_data(symbol, timeframe, retries=1):
             await asyncio.sleep(1)
     return None
 
+
+
 async def daily_update_symbols(symbols, timeframe='4h'):
     async with session() as s:
         try:
@@ -133,8 +134,9 @@ async def daily_update_symbols(symbols, timeframe='4h'):
 
 
 
+async def collect_signals(timeframe='4h', max_concurrent_tasks=10):
+    semaphore = asyncio.Semaphore(max_concurrent_tasks)
 
-async def collect_signals(timeframe='4h'):
     async with session() as s:
         result = await s.execute(
             select(db.Symbols).where(db.Symbols.tradingview_symbol == True)
@@ -142,46 +144,49 @@ async def collect_signals(timeframe='4h'):
         symbols = result.scalars().all()
         symbol_names = [s.binance_symbol for s in symbols]
 
-        try:
-            prices_raw = await client.mark_price()
-            prices = {item['symbol']: float(item['markPrice']) for item in prices_raw}
-        except Exception as e:
-            logging.error(f"Ошибка при получении mark_price: {e}")
-            return
+    try:
+        prices_raw = await client.mark_price()
+        prices = {item['symbol']: float(item['markPrice']) for item in prices_raw}
+    except Exception as e:
+        logging.error(f"Ошибка при получении mark_price: {e}")
+        return
 
-        # sort symbols to preprocess IMPORTANT_SYMBOLS
-        other_symbols = [s for s in symbol_names if s not in IMPORTANT_SYMBOLS]
-        symbols_ordered = IMPORTANT_SYMBOLS + other_symbols
+    other_symbols = [s for s in symbol_names if s not in IMPORTANT_SYMBOLS]
+    symbols_ordered = IMPORTANT_SYMBOLS + other_symbols
 
-        # for symbol in symbol_names:
-        for symbol in symbols_ordered:
+    async def process_symbol(symbol):
+        async with semaphore:
             try:
                 data = await get_tradingview_data(symbol, timeframe)
                 if not data:
-                    continue
+                    return
 
                 entry_price = prices.get(symbol)
                 if entry_price is None:
                     logging.warning(f"Цена не найдена для {symbol}")
-                    continue
+                    return
 
                 is_important = symbol in IMPORTANT_SYMBOLS
                 is_valid = data['RECOMMENDATION'] in VALID_SIGNALS
 
                 if is_important or is_valid:
                     logging.info(f"Сигнал {symbol}: {data['RECOMMENDATION']} по цене {entry_price}")
-                    stmt = insert(db.TradingviewSignals).values(
-                        symbol=symbol,
-                        interval=timeframe,
-                        signal=data['RECOMMENDATION'],
-                        entry_price=entry_price,
-                        utc_time=datetime.utcnow()
-                    )
-                    await s.execute(stmt)
-                    await s.commit()  # сразу сохраняем в БД
-
+                    async with session() as local_session:
+                        stmt = insert(db.TradingviewSignals).values(
+                            symbol=symbol,
+                            interval=timeframe,
+                            signal=data['RECOMMENDATION'],
+                            entry_price=entry_price,
+                            utc_time=datetime.utcnow()
+                        )
+                        await local_session.execute(stmt)
+                        await local_session.commit()
             except Exception as e:
                 logging.warning(f"Ошибка сигнала {symbol}: {e}")
+
+    tasks = [process_symbol(symbol) for symbol in symbols_ordered]
+    await asyncio.gather(*tasks)
+
 
 
 
