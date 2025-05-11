@@ -24,6 +24,7 @@ all_symbols: dict[str, binance.SymbolFutures] = {}
 IMPORTANT_SYMBOLS = ['BTCUSDT', 'ETHUSDT']
 VALID_SIGNALS = ['STRONG_BUY', 'STRONG_SELL']
 
+timeframe='4h'
 
 # Интервалы TradingView
 INTERVAL_MAPPING = {
@@ -51,9 +52,9 @@ async def main():
 
     while True:
         try:
-            symbols = await load_symbols(client)
-            # await daily_update_symbols(symbols)
-            await collect_signals()
+            symbols = await load_binance_symbols(client)
+            # await daily_update_symbols(symbols,timeframe)
+            await collect_signals(timeframe)
             logging.info("Обновление завершено. Спим 24 часа...")
         except Exception as e:
             logging.error(f"Ошибка в основном цикле: {e}")
@@ -64,7 +65,7 @@ async def main():
 
 
 
-async def load_symbols(client):
+async def load_binance_symbols(client):
     global all_symbols
     try:
         symbols_data = await client.load_symbols()
@@ -92,7 +93,8 @@ async def add_new_symbols(symbols):
             await s.rollback()
 
 async def get_tradingview_data(symbol, timeframe, retries=1):
-    interval = INTERVAL_MAPPING.get(timeframe, Interval.INTERVAL_4_HOURS)
+    interval = INTERVAL_MAPPING[timeframe]
+    # interval = INTERVAL_MAPPING.get(timeframe, Interval.INTERVAL_4_HOURS)
     for attempt in range(retries):
         try:
             handler = TA_Handler(
