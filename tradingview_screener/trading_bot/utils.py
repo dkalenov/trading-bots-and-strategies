@@ -1,7 +1,7 @@
 import asyncio
 import logging
-from datetime import datetime, timezone, timedelta
-
+from datetime import datetime, timezone, timedelta, time
+from tradingview_ta import TA_Handler, Interval
 
 
 logging.basicConfig(level=logging.INFO)
@@ -26,5 +26,19 @@ async def wait_for_next_candle(timeframe: str):
     logging.info(f"[{timeframe}] Ждем {int(wait_seconds)} секунд до закрытия свечи")
     await asyncio.sleep(wait_seconds)
 
+
+
+def is_tradingview_symbols_available(symbol: str) -> bool:
+    try:
+        handler = TA_Handler(
+            symbol=symbol,
+            exchange='Binance',
+            screener='crypto',
+            interval=Interval.INTERVAL_1_HOUR,
+        )
+        handler.get_analysis()
+        return True
+    except Exception:
+        return False
 
 
