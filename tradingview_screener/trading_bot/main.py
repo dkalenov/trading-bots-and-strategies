@@ -2,14 +2,13 @@ import asyncio
 import configparser
 import logging
 from tradingview_ta import TA_Handler, Interval
-from sqlalchemy import select
 import binance
 import db
-from symbols_manager import *
 from sqlalchemy.dialects.postgresql import insert
 from datetime import datetime, timezone, timedelta, time
 from concurrent.futures import ThreadPoolExecutor
-from sqlalchemy import update
+from sqlalchemy import select, update
+import utils
 
 
 # Настройка логирования
@@ -35,24 +34,68 @@ INTERVAL_MAPPING = {
     "1d": Interval.INTERVAL_1_DAY,
 }
 
+timeframes = ["1m", "5m"]
 
-async def periodic_symbol_update():
+async def main():
+    global session, conf, client
+
+    config.read('config.ini')
+    session = await db.connect(config['DB']['host'], int(config['DB']['port']), config['DB']['user'],
+        config['DB']['password'], config['DB']['db'])
+
+    conf = await db.load_config()
+    client = binance.Futures(
+        conf.api_key, conf.api_secret,
+        asynced=True, testnet=config.getboolean('BOT', 'testnet')
+    )
+
+    # Проверка: есть ли символы с поддержкой TradingView
+    if await is_symbols_table_empty():
+        logging.info("Символы с поддержкой TradingView не найдены — загружаем.")
+        await daily_update_symbols()
+
+        # Повторная проверка после обновления
+        if await is_symbols_table_empty():
+            logging.error("После обновления не найдено ни одного подходящего символа. Завершаем.")
+            return
+        else:
+            logging.info("Символы успешно загружены после обновления.")
+    else:
+        logging.info("Символы уже есть. Продолжаем.")
+
+    # Запуск сборщиков сигналов и обновления символов
+
+    await asyncio.gather(
+        *(timed_collector(tf) for tf in timeframes),
+        periodic_symbol_update()
+    )
+
+
+async def is_symbols_table_empty():
+    async with session() as s:
+        result = await s.execute(
+            select(db.Symbols.binance_symbol)
+            .where(db.Symbols.tradingview_symbol.is_(True))
+            .limit(1)
+        )
+        return result.scalar_one_or_none() is None
+
+
+
+async def periodic_symbol_update(hour=17, minute=30):
     while True:
-        # now = datetime.utcnow()
         now = datetime.now(timezone.utc)
-        target_time = datetime.combine(now.date(), time(17, 30)).replace(tzinfo=timezone.utc)
+        target_time = datetime.combine(now.date(), time(hour, minute)).replace(tzinfo=timezone.utc)
 
         # Если сейчас уже позже 05:30 — переносим на следующий день
         if now >= target_time:
             target_time += timedelta(days=1)
 
         wait_seconds = (target_time - now).total_seconds()
-        logging.info(f"Ждём {int(wait_seconds)} секунд до следующего обновления символов в 17:30 UTC...")
+        logging.info(f"Ждём {int(wait_seconds)} секунд до следующего обновления символов в {hour}:{minute} UTC...")
         await asyncio.sleep(wait_seconds)
 
-        # Запуск обновления
         await daily_update_symbols()
-
 
 
 async def daily_update_symbols():
@@ -61,27 +104,19 @@ async def daily_update_symbols():
     try:
         logging.info("Запуск ежедневного обновления символов...")
 
-        # 1. Загрузка символов с Binance
-        symbols_data = await client.load_symbols()
-        all_symbols = {
-            symbol: value for symbol, value in symbols_data.items()
-            if symbol.endswith('USDT') and 'USDC' not in symbol
-        }
+        # 1. Загружаем символы с Binance и обновляем БД (используем существующую функцию)
+        await load_binance_symbols(client)
+
+        # 2. Проверяем, какие из них доступны в TradingView
         binance_symbols = list(all_symbols.keys())
-
-        # 2. Сохранение новых символов в таблицу, если их нет
-        await add_new_symbols(binance_symbols)
-
-        # 3. Проверка доступности в TradingView (с потоками)
         loop = asyncio.get_running_loop()
         results = await asyncio.gather(
-            *[loop.run_in_executor(executor, is_tradingview_available, symbol) for symbol in binance_symbols]
+            *[loop.run_in_executor(executor, utils.is_tradingview_symbols_available, symbol) for symbol in binance_symbols]
         )
 
-        # 4. Обновление флагов tradingview_symbol
+        # 3. Обновляем флаги tradingview_symbol
         async with session() as s:
             try:
-                now = datetime.utcnow().replace(tzinfo=None)
                 now = datetime.now(timezone.utc).replace(tzinfo=None)
                 for symbol, available in zip(binance_symbols, results):
                     stmt = (
@@ -99,71 +134,17 @@ async def daily_update_symbols():
     except Exception as e:
         logging.error(f"Ошибка в daily_update_symbols: {e}")
 
-def is_tradingview_available(symbol: str) -> bool:
-    try:
-        handler = TA_Handler(
-            symbol=symbol,
-            exchange='Binance',
-            screener='crypto',
-            interval=Interval.INTERVAL_1_HOUR,
-        )
-        handler.get_analysis()
-        return True
-    except Exception:
-        return False
 
-
-
-async def wait_for_next_candle(timeframe: str):
-    now = datetime.now(timezone.utc)
-    if "h" in timeframe:
-        tf_hours = int(timeframe[:-1])
-        next_hour = (now.hour // tf_hours + 1) * tf_hours
-        next_time = now.replace(minute=0, second=5, microsecond=0, hour=next_hour % 24)
-        if next_hour >= 24:
-            next_time += timedelta(days=1)
-    elif "m" in timeframe:
-        tf_minutes = int(timeframe[:-1])
-        next_minute = (now.minute // tf_minutes + 1) * tf_minutes
-        next_time = now.replace(second=5, microsecond=0) + timedelta(minutes=(next_minute - now.minute))
-    else:
-        raise ValueError(f"Неподдерживаемый таймфрейм: {timeframe}")
-
-    wait_seconds = max((next_time - now).total_seconds(), 0)
-    logging.info(f"[{timeframe}] Ждем {int(wait_seconds)} секунд до закрытия свечи")
-    await asyncio.sleep(wait_seconds)
 
 
 async def timed_collector(timeframe: str):
     while True:
-        await wait_for_next_candle(timeframe)
+        await utils.wait_for_next_candle(timeframe)
         try:
             await collect_signals(timeframe)
         except Exception as e:
             logging.error(f"[{timeframe}] Ошибка в сборщике сигналов: {e}")
 
-
-async def main():
-    global session, conf, client
-
-    config.read('config.ini')
-    session = await db.connect(config['DB']['host'], int(config['DB']['port']), config['DB']['user'],
-        config['DB']['password'], config['DB']['db'])
-
-    conf = await db.load_config()
-    client = binance.Futures(
-        conf.api_key, conf.api_secret,
-        asynced=True, testnet=config.getboolean('BOT', 'testnet')
-    )
-
-    await load_binance_symbols(client)
-
-    timeframes = ["1m", "5m"]
-    # await asyncio.gather(*(timed_collector(tf) for tf in timeframes))
-    await asyncio.gather(
-        *(timed_collector(tf) for tf in timeframes),
-        periodic_symbol_update()
-    )
 
 
 async def load_binance_symbols(client):
@@ -176,12 +157,12 @@ async def load_binance_symbols(client):
         }
         symbols = [s.symbol for s in all_symbols.values()]
         logging.info(f"Загружены символы: {symbols}")
-        await add_new_symbols(symbols)
+        await update_binance_symbols_db(symbols)
     except Exception as e:
         logging.error(f"Ошибка при загрузке символов: {e}")
 
 
-async def add_new_symbols(symbols):
+async def update_binance_symbols_db(symbols):
     async with session() as s:
         try:
             for symbol in symbols:
@@ -193,21 +174,26 @@ async def add_new_symbols(symbols):
             await s.rollback()
 
 
-def sync_get_tradingview_data(symbol, interval):
-    try:
-        handler = TA_Handler(
-            symbol=symbol,
-            exchange='Binance',
-            screener="crypto",
-            interval=interval
-        )
-        analysis = handler.get_analysis().summary
-        analysis['SYMBOL'] = symbol
-        return analysis
-    except Exception as e:
-        logging.warning(f"TV ошибка {symbol}: {e}")
-        return None
 
+def get_tradingview_data(symbol, timeframe, retries=3):
+
+    interval = INTERVAL_MAPPING[timeframe]
+    for attempt in range(retries):
+        try:
+            handler = TA_Handler(
+                symbol=symbol,
+                exchange='Binance',
+                screener="crypto",
+                interval=interval
+            )
+            analysis = handler.get_analysis().summary
+            analysis['SYMBOL'] = symbol
+            return analysis
+        except Exception as e:
+            logging.warning(f"TV ошибка {symbol} ({timeframe}), попытка {attempt + 1}: {e}")
+            if attempt < retries - 1:
+                time.sleep(0.5)
+    return None
 
 
 
@@ -216,7 +202,7 @@ async def collect_signals(timeframe='4h'):
 
     async with session() as s:
         result = await s.execute(
-            select(db.Symbols).where(db.Symbols.tradingview_symbol == True)
+            select(db.Symbols).where(db.Symbols.tradingview_symbol.is_(True))
         )
         symbols = result.scalars().all()
         symbol_names = [s.binance_symbol for s in symbols]
@@ -241,7 +227,7 @@ async def collect_signals(timeframe='4h'):
 
 
 async def process_symbol(symbol, interval, timeframe, prices, loop):
-    data = await loop.run_in_executor(executor, sync_get_tradingview_data, symbol, interval)
+    data = await loop.run_in_executor(executor, get_tradingview_data, symbol, interval)
     if not data:
         return
 
