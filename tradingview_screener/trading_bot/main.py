@@ -34,7 +34,11 @@ INTERVAL_MAPPING = {
     "1d": Interval.INTERVAL_1_DAY,
 }
 
-timeframes = ["1m", "5m"]
+
+timeframes = ["1m", "5m", "15m"]
+btc_direction = None
+
+
 
 async def main():
     global session, conf, client
@@ -69,6 +73,111 @@ async def main():
         *(timed_collector(tf) for tf in timeframes),
         periodic_symbol_update()
     )
+
+
+async def timed_collector(timeframe: str):
+    while True:
+        await utils.wait_for_next_candle(timeframe)
+        try:
+            if timeframe == timeframes[0]:
+                await process_main_timeframe_signals()
+            else:
+                await asyncio.sleep(10) # ждём чтобы основной поток успел завершиться
+                await collect_signals(timeframe)
+        except Exception as e:
+            logging.error(f"[{timeframe}] Ошибка в сборщике сигналов: {e}")
+
+
+async def process_main_timeframe_signals():
+    global btc_signal
+    logging.info(f"Обработка сигналов {timeframes[0]} и открытие сделок...")
+
+    interval = INTERVAL_MAPPING[timeframes[0]]
+    async with session() as s:
+        result = await s.execute(
+            select(db.Symbols).where(db.Symbols.tradingview_symbol.is_(True))
+        )
+        symbols = result.scalars().all()
+        symbol_names = [s.binance_symbol for s in symbols]
+
+    try:
+        prices_raw = await client.mark_price()
+        prices = {item['symbol']: float(item['markPrice']) for item in prices_raw}
+    except Exception as e:
+        logging.error(f"Ошибка при получении цен: {e}")
+        return
+
+    # Сначала обрабатываем BTC отдельно
+    loop = asyncio.get_running_loop()
+    btc_data = await loop.run_in_executor(executor, get_tradingview_data, 'BTCUSDT', interval)
+    if not btc_data:
+        logging.error("Не удалось получить сигнал BTCUSDT — пропускаем обработку.")
+        return
+    btc_signal = btc_data['RECOMMENDATION']
+    logging.info(f"Сигнал BTCUSDT {timeframes[0]}: {btc_signal}")
+
+    # Обрабатываем все остальные сигналы, включая ETH
+    other_symbols = [s for s in symbol_names]
+    symbols_ordered = IMPORTANT_SYMBOLS + [s for s in other_symbols if s not in IMPORTANT_SYMBOLS]
+
+    tasks = []
+    for symbol in symbols_ordered:
+        tasks.append(process_trade_signal(symbol, interval, prices))
+
+    await asyncio.gather(*tasks)
+
+
+
+async def process_trade_signal(symbol, interval, prices):
+    loop = asyncio.get_running_loop()
+    data = await loop.run_in_executor(executor, get_tradingview_data, symbol, interval)
+    if not data:
+        return
+
+    entry_price = prices.get(symbol)
+    if entry_price is None:
+        logging.warning(f"Цена не найдена для {symbol}")
+        return
+
+    recommendation = data['RECOMMENDATION']
+    is_important = symbol in IMPORTANT_SYMBOLS
+    is_valid = recommendation in VALID_SIGNALS
+
+    # Сохраняем сигнал независимо от открытия сделки
+
+    await save_signal_to_db(symbol, interval, recommendation, entry_price)
+
+    # Логика открытия сделки
+    open_long = recommendation == 'STRONG_BUY' and btc_signal in ['STRONG_BUY', 'BUY', 'NEUTRAL']
+    open_short = recommendation == 'STRONG_SELL' and btc_signal in ['STRONG_SELL', 'SELL', 'NEUTRAL']
+
+    if is_important or is_valid:
+        if open_long or open_short:
+            logging.info(f"Открытие {'LONG' if open_long else 'SHORT'} по {symbol} @ {entry_price} | BTC = {btc_signal}")
+            await open_trade(symbol, entry_price, open_long)
+
+
+async def save_signal_to_db(symbol: str, timeframe: str, signal: str, entry_price: float):
+    async with session() as s_local:
+        try:
+            stmt = insert(db.TradingviewSignals).values(
+                symbol=symbol,
+                interval=timeframe,
+                signal=signal,
+                entry_price=entry_price,
+                utc_time=datetime.now(timezone.utc)
+            )
+            await s_local.execute(stmt)
+            await s_local.commit()
+        except Exception as db_e:
+            logging.error(f"Ошибка при сохранении сигнала {symbol}: {db_e}")
+            await s_local.rollback()
+
+
+async def open_trade(symbol: str, entry_price: float, is_long: bool):
+    logging.info(f"Открытие сделки")
+
+
 
 
 async def is_symbols_table_empty():
@@ -137,15 +246,6 @@ async def daily_update_symbols():
 
 
 
-async def timed_collector(timeframe: str):
-    while True:
-        await utils.wait_for_next_candle(timeframe)
-        try:
-            await collect_signals(timeframe)
-        except Exception as e:
-            logging.error(f"[{timeframe}] Ошибка в сборщике сигналов: {e}")
-
-
 
 async def load_binance_symbols(client):
     global all_symbols
@@ -197,7 +297,7 @@ def get_tradingview_data(symbol, timeframe, retries=3):
 
 
 
-async def collect_signals(timeframe='4h'):
+async def collect_signals(timeframe=timeframes[0]):
     interval = INTERVAL_MAPPING[timeframe]
 
     async with session() as s:
@@ -236,27 +336,14 @@ async def process_symbol(symbol, interval, timeframe, prices, loop):
         logging.warning(f"Цена не найдена для {symbol}")
         return
 
-    is_important = symbol in IMPORTANT_SYMBOLS
-    is_valid = data['RECOMMENDATION'] in VALID_SIGNALS
+    # is_important = symbol in IMPORTANT_SYMBOLS
+    # is_valid = data['RECOMMENDATION'] in VALID_SIGNALS
+    #
+    # if is_important or is_valid:
+    #     logging.info(f"Сигнал {symbol}: {data['RECOMMENDATION']} по цене {entry_price}")
 
-    if is_important or is_valid:
-        logging.info(f"Сигнал {symbol}: {data['RECOMMENDATION']} по цене {entry_price}")
 
-        async with session() as s_local:
-            try:
-                stmt = insert(db.TradingviewSignals).values(
-                    symbol=symbol,
-                    interval=timeframe,
-                    signal=data['RECOMMENDATION'],
-                    entry_price=entry_price,
-                    utc_time=datetime.now(timezone.utc)
-                )
-                await s_local.execute(stmt)
-                await s_local.commit()
-            except Exception as db_e:
-                logging.error(f"Ошибка при сохранении сигнала {symbol}: {db_e}")
-                await s_local.rollback()
-
+    await save_signal_to_db(symbol, timeframe, data['RECOMMENDATION'], entry_price)
 
 if __name__ == '__main__':
     config = configparser.ConfigParser()
