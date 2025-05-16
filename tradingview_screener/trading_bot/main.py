@@ -9,6 +9,9 @@ from datetime import datetime, timezone, timedelta, time
 from concurrent.futures import ThreadPoolExecutor
 from sqlalchemy import select, update
 import utils
+import traceback
+
+
 
 
 # Настройка логирования
@@ -17,9 +20,9 @@ logging.basicConfig(level=logging.INFO)
 # Глобальные переменные
 conf: db.ConfigInfo
 client: binance.Futures
-all_symbols: dict[str, binance.SymbolFutures] = {}
 session = None
 executor = ThreadPoolExecutor(max_workers=20)
+all_symbols: dict[str, binance.SymbolFutures] = {}
 
 IMPORTANT_SYMBOLS = ['BTCUSDT', 'ETHUSDT']
 VALID_SIGNALS = ['STRONG_BUY', 'STRONG_SELL']
@@ -36,8 +39,11 @@ INTERVAL_MAPPING = {
 
 
 timeframes = ["1m", "5m", "15m"]
-btc_direction = None
 
+btc_signal = None
+
+# список открытых позиций
+positions = {}
 
 
 async def main():
@@ -54,12 +60,12 @@ async def main():
     )
 
     # Проверка: есть ли символы с поддержкой TradingView
-    if await is_symbols_table_empty():
+    if await db.is_symbols_table_empty():
         logging.info("Символы с поддержкой TradingView не найдены — загружаем.")
         await daily_update_symbols()
 
         # Повторная проверка после обновления
-        if await is_symbols_table_empty():
+        if await db.is_symbols_table_empty():
             logging.error("После обновления не найдено ни одного подходящего символа. Завершаем.")
             return
         else:
@@ -69,11 +75,30 @@ async def main():
 
     # Запуск сборщиков сигналов и обновления символов
 
+    asyncio.create_task(load_binance_symbols(client))
+
     await asyncio.gather(
         *(timed_collector(tf) for tf in timeframes),
         periodic_symbol_update()
     )
 
+
+
+
+
+async def load_binance_symbols(client):
+    global all_symbols
+    try:
+        symbols_data = await client.load_symbols()
+        all_symbols = {
+            symbol: value for symbol, value in symbols_data.items()
+            if symbol.endswith('USDT') and 'USDC' not in symbol
+        }
+        symbols = [s.symbol for s in all_symbols.values()]
+        logging.info(f"Загружены символы: {symbols}")
+        await db.update_binance_symbols_db(symbols)
+    except Exception as e:
+        logging.error(f"Ошибка при загрузке символов: {e}")
 
 async def timed_collector(timeframe: str):
     while True:
@@ -86,6 +111,45 @@ async def timed_collector(timeframe: str):
                 await collect_signals(timeframe)
         except Exception as e:
             logging.error(f"[{timeframe}] Ошибка в сборщике сигналов: {e}")
+
+
+async def daily_update_symbols():
+    global all_symbols
+    try:
+        logging.info("Запуск ежедневного обновления символов...")
+
+        # 1. Загружаем символы с Binance и обновляем БД (используем существующую функцию)
+        await db.load_binance_symbols(client)
+
+        # 2. Проверяем, какие из них доступны в TradingView
+        binance_symbols = list(all_symbols.keys())
+        loop = asyncio.get_running_loop()
+        results = await asyncio.gather(
+            *[loop.run_in_executor(executor, db.is_tradingview_symbols_available, symbol) for symbol in binance_symbols]
+        )
+
+        # 3. Обновляем флаги tradingview_symbol
+        async with session() as s:
+            try:
+                now = datetime.now(timezone.utc).replace(tzinfo=None)
+                for symbol, available in zip(binance_symbols, results):
+                    stmt = (
+                        update(db.Symbols)
+                        .where(db.Symbols.binance_symbol == symbol)
+                        .values(tradingview_symbol=available, last_update=now)
+                    )
+                    await s.execute(stmt)
+                await s.commit()
+                logging.info("Флаги tradingview обновлены.")
+            except Exception as e:
+                await s.rollback()
+                logging.error(f"Ошибка при обновлении tradingview флагов: {e}")
+
+    except Exception as e:
+        logging.error(f"Ошибка в daily_update_symbols: {e}")
+
+
+
 
 
 async def process_main_timeframe_signals():
@@ -129,6 +193,7 @@ async def process_main_timeframe_signals():
 
 
 async def process_trade_signal(symbol, interval, prices):
+    signal = None
     loop = asyncio.get_running_loop()
     data = await loop.run_in_executor(executor, get_tradingview_data, symbol, interval)
     if not data:
@@ -144,51 +209,183 @@ async def process_trade_signal(symbol, interval, prices):
     is_valid = recommendation in VALID_SIGNALS
 
     # Сохраняем сигнал независимо от открытия сделки
+    await db.save_signal_to_db(symbol, interval, recommendation, entry_price)
 
-    await save_signal_to_db(symbol, interval, recommendation, entry_price)
 
     # Логика открытия сделки
     open_long = recommendation == 'STRONG_BUY' and btc_signal in ['STRONG_BUY', 'BUY', 'NEUTRAL']
     open_short = recommendation == 'STRONG_SELL' and btc_signal in ['STRONG_SELL', 'SELL', 'NEUTRAL']
 
+    if open_long:
+        signal = "BUY"
+    elif open_short:
+        signal = "SELL"
+
     if is_important or is_valid:
-        if open_long or open_short:
+        if signal:
             logging.info(f"Открытие {'LONG' if open_long else 'SHORT'} по {symbol} @ {entry_price} | BTC = {btc_signal}")
-            await open_trade(symbol, entry_price, open_long)
+
+            await new_trade(symbol, interval, signal)
 
 
-async def save_signal_to_db(symbol: str, timeframe: str, signal: str, entry_price: float):
-    async with session() as s_local:
+async def new_trade(symbol, interval, signal):
+    global positions
+    loop = asyncio.get_running_loop()
+    try:
         try:
-            stmt = insert(db.TradingviewSignals).values(
-                symbol=symbol,
-                interval=timeframe,
-                signal=signal,
-                entry_price=entry_price,
-                utc_time=datetime.now(timezone.utc)
-            )
-            await s_local.execute(stmt)
-            await s_local.commit()
-        except Exception as db_e:
-            logging.error(f"Ошибка при сохранении сигнала {symbol}: {db_e}")
-            await s_local.rollback()
+            klines = await client.klines(symbol, interval=interval, limit=150)
+            # print(f"{symbol} klines{klines}")
+        except Exception as e:
+            logging.error(f"Ошибка при получении свечей: {e}")
+            return
+
+        # try:
+            # async with session() as s:
+                # Проверяем, есть ли настройки для этого символа
+        #         result = await s.execute(
+        #             select(db.SymbolsSettings).where(db.SymbolsSettings.symbol == symbol)
+        #         )
+        #         settings = result.scalar_one_or_none()
+        #
+        #         if not settings:
+        #             # Проверяем, что символ есть в таблице symbols и он поддерживается TradingView
+        #             result = await s.execute(
+        #                 select(db.Symbols).where(
+        #                     db.Symbols.binance_symbol == symbol,
+        #                     db.Symbols.tradingview_symbol == True
+        #                 )
+        #             )
+        #             symbol_exists = result.scalar_one_or_none()
+        #
+        #             if symbol_exists:
+        #                 # Добавляем настройки по умолчанию
+        #                 s.add(db.SymbolsSettings(symbol=symbol))
+        #                 await s.commit()
+        #                 logging.info(f"Добавлены настройки по умолчанию для {symbol}.")
+        #
+        #                 # Повторно получаем настройки, чтобы достать значения по умолчанию из БД
+        #                 result = await s.execute(
+        #                     select(db.SymbolsSettings).where(db.SymbolsSettings.symbol == symbol)
+        #                 )
+        #                 settings = result.scalar_one()
+        #             else:
+        #                 logging.error(f"Символ {symbol} не найден в таблице symbols или не поддерживается TradingView.")
+        #                 return
+        #
+        #         # Получаем параметры из settings (уже гарантированно существуют)
+        #         atr_length = settings.atr_length
+        #
+        #
+        # except Exception as e:
+        #     logging.error(f"Ошибка при получении данных из настройки сивола: {e}")
+        #     return
 
 
-async def open_trade(symbol: str, entry_price: float, is_long: bool):
-    logging.info(f"Открытие сделки")
+
+
+        # получаем информацию о символе
+        if not (symbol_info := all_symbols.get(symbol)):
+            print("RETURN")
+            return
+
+        #получаем настройки для символа
+        try:
+            symbol_conf = await db.get_symbol_conf(symbol)
+            print(f"{symbol}: {symbol_conf}")
+        except Exception as e:
+            logging.error(f"Ошибка при получении конфигурации символа {symbol}: {e}")
+            return
+
+        atr_length = symbol_conf.atr_length
+        print(f"{symbol} atr: {atr_length}")
+        try:
+            df = await loop.run_in_executor(executor, utils.calculate_atr, klines, atr_length)
+        except Exception as e:
+            logging.error(f"Ошибка при расчёте atr: {e}")
+            return
+
+        last_row = df.iloc[-1]
+        atr = float(last_row["ATR"])
+        # print(f'{symbol}, atr:{atr}')
+
+        #получаем последнюю цену
+        last_price = float((await client.ticker_price(symbol))['price'])
+        print(f"{symbol}: {last_price}")
+        # расчитываем количество
+        quantity = utils.round_down(symbol_conf.order_size / last_price, symbol_info.step_size)
+        print(f"{symbol}: {quantity}")
+
+        # проверяем чтобы объем был больше минимального
+        min_notional = symbol_info.notional * 1.1
+        if quantity * last_price < min_notional:
+            # если объем меньше минимального, то берем минимальный объем
+            quantity = utils.round_up(min_notional / last_price, symbol_info.step_size)
+        # создаем ордер на вход в позицию
+        entry_order = await client.new_order(symbol=symbol, side='BUY' if signal == "BUY" else 'SELL', type='MARKET',
+                                             quantity=quantity, newOrderRespType='RESULT')
+
+
+    except:
+        print(f"Ошибка при открытии {'ЛОНГОВОЙ' if signal == "BUY" else 'ШОРТОВОЙ'} позиции по {symbol}\n{traceback.format_exc()}")
+        positions.pop(symbol, None)
+        return
+    try:
+        # получаем цену входа
+        entry_price = float(entry_order['avgPrice'])
+        # получаем количество из ордера
+        quantity = float(entry_order['executedQty'])
+        # расчитываем цены стопа и тейка
+        if signal == "BUY":
+            take_price = entry_price + atr * symbol_conf.take
+            stop_price = entry_price - atr * symbol_conf.stop
+        else:
+            take_price = entry_price - atr * symbol_conf.take
+            stop_price = entry_price + atr * symbol_conf.stop
+
+        # округляем их
+        take_price = round(take_price, symbol_info.tick_size)
+        stop_price = round(stop_price, symbol_info.tick_size)
+        # создаем ордеры на стоп и тейк
+        stop_order = await client.new_order(symbol=symbol, side='SELL' if signal == "BUY" else 'BUY', type='STOP_MARKET',
+                                            quantity=quantity, stopPrice=stop_price, timeInForce='GTE_GTC', reduceOnly=True)
+        take_order = await client.new_order(symbol=symbol, side='SELL' if signal == "BUY" else 'BUY', type='LIMIT',
+                                            quantity=quantity, price=take_price, timeInForce='GTC', reduceOnly=True)
+        print(f"Открыли сделку по {symbol} по цене {entry_price} с тейком {take_price} и стопом {stop_price}")
+        # создаем сессию для работы с базой данных
+        async with session() as s:
+            # записывает сделку в БД
+            trade = db.Trades(symbol=symbol, order_size=float(entry_order['cumQuote']), side = "BUY" if signal == "BUY" else "SELL",
+                              status='NEW', open_time=entry_order['updateTime'], interval=interval, leverage=symbol_conf.leverage,
+                              atr_length=atr_length, atr=atr, entry_price=entry_price, quantity=quantity, take1_price=take_price,
+                              take2_price=take_price, stop_price=stop_price)
 
 
 
-
-async def is_symbols_table_empty():
-    async with session() as s:
-        result = await s.execute(
-            select(db.Symbols.binance_symbol)
-            .where(db.Symbols.tradingview_symbol.is_(True))
-            .limit(1)
-        )
-        return result.scalar_one_or_none() is None
-
+            s.add(trade)
+            # отправляем данные в БД
+            await s.commit()
+            # записываем ордера в БД
+            for order in (entry_order, stop_order, take_order):
+                s.add(db.Orders(order_id=order['orderId'], trade_id=trade.id, symbol=symbol, time=order['updateTime'],
+                                side=order['side'] == 'BUY', type=order['type'], status=order['status'],
+                                reduce=order['reduceOnly'], price=float(order['avgPrice']),
+                                quantity=float(order['executedQty'])))
+            # отправляем данные в БД
+            await s.commit()
+            # формируем текст поста в канал
+            # text = (f"Открыл в <b>{'ЛОНГ' if signal.side else 'ШОРТ'}</b> {quantity} <b>{symbol}</b>\n"
+            #         f"Цена входа: <b>{entry_price}</b>\n"
+            #         f"Тейк / стоп: <b>{take_price} / {stop_price}</b>\n")
+            # # отправляем сообщение в канал
+            # msg = await tg.bot.send_message(config['TG']['channel'], text, parse_mode='HTML')
+            # # записываем идентификатор сообщения в БД
+            # trade.msg_id = msg.message_id
+            # await s.commit()
+    except:
+        print(f"Ошибка при выставлении стопа и тейка по {symbol}\n{traceback.format_exc()}")
+        # закрываю сделку по рынку
+        await client.new_order(symbol=symbol, side='SELL' if signal == "BUY" else 'BUY', type='MARKET', quantity=quantity,
+                               reduceOnly=True)
 
 
 async def periodic_symbol_update(hour=17, minute=30):
@@ -205,73 +402,6 @@ async def periodic_symbol_update(hour=17, minute=30):
         await asyncio.sleep(wait_seconds)
 
         await daily_update_symbols()
-
-
-async def daily_update_symbols():
-    global all_symbols
-
-    try:
-        logging.info("Запуск ежедневного обновления символов...")
-
-        # 1. Загружаем символы с Binance и обновляем БД (используем существующую функцию)
-        await load_binance_symbols(client)
-
-        # 2. Проверяем, какие из них доступны в TradingView
-        binance_symbols = list(all_symbols.keys())
-        loop = asyncio.get_running_loop()
-        results = await asyncio.gather(
-            *[loop.run_in_executor(executor, utils.is_tradingview_symbols_available, symbol) for symbol in binance_symbols]
-        )
-
-        # 3. Обновляем флаги tradingview_symbol
-        async with session() as s:
-            try:
-                now = datetime.now(timezone.utc).replace(tzinfo=None)
-                for symbol, available in zip(binance_symbols, results):
-                    stmt = (
-                        update(db.Symbols)
-                        .where(db.Symbols.binance_symbol == symbol)
-                        .values(tradingview_symbol=available, last_update=now)
-                    )
-                    await s.execute(stmt)
-                await s.commit()
-                logging.info("Флаги tradingview обновлены.")
-            except Exception as e:
-                await s.rollback()
-                logging.error(f"Ошибка при обновлении tradingview флагов: {e}")
-
-    except Exception as e:
-        logging.error(f"Ошибка в daily_update_symbols: {e}")
-
-
-
-
-
-async def load_binance_symbols(client):
-    global all_symbols
-    try:
-        symbols_data = await client.load_symbols()
-        all_symbols = {
-            symbol: value for symbol, value in symbols_data.items()
-            if symbol.endswith('USDT') and 'USDC' not in symbol
-        }
-        symbols = [s.symbol for s in all_symbols.values()]
-        logging.info(f"Загружены символы: {symbols}")
-        await update_binance_symbols_db(symbols)
-    except Exception as e:
-        logging.error(f"Ошибка при загрузке символов: {e}")
-
-
-async def update_binance_symbols_db(symbols):
-    async with session() as s:
-        try:
-            for symbol in symbols:
-                stmt = insert(db.Symbols).values(binance_symbol=symbol).on_conflict_do_nothing()
-                await s.execute(stmt)
-            await s.commit()
-        except Exception as e:
-            logging.error(f"Ошибка при вставке: {e}")
-            await s.rollback()
 
 
 
@@ -291,8 +421,8 @@ def get_tradingview_data(symbol, timeframe, retries=3):
             return analysis
         except Exception as e:
             logging.warning(f"TV ошибка {symbol} ({timeframe}), попытка {attempt + 1}: {e}")
-            if attempt < retries - 1:
-                time.sleep(0.5)
+            # if attempt < retries - 1:
+            #     time.sleep(0.5)
     return None
 
 
@@ -343,7 +473,10 @@ async def process_symbol(symbol, interval, timeframe, prices, loop):
     #     logging.info(f"Сигнал {symbol}: {data['RECOMMENDATION']} по цене {entry_price}")
 
 
-    await save_signal_to_db(symbol, timeframe, data['RECOMMENDATION'], entry_price)
+    await db.save_signal_to_db(symbol, timeframe, data['RECOMMENDATION'], entry_price)
+
+
+
 
 if __name__ == '__main__':
     config = configparser.ConfigParser()
