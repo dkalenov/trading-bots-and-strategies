@@ -36,7 +36,7 @@ btc_signal = None
 # список открытых позиций
 positions = {}
 
-
+websockets_list: list[binance.futures.WebsocketAsync] = []
 
 async def main():
     global session, conf, client, all_symbols, all_prices
@@ -85,7 +85,8 @@ async def timed_collector(timeframe: str, lock: asyncio.Lock):
 
 
 async def collect_signals(timeframe=timeframes[0]):
-    available_symbols = await db.get_all_available_symbols()
+    available_symbols_conf = await db.get_all_symbols_conf()
+    available_symbols = [s.symbol for s in available_symbols_conf]
     symbols_ordered = IMPORTANT_SYMBOLS + [s for s in available_symbols if s not in IMPORTANT_SYMBOLS]
 
     loop = asyncio.get_running_loop()
@@ -132,7 +133,9 @@ async def process_main_timeframe_signals():
     btc_signal = btc_data['RECOMMENDATION']
     logging.info(f"Сигнал BTCUSDT {timeframes[0]}: {btc_signal}")
 
-    available_symbols = await db.get_all_available_symbols()
+    available_symbols = await db.get_all_symbols_conf()
+    available_symbols = [s.symbol for s in available_symbols]
+    # print(f"AVAILABLE {available_symbols}")
     symbols_ordered = IMPORTANT_SYMBOLS + [s for s in available_symbols if s not in IMPORTANT_SYMBOLS]
 
     tasks = []
@@ -176,6 +179,7 @@ async def process_trade_signal(symbol, interval):
             logging.info(f"Открытие {'LONG' if open_long else 'SHORT'} по {symbol} @ {entry_price} | BTC = {btc_signal}")
 
             await new_trade(symbol, interval, signal)
+
 
 
 
@@ -296,11 +300,20 @@ async def new_trade(symbol, interval, signal):
                                reduceOnly=True)
 
 
-
-
-
-
-
+async def connect_ws():
+    global websockets_list
+    if not conf.trade_mode:
+        return
+    print("Подключение к вебсокетам")
+    streams = []
+    symbols = await db.get_all_symbols_conf()
+    for symbol in symbols:
+        if symbol.stuts:
+            streams.append(f"{symbol.symbol.lower()}@kline_{symbol.interval}")
+    chunk_size = 100
+    streams_list = [streams[i:i + chunk_size] for i in range(0, len(streams), chunk_size)]
+    for stream_list in streams_list:
+        websockets_list.append(await client.websocket(stream_list))
 
 
 if __name__ == '__main__':
