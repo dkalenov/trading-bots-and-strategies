@@ -2,9 +2,22 @@ from datetime import datetime
 from sqlalchemy import Column, Integer, BigInteger, String, Float, Boolean, DateTime, select
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+import logging
+from sqlalchemy.dialects.postgresql import insert
+from datetime import datetime, timezone, timedelta, time
+from sqlalchemy import select, update
+from tradingview_ta import TA_Handler, Interval
+import binance
+import asyncio
+import get_data
+
 
 Base = declarative_base()
 Session: async_sessionmaker
+client: binance.Futures
+
+
+
 
 
 class Config(Base):
@@ -25,9 +38,13 @@ class Trades(Base):
     __tablename__ = 'trades'
     id = Column(Integer, primary_key=True, autoincrement=True)
     symbol = Column(String)
+    interval = Column(String, default='4h')
     order_size = Column(Float)
     side = Column(Boolean)
     status = Column(String)
+    leverage = Column(Integer)
+    atr_length = Column(Integer)
+    atr = Column(Float)
     open_time = Column(BigInteger)
     close_time = Column(BigInteger)
     entry_price = Column(Float)
@@ -52,6 +69,21 @@ class Orders(Base):
     reduce = Column(Boolean)
     price = Column(Float)
     quantity = Column(Float)
+
+
+
+class SymbolsSettings(Base):
+    __tablename__ = 'symbols_settings'
+    symbol = Column(String, primary_key=True)
+    status = Column(Integer, default=0)
+    interval = Column(String, default='4h')
+    order_size = Column(Float, default=10)
+    leverage = Column(Integer, default=20)
+    atr_length = Column(Integer, default=14)
+    portion = Column(Float, default=0.05)
+    take1 = Column(Float, default=2.25)
+    take2 = Column(Float, default=2.25)
+    stop = Column(Float, default=0.45)
 
 
 class Symbols(Base):
@@ -80,13 +112,41 @@ class ConfigInfo:
             setattr(self, key, value)
 
 
-async def connect(host, port, user, password, db):
+# async def connect(host, port, user, password, db):
+#     global Session
+#     engine = create_async_engine(f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{db}")
+#     async with engine.begin() as conn:
+#         await conn.run_sync(Base.metadata.create_all)
+#     Session = async_sessionmaker(engine, expire_on_commit=False)
+#     return Session
+
+
+
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+
+async def connect(host, port, user, password, dbname):
     global Session
-    engine = create_async_engine(f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{db}")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    Session = async_sessionmaker(engine, expire_on_commit=False)
+    DATABASE_URL = f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{dbname}"
+
+    engine = create_async_engine(
+        DATABASE_URL,
+        echo=False,
+        pool_size=20,       # увеличиваем пул
+        max_overflow=30,    # сколько можно создать поверх основного пула
+        pool_timeout=10,    # сколько ждать свободное соединение
+    )
+
+    Session = async_sessionmaker(
+        bind=engine,
+        expire_on_commit=False,
+        class_=AsyncSession
+    )
+
     return Session
+
+
+
+
 
 async def load_config():
     for key in ConfigInfo.__annotations__.keys():
@@ -104,6 +164,203 @@ async def load_config():
 
     result = await s.execute(select(Config))
     data = {row.key: row.value for row in result.scalars()}
+
+
+# # функция для получения настроек для символа
+# async def get_symbol_conf(symbol):
+#     # создание сессии для работы с БД
+#     async with Session() as s:
+#         # получение настроек для символа
+#         symbols = await s.execute(select(SymbolsSettings).where(SymbolsSettings.symbol == symbol))
+#         # берем одну строку и возвращаем результат
+#         return symbols.scalars().one_or_none()
+
+
+
+async def get_symbol_conf(symbol):
+    async with Session() as s:
+        try:
+            # Получаем настройки символа
+            result = await s.execute(
+                select(SymbolsSettings).where(SymbolsSettings.symbol == symbol)
+            )
+            settings = result.scalar_one_or_none()
+
+            # Если настроек нет, проверяем, есть ли символ в таблице symbols и поддерживается ли TradingView
+            if not settings:
+                result = await s.execute(
+                    select(Symbols).where(
+                        Symbols.binance_symbol == symbol,
+                        Symbols.tradingview_symbol == True
+                    )
+                )
+                symbol_exists = result.scalar_one_or_none()
+
+                if symbol_exists:
+                    # Добавляем настройки по умолчанию
+                    s.add(SymbolsSettings(symbol=symbol))
+                    await s.commit()
+                    logging.info(f"Добавлены настройки по умолчанию для {symbol}.")
+
+                    # Повторно загружаем настройки для символа
+                    result = await s.execute(
+                        select(SymbolsSettings).where(SymbolsSettings.symbol == symbol)
+                    )
+                    settings = result.scalar_one()
+                else:
+                    logging.error(f"Символ {symbol} не найден в таблице symbols или не поддерживается TradingView.")
+                    return None
+
+            # Возвращаем настройки (уже гарантированно существуют)
+            return settings
+
+        except Exception as e:
+            logging.error(f"Ошибка при получении данных из настройки символа: {e}")
+            return None
+
+
+
+
+async def get_all_available_symbols():
+    async with Session() as s:
+        # return (await s.execute(select(SymbolsSettings))).scalars().all()
+
+        result = await s.execute(
+            select(Symbols).where(Symbols.tradingview_symbol.is_(True))
+        )
+        symbols = result.scalars().all()
+        return [s.binance_symbol for s in symbols]
+
+
+
+async def save_signal_to_db(symbol: str, timeframe: str, signal: str, entry_price: float):
+    async with Session() as s:
+        try:
+            stmt = insert(TradingviewSignals).values(
+                symbol=symbol,
+                interval=timeframe,
+                signal=signal,
+                entry_price=entry_price,
+                utc_time=datetime.now(timezone.utc)
+            )
+            await s.execute(stmt)
+            await s.commit()
+        except Exception as db_e:
+            logging.error(f"Ошибка при сохранении сигнала {symbol}: {db_e}")
+            await s.rollback()
+
+
+
+
+
+async def update_binance_symbols_db(symbols):
+    async with Session() as s:
+        try:
+            for symbol in symbols:
+                stmt = insert(Symbols).values(binance_symbol=symbol).on_conflict_do_nothing()
+                await s.execute(stmt)
+            await s.commit()
+        except Exception as e:
+            logging.error(f"Ошибка при вставке: {e}")
+            await s.rollback()
+
+
+
+def is_tradingview_symbols_available(symbol: str) -> bool:
+    try:
+        handler = TA_Handler(
+            symbol=symbol,
+            exchange='Binance',
+            screener='crypto',
+            interval=Interval.INTERVAL_1_HOUR,
+        )
+        handler.get_analysis()
+        return True
+    except Exception:
+        return False
+
+
+
+
+async def is_symbols_table_empty():
+    async with Session() as s:
+        result = await s.execute(
+            select(Symbols.binance_symbol)
+            .where(Symbols.tradingview_symbol.is_(True))
+            .limit(1)
+        )
+        return result.scalar_one_or_none() is None
+
+
+
+
+async def periodic_symbol_update(client, executor, lock: asyncio.Lock, hour=17, minute=30):
+    while True:
+        if await is_symbols_table_empty():
+            logging.info("Символы с поддержкой TradingView не найдены — загружаем.")
+            async with lock:
+                await daily_update_symbols(client, executor)
+
+            # Повторная проверка после обновления
+            if await is_symbols_table_empty():
+                logging.error("После обновления не найдено ни одного подходящего символа. Завершаем.")
+                return
+            else:
+                logging.info("Символы успешно загружены после обновления.")
+        else:
+            logging.info("Символы уже есть. Продолжаем.")
+
+        # ждём до следующего обновления
+        now = datetime.now(timezone.utc)
+        target_time = datetime.combine(now.date(), time(hour, minute)).replace(tzinfo=timezone.utc)
+        if now >= target_time:
+            target_time += timedelta(days=1)
+
+        wait_seconds = (target_time - now).total_seconds()
+        logging.info(f"Ждём {int(wait_seconds)} секунд до следующего обновления символов в {hour}:{minute} UTC...")
+        await asyncio.sleep(wait_seconds)
+
+        # 🔒 Блокируем сбор сигналов на время обновления
+        async with lock:
+            await daily_update_symbols(client, executor)
+
+
+
+
+
+async def daily_update_symbols(client, executor):
+    try:
+        logging.info("Запуск ежедневного обновления символов...")
+
+        # 1. Загружаем символы с Binance и обновляем БД (используем существующую функцию)
+        symbols = await get_data.load_binance_symbols(client)
+
+        # 2. Проверяем, какие из них доступны в TradingView
+        binance_symbols = list(symbols.keys())
+        loop = asyncio.get_running_loop()
+        results = await asyncio.gather(
+            *[loop.run_in_executor(executor, is_tradingview_symbols_available, symbol) for symbol in binance_symbols]
+        )
+
+        # 3. Обновляем флаги tradingview_symbol
+        async with Session() as s:
+            try:
+                now = datetime.now(timezone.utc).replace(tzinfo=None)
+                for symbol, available in zip(binance_symbols, results):
+                    stmt = (
+                        update(Symbols)
+                        .where(Symbols.binance_symbol == symbol)
+                        .values(tradingview_symbol=available, last_update=now)
+                    )
+                    await s.execute(stmt)
+                await s.commit()
+                logging.info("Флаги tradingview обновлены.")
+            except Exception as e:
+                await s.rollback()
+                logging.error(f"Ошибка при обновлении tradingview флагов: {e}")
+
+    except Exception as e:
+        logging.error(f"Ошибка в daily_update_symbols: {e}")
 
 
 # async def get_all_symbols():
