@@ -29,7 +29,7 @@ all_prices: dict[str, binance.SymbolFutures] = {}
 IMPORTANT_SYMBOLS = ['BTCUSDT', 'ETHUSDT']
 VALID_SIGNALS = ['STRONG_BUY', 'STRONG_SELL']
 
-timeframes = ["1m", "5m", "15m"]
+timeframes = ["5m", "1m", "15m"]
 
 btc_signal = None
 
@@ -58,8 +58,10 @@ async def main():
     all_symbols = await get_data.load_binance_symbols(client)
     all_prices = await get_data.get_all_prices(client)
     # print(f" ALL SYMBOLS {all_symbols}")
-    # asyncio.create_task(load_binance_symbols(client))
 
+    # await asyncio.create_task(connect_ws())
+
+    #
     symbol_update_lock = asyncio.Lock()
 
     await asyncio.gather(
@@ -248,10 +250,10 @@ async def new_trade(symbol, interval, signal):
         quantity = float(entry_order['executedQty'])
         # расчитываем цены стопа и тейка
         if signal == "BUY":
-            take_price = entry_price + atr * symbol_conf.take
+            take_price = entry_price + atr * symbol_conf.take2
             stop_price = entry_price - atr * symbol_conf.stop
         else:
-            take_price = entry_price - atr * symbol_conf.take
+            take_price = entry_price - atr * symbol_conf.take2
             stop_price = entry_price + atr * symbol_conf.stop
 
         # округляем их
@@ -266,9 +268,9 @@ async def new_trade(symbol, interval, signal):
         # создаем сессию для работы с базой данных
         async with session() as s:
             # записывает сделку в БД
-            trade = db.Trades(symbol=symbol, order_size=float(entry_order['cumQuote']), side = "BUY" if signal == "BUY" else "SELL",
+            trade = db.Trades(symbol=symbol, order_size=float(entry_order['cumQuote']), side = 1 if signal == "BUY" else 0,
                               status='NEW', open_time=entry_order['updateTime'], interval=interval, leverage=symbol_conf.leverage,
-                              atr_length=atr_length, atr=atr, entry_price=entry_price, quantity=quantity, take1_price=take_price,
+                              atr_length=atr_length, atr=atr, entry_price=entry_price, quantity=quantity, take1_price=(take_price / 2),
                               take2_price=take_price, stop_price=stop_price)
 
 
@@ -282,8 +284,8 @@ async def new_trade(symbol, interval, signal):
                                 side=order['side'] == 'BUY', type=order['type'], status=order['status'],
                                 reduce=order['reduceOnly'], price=float(order['avgPrice']),
                                 quantity=float(order['executedQty'])))
-    #         # отправляем данные в БД
-    #         await s.commit()
+            # отправляем данные в БД
+            await s.commit()
             # формируем текст поста в канал
             # text = (f"Открыл в <b>{'ЛОНГ' if signal.side else 'ШОРТ'}</b> {quantity} <b>{symbol}</b>\n"
             #         f"Цена входа: <b>{entry_price}</b>\n"
@@ -308,12 +310,17 @@ async def connect_ws():
     streams = []
     symbols = await db.get_all_symbols_conf()
     for symbol in symbols:
-        if symbol.stuts:
+        if symbol.status:
             streams.append(f"{symbol.symbol.lower()}@kline_{symbol.interval}")
     chunk_size = 100
     streams_list = [streams[i:i + chunk_size] for i in range(0, len(streams), chunk_size)]
     for stream_list in streams_list:
-        websockets_list.append(await client.websocket(stream_list))
+        websockets_list.append(await client.websocket(stream_list, on_message=ws_msg))
+
+
+async def ws_msg(ws, msg):
+    print(msg)
+
 
 
 if __name__ == '__main__':
