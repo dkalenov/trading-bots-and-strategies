@@ -221,15 +221,15 @@ async def get_symbol_conf(symbol):
 
 
 
-async def get_all_available_symbols():
+async def get_all_symbols_conf():
     async with Session() as s:
-        # return (await s.execute(select(SymbolsSettings))).scalars().all()
+        return (await s.execute(select(SymbolsSettings))).scalars().all()
 
-        result = await s.execute(
-            select(Symbols).where(Symbols.tradingview_symbol.is_(True))
-        )
-        symbols = result.scalars().all()
-        return [s.binance_symbol for s in symbols]
+        # result = await s.execute(
+        #     select(Symbols).where(Symbols.tradingview_symbol.is_(True))
+        # )
+        # symbols = result.scalars().all()
+        # return [s.binance_symbol for s in symbols]
 
 
 
