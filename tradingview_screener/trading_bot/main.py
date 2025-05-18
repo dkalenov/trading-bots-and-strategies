@@ -11,6 +11,7 @@ from sqlalchemy import select, update
 import utils
 import traceback
 import get_data
+import tg
 
 
 
@@ -29,7 +30,7 @@ all_prices: dict[str, binance.SymbolFutures] = {}
 IMPORTANT_SYMBOLS = ['BTCUSDT', 'ETHUSDT']
 VALID_SIGNALS = ['STRONG_BUY', 'STRONG_SELL']
 
-timeframes = ["5m", "1m", "15m"]
+timeframes = ["1m", "5m", "15m"]
 
 btc_signal = None
 
@@ -63,10 +64,12 @@ async def main():
 
     #
     symbol_update_lock = asyncio.Lock()
+    # await tg.run()
 
     await asyncio.gather(
         *(timed_collector(tf, symbol_update_lock) for tf in timeframes),
-        db.periodic_symbol_update(client, executor, symbol_update_lock, hour=17, minute=35)
+        db.periodic_symbol_update(client, executor, symbol_update_lock, hour=17, minute=35),
+        tg.run()
     )
 
 
@@ -286,15 +289,16 @@ async def new_trade(symbol, interval, signal):
                                 quantity=float(order['executedQty'])))
             # отправляем данные в БД
             await s.commit()
+
             # формируем текст поста в канал
-            # text = (f"Открыл в <b>{'ЛОНГ' if signal.side else 'ШОРТ'}</b> {quantity} <b>{symbol}</b>\n"
-            #         f"Цена входа: <b>{entry_price}</b>\n"
-            #         f"Тейк / стоп: <b>{take_price} / {stop_price}</b>\n")
-            # # отправляем сообщение в канал
-            # msg = await tg.bot.send_message(config['TG']['channel'], text, parse_mode='HTML')
-            # # записываем идентификатор сообщения в БД
-            # trade.msg_id = msg.message_id
-            # await s.commit()
+            text = (f"Открыл в <b>{'ЛОНГ' if signal=="BUY" else 'ШОРТ'}</b> {quantity} <b>{symbol}</b>\n"
+                    f"Цена входа: <b>{entry_price}</b>\n"
+                    f"Тейк / стоп: <b>{take_price} / {stop_price}</b>\n")
+            # отправляем сообщение в канал
+            msg = await tg.bot.send_message(config['TG']['channel'], text, parse_mode='HTML')
+            # записываем идентификатор сообщения в БД
+            trade.msg_id = msg.message_id
+            await s.commit()
     except:
         print(f"Ошибка при выставлении стопа и тейка по {symbol}\n{traceback.format_exc()}")
         # закрываю сделку по рынку
