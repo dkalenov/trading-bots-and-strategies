@@ -12,7 +12,7 @@ import utils
 import traceback
 import get_data
 import tg
-
+import pprint
 
 
 # Настройка логирования
@@ -38,6 +38,7 @@ btc_signal = None
 positions = {}
 
 websockets_list: list[binance.futures.WebsocketAsync] = []
+trade_watchers: dict[str, asyncio.Task] = {}
 
 async def main():
     global session, conf, client, all_symbols, all_prices
@@ -55,22 +56,24 @@ async def main():
     # Проверка: есть ли символы с поддержкой TradingView
 
     # Запуск сборщиков сигналов и обновления символов
-
-    all_symbols = await get_data.load_binance_symbols(client)
-    all_prices = await get_data.get_all_prices(client)
-    # print(f" ALL SYMBOLS {all_symbols}")
-
-    # await asyncio.create_task(connect_ws())
-
-    #
     symbol_update_lock = asyncio.Lock()
-    # await tg.run()
 
-    await asyncio.gather(
-        *(timed_collector(tf, symbol_update_lock) for tf in timeframes),
-        db.periodic_symbol_update(client, executor, symbol_update_lock, hour=17, minute=35),
-        tg.run()
-    )
+    await get_data.sync_positions_with_exchange(client, positions)
+    print(f"Всего открытых сделок: {sum(1 for v in positions.values() if v)}")
+    all_symbols = await get_data.load_binance_symbols(client)
+
+    while True:
+        all_prices = await get_data.get_all_prices(client)
+        # print(f" ALL SYMBOLS {all_symbols}")
+
+        # await asyncio.create_task(connect_ws())
+        # await tg.run()
+
+        await asyncio.gather(
+            *(timed_collector(tf, symbol_update_lock) for tf in timeframes),
+            db.periodic_symbol_update(client, executor, symbol_update_lock, hour=17, minute=35),
+            tg.run()
+        )
 
 
 
@@ -179,11 +182,11 @@ async def process_trade_signal(symbol, interval):
     elif open_short:
         signal = "SELL"
 
-    if is_important or is_valid:
-        if signal:
-            logging.info(f"Открытие {'LONG' if open_long else 'SHORT'} по {symbol} @ {entry_price} | BTC = {btc_signal}")
+    if (is_valid or symbol in IMPORTANT_SYMBOLS) and symbol not in positions.keys():
+    # if is_valid and symbol not in positions.keys():
 
-            await new_trade(symbol, interval, signal)
+        logging.info(f"Открытие {'LONG' if open_long else 'SHORT'} по {symbol} @ {entry_price} | BTC = {btc_signal}")
+        await new_trade(symbol, interval, signal)
 
 
 
@@ -212,6 +215,8 @@ async def new_trade(symbol, interval, signal):
             return
 
         atr_length = symbol_conf.atr_length
+        portion = symbol_conf.portion
+        take1 = symbol_conf.take1
         # print(f"{symbol} atr: {atr_length}")
         try:
             df = await loop.run_in_executor(executor, utils.calculate_atr, klines, atr_length)
@@ -238,12 +243,14 @@ async def new_trade(symbol, interval, signal):
             # если объем меньше минимального, то берем минимальный объем
             quantity = utils.round_up(min_notional / last_price, symbol_info.step_size)
         # создаем ордер на вход в позицию
+        print(f"Открываем позицию по {symbol}")
         entry_order = await client.new_order(symbol=symbol, side='BUY' if signal == "BUY" else 'SELL', type='MARKET',
                                              quantity=quantity, newOrderRespType='RESULT')
 
 
+
     except:
-        print(f"Ошибка при открытии {'ЛОНГОВОЙ' if signal == "BUY" else 'ШОРТОВОЙ'} позиции по {symbol}\n{traceback.format_exc()}")
+        # print(f"Ошибка при открытии {'ЛОНГОВОЙ' if signal == "BUY" else 'ШОРТОВОЙ'} позиции по {symbol}\n{traceback.format_exc()}")
         positions.pop(symbol, None)
         return
     try:
@@ -267,6 +274,11 @@ async def new_trade(symbol, interval, signal):
                                             quantity=quantity, stopPrice=stop_price, timeInForce='GTE_GTC', reduceOnly=True)
         take_order = await client.new_order(symbol=symbol, side='SELL' if signal == "BUY" else 'BUY', type='LIMIT',
                                             quantity=quantity, price=take_price, timeInForce='GTC', reduceOnly=True)
+
+        positions[symbol] = True
+
+        await start_trade_monitor(symbol, entry_price, signal, atr, portion, take1)
+
         print(f"Открыли сделку по {symbol} по цене {entry_price} с тейком {take_price} и стопом {stop_price}")
         # создаем сессию для работы с базой данных
         async with session() as s:
@@ -300,7 +312,7 @@ async def new_trade(symbol, interval, signal):
             trade.msg_id = msg.message_id
             await s.commit()
     except:
-        print(f"Ошибка при выставлении стопа и тейка по {symbol}\n{traceback.format_exc()}")
+        # print(f"Ошибка при выставлении стопа и тейка по {symbol}\n{traceback.format_exc()}")
         # закрываю сделку по рынку
         await client.new_order(symbol=symbol, side='SELL' if signal == "BUY" else 'BUY', type='MARKET', quantity=quantity,
                                reduceOnly=True)
@@ -308,10 +320,22 @@ async def new_trade(symbol, interval, signal):
 
 async def connect_ws():
     global websockets_list
+    global userdata_ws
+    global conf
+    # загружаем конфиг
+    conf = await db.load_config()
+    # если торговля отключена, то выходим
     if not conf.trade_mode:
         return
-    print("Подключение к вебсокетам")
+    # проверяем API KEY и SECRET KEY
+    if not conf.api_key or not conf.api_secret:
+        # если нет, то отключаем торговлю
+        await db.config_update(trade_mode='0')
+        return
+    print(f"Подключаемся к вебсокетам")
+    # создаем списки стримов
     streams = []
+
     symbols = await db.get_all_symbols_conf()
     for symbol in symbols:
         if symbol.status:
@@ -320,6 +344,102 @@ async def connect_ws():
     streams_list = [streams[i:i + chunk_size] for i in range(0, len(streams), chunk_size)]
     for stream_list in streams_list:
         websockets_list.append(await client.websocket(stream_list, on_message=ws_msg))
+
+
+
+
+
+# обработка сообщений вебсокета
+async def ws_msg(ws, msg):
+    global positions
+    if 'data' not in msg:
+        return
+    # получаем свечу
+    kline = msg['data']['k']
+    # получаем символ и интервал
+    symbol = kline['s']
+    interval = kline['i']
+    pprint.pprint(kline)
+
+
+
+async def start_trade_monitor(symbol, entry_price, side, atr, portion, take1):
+    global positions, client, trade_watchers
+
+    async def on_price_update(ws, msg):
+        try:
+            kline = msg.get("data", {}).get("k", {})
+            if not kline or not kline.get("x"):  # только закрытые свечи
+                return
+
+            current_price = float(kline["c"])
+            take_trigger = entry_price + take1 * atr if side == "BUY" else entry_price - take1 * atr
+            stop_breakeven = entry_price * 1.01 if side == "BUY" else entry_price * 0.99 # переместим стоп в безубыток
+
+            # Получаем информацию по позиции
+            position_info = await client.get_position_risk(symbol)
+            position_amt = abs(float(position_info['positionAmt']))
+
+            # Если позиция закрыта вручную — выключаем монитор
+            if not position_amt or symbol not in positions:
+                print(f"{symbol} — позиция закрыта, выключаю монитор")
+                ws.stop()
+                trade_watchers.pop(symbol, None)
+                return
+
+            hit_take = (side == "BUY" and current_price >= take_trigger) or \
+                       (side == "SELL" and current_price <= take_trigger)
+            if not hit_take:
+                return
+
+            print(f"{symbol} достиг цели 2.5 ATR — частичное закрытие и стоп в безубыток")
+
+            reduce_qty = utils.round_down(position_amt * portion, all_symbols[symbol].step_size)
+            remaining_qty = utils.round_down(position_amt - reduce_qty, all_symbols[symbol].step_size)
+
+            # Закрытие 50% позиции
+            await client.new_order(
+                symbol=symbol,
+                side="SELL" if side == "BUY" else "BUY",
+                type="MARKET",
+                quantity=reduce_qty,
+                reduceOnly=True
+            )
+
+            # Удаление старых стопов
+            open_orders = await client.get_open_orders(symbol)
+            for order in open_orders:
+                if order['type'] == 'STOP_MARKET':
+                    await client.cancel_order(symbol=symbol, orderId=order['orderId'])
+
+            # Новый стоп в безубыток
+            stop_price = round(stop_breakeven, all_symbols[symbol].tick_size)
+            await client.new_order(
+                symbol=symbol,
+                side="SELL" if side == "BUY" else "BUY",
+                type="STOP_MARKET",
+                stopPrice=stop_price,
+                quantity=remaining_qty,
+                reduceOnly=True,
+                timeInForce="GTE_GTC"
+            )
+
+            print(f"{symbol} частично закрыт, стоп в безубытке на {stop_price}")
+            ws.stop()
+            trade_watchers.pop(symbol, None)
+
+        except Exception as e:
+            print(f"❌ Ошибка в мониторинге {symbol}:\n{traceback.format_exc()}")
+            ws.stop()
+            trade_watchers.pop(symbol, None)
+
+    try:
+        ws = await client.websocket([f"{symbol.lower()}@kline_1m"], on_message=on_price_update)
+        trade_watchers[symbol] = ws
+    except Exception as e:
+        print(f"❌ Не удалось запустить WebSocket монитор для {symbol}:\n{traceback.format_exc()}")
+
+
 
 
 async def ws_msg(ws, msg):
