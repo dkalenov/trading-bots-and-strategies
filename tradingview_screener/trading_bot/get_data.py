@@ -63,3 +63,17 @@ async def get_all_prices(client) -> dict[str, float]:
         return
 
 
+async def sync_positions_with_exchange(client, positions: dict):
+    position_info = await client.get_position_risk()
+
+    for pos in position_info:
+        symbol = pos['symbol']
+        amt = float(pos['positionAmt'])
+
+        if amt != 0.0:
+            if symbol not in positions or not positions[symbol]:
+                # print(f"[SYNC] Найдена активная позиция на бирже: {symbol}")
+                positions[symbol] = True
+        else:
+            if symbol not in positions:
+                positions[symbol] = False
