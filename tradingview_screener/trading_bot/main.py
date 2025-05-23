@@ -510,10 +510,15 @@ btc_signal = None
 positions = {}
 
 websockets_list: list[binance.futures.WebsocketAsync] = []
-available_symbols, trade_mode = None, None
+
+debug = None
+
+symbol_conf_cache: dict[str, db.SymbolsSettings] = {}
+
+
 
 async def main():
-    global session, conf, client, all_symbols, all_prices, available_symbols, trade_mode
+    global session, conf, client, all_symbols, all_prices, debug
 
     config.read('config.ini')
     session = await db.connect(config['DB']['host'], int(config['DB']['port']), config['DB']['user'],
@@ -524,6 +529,7 @@ async def main():
         conf.api_key, conf.api_secret,
         asynced=True, testnet=config.getboolean('BOT', 'testnet')
     )
+    debug = config.getboolean('BOT', 'debug')
 
     # Проверка: есть ли символы с поддержкой TradingView
 
@@ -534,15 +540,10 @@ async def main():
 
     # await get_data.sync_positions_with_exchange(client, positions)
     # print(f"Всего открытых сделок: {sum(1 for v in positions.values() if v)}")
-    # available_symbols = await db.get_all_symbols_conf() # получам список в котором дата по всм символам адо вытащить статус символа
-    # print(f"available_symbols: {available_symbols}")
-    # trade_mode = available_symbols.status
-    # print(f"trade_mode: {trade_mode}")
-    # print(f" ALL SYMBOLS {all_symbols}")
 
     # await asyncio.create_task(connect_ws())
 
-    #
+
     symbol_update_lock = asyncio.Lock()
     # await tg.run()
 
@@ -555,23 +556,32 @@ async def main():
 
 
 async def timed_collector(timeframe: str, lock: asyncio.Lock):
+    global symbol_conf_cache
+
     while True:
         await utils.wait_for_next_candle(timeframe)
         async with lock:
             try:
+                # ✅ Обновляем кэш 1 раз на таймфрейм
+                symbol_confs = await db.get_all_symbols_conf()
+                symbol_conf_cache = {s.symbol: s for s in symbol_confs}
+
                 if timeframe == timeframes[0]:
                     await process_main_timeframe_signals()
                 else:
                     await asyncio.sleep(10)
                     await collect_signals(timeframe)
+
             except Exception as e:
                 logging.error(f"[{timeframe}] Ошибка в сборщике сигналов: {e}")
 
 
 
 async def collect_signals(timeframe=timeframes[0]):
-    available_symbols_conf = await db.get_all_symbols_conf()
-    available_symbols = [s.symbol for s in available_symbols_conf]
+    global symbol_conf_cache
+
+
+    available_symbols = list(symbol_conf_cache.keys())
     symbols_ordered = IMPORTANT_SYMBOLS + [s for s in available_symbols if s not in IMPORTANT_SYMBOLS]
 
     loop = asyncio.get_running_loop()
@@ -604,7 +614,7 @@ async def process_symbol(symbol, interval, loop):
 
 
 async def process_main_timeframe_signals():
-    global btc_signal, available_symbols
+    global btc_signal
     logging.info(f"Обработка сигналов {timeframes[0]} и открытие сделок...")
 
     interval = timeframes[0]
@@ -618,11 +628,10 @@ async def process_main_timeframe_signals():
     btc_signal = btc_data['RECOMMENDATION']
     logging.info(f"Сигнал BTCUSDT {timeframes[0]}: {btc_signal}")
 
-    available_symbols_conf = await db.get_all_symbols_conf()
-    trade_symbols = [s.symbol for s in available_symbols_conf]
-
+    available_symbols = list(symbol_conf_cache.keys())
     # print(f"AVAILABLE {available_symbols}")
-    symbols_ordered = IMPORTANT_SYMBOLS + [s for s in trade_symbols if s not in IMPORTANT_SYMBOLS]
+
+    symbols_ordered = IMPORTANT_SYMBOLS + [s for s in available_symbols if s not in IMPORTANT_SYMBOLS]
 
     tasks = []
     for symbol in symbols_ordered:
@@ -632,7 +641,7 @@ async def process_main_timeframe_signals():
 
 
 async def process_trade_signal(symbol, interval):
-    global trade_mode
+    global trade_mode, debug
     signal = None
     loop = asyncio.get_running_loop()
     data = await loop.run_in_executor(executor, get_data.get_tradingview_data, symbol, interval)
@@ -646,39 +655,27 @@ async def process_trade_signal(symbol, interval):
         return
 
     recommendation = data['RECOMMENDATION']
-    is_important = symbol in IMPORTANT_SYMBOLS
     is_valid = recommendation in VALID_SIGNALS
 
     # Сохраняем сигнал независимо от открытия сделки
     await db.save_signal_to_db(symbol, interval, recommendation, entry_price)
 
-    # # Логика открытия сделки
-    # open_long = recommendation == 'STRONG_BUY' and btc_signal in ['STRONG_BUY', 'BUY', 'NEUTRAL']
-    # open_short = recommendation == 'STRONG_SELL' and btc_signal in ['STRONG_SELL', 'SELL', 'NEUTRAL']
-    #
-    # if open_long:
-    #     signal = "BUY"
-    # elif open_short:
-    #     signal = "SELL"
-    #
-    # if is_important or is_valid:
-    #     if signal:
-    #         logging.info(f"Открытие {'LONG' if open_long else 'SHORT'} по {symbol} @ {entry_price} | BTC = {btc_signal}")
-    #
-    #         await new_trade(symbol, interval, signal)
 
-    # if trade_mode:
-    #     debug = config.getboolean('BOT', 'debug')
+    symbol_conf = symbol_conf_cache.get(symbol)
+    # print(f"{symbol} ТРЕЙДИНГ СТАТУС {symbol_conf.status}")
+
+    if not symbol_conf or not symbol_conf.status:
+        # print('RETURN')
+        return
 
     # Логика открытия сделки
-    open_long = recommendation == 'STRONG_BUY' and btc_signal in ['STRONG_BUY', 'BUY', 'NEUTRAL']
-    open_short = recommendation == 'STRONG_SELL' and btc_signal in ['STRONG_SELL', 'SELL', 'NEUTRAL']
-
-    debug = config.getboolean('BOT', 'debug')
 
     if debug:
         open_long = recommendation == 'STRONG_BUY' or recommendation == 'BUY'
         open_short = recommendation == 'STRONG_SELL' or recommendation == 'SELL'
+    else:
+        open_long = recommendation == 'STRONG_BUY' and btc_signal in ['STRONG_BUY', 'BUY', 'NEUTRAL']
+        open_short = recommendation == 'STRONG_SELL' and btc_signal in ['STRONG_SELL', 'SELL', 'NEUTRAL']
 
     if open_long:
         signal = "BUY"
@@ -711,7 +708,7 @@ async def new_trade(symbol, interval, signal):
 
         #получаем настройки для символа
         try:
-            symbol_conf = await db.get_symbol_conf(symbol)
+            symbol_conf = symbol_conf_cache.get(symbol)
             # print(f"{symbol}: {symbol_conf}")
         except Exception as e:
             logging.error(f"Ошибка при получении конфигурации символа {symbol}: {e}")
@@ -755,6 +752,7 @@ async def new_trade(symbol, interval, signal):
         print(f"Ошибка при открытии {'ЛОНГОВОЙ' if signal == "BUY" else 'ШОРТОВОЙ'} позиции по {symbol}\n{traceback.format_exc()}")
         positions.pop(symbol, None)
         return
+
     try:
         # получаем цену входа
         entry_price = float(entry_order['avgPrice'])
