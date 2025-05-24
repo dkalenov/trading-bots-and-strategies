@@ -473,13 +473,9 @@
 import asyncio
 import configparser
 import logging
-from tradingview_ta import TA_Handler, Interval
 import binance
 import db
-from sqlalchemy.dialects.postgresql import insert
-from datetime import datetime, timezone, timedelta, time
 from concurrent.futures import ThreadPoolExecutor
-from sqlalchemy import select, update
 import utils
 import traceback
 import get_data
@@ -518,7 +514,7 @@ symbol_conf_cache: dict[str, db.SymbolsSettings] = {}
 
 
 async def main():
-    global session, conf, client, all_symbols, all_prices, debug
+    global session, conf, client, all_symbols, all_prices, debug, symbol_conf_cache
 
     config.read('config.ini')
     session = await db.connect(config['DB']['host'], int(config['DB']['port']), config['DB']['user'],
@@ -531,28 +527,32 @@ async def main():
     )
     debug = config.getboolean('BOT', 'debug')
 
-    # all_symbols = await get_data.load_binance_symbols(client)
-    # all_prices = await get_data.get_all_prices(client)
+    # ЗАГРУЖАЕМ КОНФИГИ СИМВОЛОВ ДО подключения к WS
+    symbol_confs = await db.get_all_symbols_conf()
+    symbol_conf_cache = {s.symbol: s for s in symbol_confs}
 
-    # await get_data.sync_positions_with_exchange(client, positions)
-    # print(f"Всего открытых сделок: {sum(1 for v in positions.values() if v)}")
+    # Загружаем позиции
+    await get_data.sync_positions_with_exchange(client, positions)
 
-    # await asyncio.create_task(connect_ws())
+    # Загружаем данные о символах и ценах
+    all_symbols = await get_data.load_binance_symbols(client)
+    all_prices = await get_data.get_all_prices(client)
+
+
 
 
     symbol_update_lock = asyncio.Lock()
-    # await tg.run()
 
     await asyncio.gather(
         *(timed_collector(tf, symbol_update_lock) for tf in timeframes),
         db.periodic_symbol_update(client, executor, symbol_update_lock, hour=17, minute=35),
-        tg.run()
+        tg.run(),
+        connect_ws()
     )
 
 
-
 async def timed_collector(timeframe: str, lock: asyncio.Lock):
-    global symbol_conf_cache, all_symbols, all_prices
+    global symbol_conf_cache, all_symbols, all_prices, conf
 
     while True:
         await utils.wait_for_next_candle(timeframe)
@@ -566,6 +566,7 @@ async def timed_collector(timeframe: str, lock: asyncio.Lock):
                 all_prices = await get_data.get_all_prices(client)
 
                 if timeframe == timeframes[0]:
+                    conf = await db.load_config()
                     await process_main_timeframe_signals()
                 else:
                     await asyncio.sleep(15)
@@ -590,7 +591,6 @@ async def collect_signals(timeframe=timeframes[0]):
         await db.save_signals_batch_to_db(signals)
 
 
-
 async def process_symbol(symbol, interval, loop):
     data = await loop.run_in_executor(executor, get_data.get_tradingview_data, symbol, interval)
     if not data:
@@ -610,7 +610,6 @@ async def process_main_timeframe_signals():
 
     interval = timeframes[0]
 
-    # Сначала обрабатываем BTC отдельно
     loop = asyncio.get_running_loop()
     btc_data = await loop.run_in_executor(executor, get_data.get_tradingview_data, 'BTCUSDT', interval)
     if not btc_data:
@@ -620,66 +619,70 @@ async def process_main_timeframe_signals():
     logging.info(f"Сигнал BTCUSDT {timeframes[0]}: {btc_signal}")
 
     available_symbols = list(symbol_conf_cache.keys())
-    # print(f"AVAILABLE {available_symbols}")
-
     symbols_ordered = IMPORTANT_SYMBOLS + [s for s in available_symbols if s not in IMPORTANT_SYMBOLS]
 
-    tasks = []
-    for symbol in symbols_ordered:
-        tasks.append(process_trade_signal(symbol, interval))
-    await asyncio.gather(*tasks)
+    tasks = [process_trade_signal(symbol, interval) for symbol in symbols_ordered]
+    results = await asyncio.gather(*tasks)
+
+    signals_to_save = [r for r in results if r is not None]
+
+    if signals_to_save:
+        await db.save_signals_batch_to_db(signals_to_save)
 
 
 
 async def process_trade_signal(symbol, interval):
-    global trade_mode, debug
-    signal = None
+    global debug, conf
+    signal_to_return = None
+
     loop = asyncio.get_running_loop()
     data = await loop.run_in_executor(executor, get_data.get_tradingview_data, symbol, interval)
     if not data:
-        return
+        return None
 
     entry_price = all_prices.get(symbol)
-    # print(f"{symbol} ENTRY PRICE: {entry_price}")
     if entry_price is None:
-        logging.warning(f"Цена не найдена для {symbol}")
-        return
+        logging.warning(f"Цена не найдена для {symbol}, сохраняем с NaN")
+        entry_price = float('nan')
 
     recommendation = data['RECOMMENDATION']
     is_valid = recommendation in VALID_SIGNALS
 
-    # Сохраняем сигнал независимо от открытия сделки
-    await db.save_signal_to_db(symbol, interval, recommendation, entry_price)
+    # Подготовим сигнал для batch-сохранения
+    signal_to_return = (symbol, interval, recommendation, entry_price)
 
+    # Проверка: торговля включена?
+    if not conf.trade_mode:
+        return signal_to_return
 
+    # Проверка: есть ли API-ключи
+    if not conf.api_key or not conf.api_secret:
+        await db.config_update(trade_mode='0')
+        return signal_to_return
+
+    # Проверка: разрешён ли трейдинг по символу
     symbol_conf = symbol_conf_cache.get(symbol)
-    # print(f"{symbol} ТРЕЙДИНГ СТАТУС {symbol_conf.status}")
-
     if not symbol_conf or not symbol_conf.status:
-        # print('RETURN')
-        return
+        return signal_to_return
 
-    # Логика открытия сделки
+    # Условия открытия сделок
+    open_long = False
+    open_short = False
 
     if debug:
-        open_long = recommendation == 'STRONG_BUY' or recommendation == 'BUY'
-        open_short = recommendation == 'STRONG_SELL' or recommendation == 'SELL'
+        open_long = recommendation in ['STRONG_BUY', 'BUY']
+        open_short = recommendation in ['STRONG_SELL', 'SELL']
     else:
         open_long = recommendation == 'STRONG_BUY' and btc_signal in ['STRONG_BUY', 'BUY', 'NEUTRAL']
         open_short = recommendation == 'STRONG_SELL' and btc_signal in ['STRONG_SELL', 'SELL', 'NEUTRAL']
 
-    if open_long:
-        signal = "BUY"
-    elif open_short:
-        signal = "SELL"
+    if (open_long or open_short) and (is_valid or debug) and symbol not in positions:
+        direction = "BUY" if open_long else "SELL"
+        logging.info(f"Открытие {direction} по {symbol} @ {entry_price} | BTC = {btc_signal}")
+        await new_trade(symbol, interval, direction)
 
+    return signal_to_return
 
-
-        if (is_valid or debug) and symbol not in positions.keys():
-        # if is_valid and symbol not in positions.keys():
-
-            logging.info(f"Открытие {'LONG' if open_long else 'SHORT'} по {symbol} @ {entry_price} | BTC = {btc_signal}")
-            await new_trade(symbol, interval, signal)
 
 
 async def new_trade(symbol, interval, signal):
@@ -719,7 +722,6 @@ async def new_trade(symbol, interval, signal):
 
         #получаем последнюю цену
         last_price = all_prices.get(symbol)
-        # last_price = float((await client.ticker_price(symbol))['price'])
         # print(f"LAST PRICE {symbol}: {last_price}")
 
         # расчитываем количество
@@ -737,6 +739,7 @@ async def new_trade(symbol, interval, signal):
                                              quantity=quantity, newOrderRespType='RESULT')
 
         positions[symbol] = True
+
 
 
     except:
@@ -807,53 +810,59 @@ async def new_trade(symbol, interval, signal):
 
 
 async def connect_ws():
-    global websockets_list
-    global userdata_ws
-    global conf
-    # загружаем конфиг
-    conf = await db.load_config()
-    # если торговля отключена, то выходим
-    if not conf.trade_mode:
-        return
-    # проверяем API KEY и SECRET KEY
-    if not conf.api_key or not conf.api_secret:
-        # если нет, то отключаем торговлю
-        await db.config_update(trade_mode='0')
-        return
-    print(f"Подключаемся к вебсокетам")
-    # создаем списки стримов
+    global websockets_list, symbol_conf_cache
+
+    logging.info("Подключаемся к вебсокетам...")
     streams = []
 
-    symbols = await db.get_all_symbols_conf()
-    for symbol in symbols:
-        if symbol.status:
-            streams.append(f"{symbol.symbol.lower()}@kline_{symbol.interval}")
+    available_symbols = list(symbol_conf_cache.keys())
+    symbols_ordered = IMPORTANT_SYMBOLS + [s for s in available_symbols if s not in IMPORTANT_SYMBOLS]
+
+    for symbol in symbols_ordered:
+        conf = symbol_conf_cache.get(symbol)
+        # print(f"WS {symbol}")
+        if conf and conf.status:
+            # print('STREAMS APPENDED')
+            streams.append(f"{symbol.lower()}@kline_{conf.interval}")
+
+    # Разбиваем по чанкам по 100 стримов (лимит Binance)
     chunk_size = 100
     streams_list = [streams[i:i + chunk_size] for i in range(0, len(streams), chunk_size)]
-    for stream_list in streams_list:
-        websockets_list.append(await client.websocket(stream_list, on_message=ws_msg))
 
+    for stream_chunk in streams_list:
+        ws = await client.websocket(stream_chunk, on_message=ws_msg)
+        websockets_list.append(ws)
 
-
-
-
-# обработка сообщений вебсокета
 async def ws_msg(ws, msg):
-    global positions
     if 'data' not in msg:
+        # print('NO DATA')
         return
-    # получаем свечу
+
     kline = msg['data']['k']
-    # получаем символ и интервал
     symbol = kline['s']
     interval = kline['i']
-    pprint.pprint(kline)
+    is_closed = kline['x']  # завершена ли свеча
 
+    # if not is_closed:
+    #     print('NOT CLOSED')
+    #     return  # только завершенные свечи обрабатываем
 
+    # pprint.pprint({
+    #     'symbol': symbol,
+    #     'interval': interval,
+    #     'close': kline['c'],
+    #     'high': kline['h'],
+    #     'low': kline['l'],
+    #     'volume': kline['v'],
+    #     'is_closed': is_closed
+    # })
 
-
-async def ws_msg(ws, msg):
-    print(msg)
+    # при необходимости: обновление цены в all_prices
+    try:
+        all_prices[symbol] = float(kline['c'])
+        print(f'WS {symbol} price: {all_prices[symbol]}')
+    except Exception as e:
+        logging.error(f"Ошибка при обновлении цены {symbol}: {e}")
 
 
 
@@ -861,3 +870,4 @@ if __name__ == '__main__':
     config = configparser.ConfigParser()
     config.read('config.ini')
     asyncio.run(main())
+
