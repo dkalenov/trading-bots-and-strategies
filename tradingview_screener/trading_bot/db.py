@@ -37,6 +37,7 @@ class Trades(Base):
     __tablename__ = 'trades'
     id = Column(Integer, primary_key=True, autoincrement=True)
     symbol = Column(String)
+    position_open = Column(Boolean, default=True)
     interval = Column(String, default='4h')
     order_size = Column(Float)
     side = Column(Boolean)
@@ -52,6 +53,7 @@ class Trades(Base):
     take2_price = Column(Float)
     stop_price = Column(Float)
     breakeven_stop_price = Column(Float)
+    take1_triggered = Column(Boolean, default=False)
     result = Column(Float)
     msg_id = Column(Integer)
 
@@ -292,6 +294,7 @@ async def save_signal_to_db(symbol: str, timeframe: str, signal: str, entry_pric
         except Exception as db_e:
             logging.error(f"Ошибка при сохранении сигнала {symbol}: {db_e}")
             await s.rollback()
+
 
 
 
