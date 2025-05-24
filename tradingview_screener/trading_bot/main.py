@@ -502,7 +502,7 @@ all_prices: dict[str, binance.SymbolFutures] = {}
 IMPORTANT_SYMBOLS = ['BTCUSDT', 'ETHUSDT']
 VALID_SIGNALS = ['STRONG_BUY', 'STRONG_SELL']
 
-timeframes = ["1m", "5m", "15m"]
+timeframes = ["5m", "1m", "15m"]
 
 btc_signal = None
 
@@ -531,12 +531,8 @@ async def main():
     )
     debug = config.getboolean('BOT', 'debug')
 
-    # Проверка: есть ли символы с поддержкой TradingView
-
-    # Запуск сборщиков сигналов и обновления символов
-
-    all_symbols = await get_data.load_binance_symbols(client)
-    all_prices = await get_data.get_all_prices(client)
+    # all_symbols = await get_data.load_binance_symbols(client)
+    # all_prices = await get_data.get_all_prices(client)
 
     # await get_data.sync_positions_with_exchange(client, positions)
     # print(f"Всего открытых сделок: {sum(1 for v in positions.values() if v)}")
@@ -556,7 +552,7 @@ async def main():
 
 
 async def timed_collector(timeframe: str, lock: asyncio.Lock):
-    global symbol_conf_cache
+    global symbol_conf_cache, all_symbols, all_prices
 
     while True:
         await utils.wait_for_next_candle(timeframe)
@@ -566,10 +562,13 @@ async def timed_collector(timeframe: str, lock: asyncio.Lock):
                 symbol_confs = await db.get_all_symbols_conf()
                 symbol_conf_cache = {s.symbol: s for s in symbol_confs}
 
+                all_symbols = await get_data.load_binance_symbols(client)
+                all_prices = await get_data.get_all_prices(client)
+
                 if timeframe == timeframes[0]:
                     await process_main_timeframe_signals()
                 else:
-                    await asyncio.sleep(10)
+                    await asyncio.sleep(15)
                     await collect_signals(timeframe)
 
             except Exception as e:
@@ -578,39 +577,31 @@ async def timed_collector(timeframe: str, lock: asyncio.Lock):
 
 
 async def collect_signals(timeframe=timeframes[0]):
-    global symbol_conf_cache
-
-
     available_symbols = list(symbol_conf_cache.keys())
     symbols_ordered = IMPORTANT_SYMBOLS + [s for s in available_symbols if s not in IMPORTANT_SYMBOLS]
 
     loop = asyncio.get_running_loop()
-    tasks = []
+    tasks = [process_symbol(symbol, timeframe, loop) for symbol in symbols_ordered]
+    results = await asyncio.gather(*tasks)
 
-    for symbol in symbols_ordered:
-        tasks.append(process_symbol(symbol, timeframe, loop))
-    await asyncio.gather(*tasks)
+    signals = [r for r in results if r is not None]
+
+    if signals:
+        await db.save_signals_batch_to_db(signals)
 
 
 
 async def process_symbol(symbol, interval, loop):
     data = await loop.run_in_executor(executor, get_data.get_tradingview_data, symbol, interval)
     if not data:
-        return
+        return None
 
     entry_price = all_prices.get(symbol)
     if entry_price is None:
         logging.warning(f"Цена не найдена для {symbol}")
-        return
+        return None
 
-    # is_important = symbol in IMPORTANT_SYMBOLS
-    # is_valid = data['RECOMMENDATION'] in VALID_SIGNALS
-    #
-    # if is_important or is_valid:
-    #     logging.info(f"Сигнал {symbol}: {data['RECOMMENDATION']} по цене {entry_price}")
-
-    await db.save_signal_to_db(symbol, interval, data['RECOMMENDATION'], entry_price)
-
+    return (symbol, interval, data['RECOMMENDATION'], entry_price)
 
 
 async def process_main_timeframe_signals():
