@@ -19,7 +19,6 @@ client: binance.Futures
 
 
 
-
 class Config(Base):
     __tablename__ = 'config'
     key = Column(String, primary_key=True)
@@ -81,8 +80,8 @@ class SymbolsSettings(Base):
     leverage = Column(Integer, default=20)
     atr_length = Column(Integer, default=14)
     portion = Column(Float, default=0.05)
-    take1 = Column(Float, default=2.25)
-    take2 = Column(Float, default=2.25)
+    take1 = Column(Float, default=2.5)
+    take2 = Column(Float, default=5)
     stop = Column(Float, default=0.45)
 
 
@@ -177,6 +176,19 @@ async def load_config():
 
 
 
+# функция для обновления конфигурации
+async def config_update(**kwargs):
+    # создание сессии для работы с БД
+    async with Session() as s:
+        # перебираем все параметры
+        for key, value in kwargs.items():
+            # записываем изменения в БД
+            await s.execute(update(Config).where(Config.key == key).values(value=value))
+        # записываем изменения в БД
+        await s.commit()
+
+
+
 async def get_symbol_conf(symbol):
     async with Session() as s:
         try:
@@ -191,7 +203,7 @@ async def get_symbol_conf(symbol):
                 result = await s.execute(
                     select(Symbols).where(
                         Symbols.binance_symbol == symbol,
-                        Symbols.tradingview_symbol == True
+                        Symbols.tradingview_symbol.is_(True)
                     )
                 )
                 symbol_exists = result.scalar_one_or_none()
@@ -221,15 +233,46 @@ async def get_symbol_conf(symbol):
 
 
 
-async def get_all_symbols_conf():
-    async with Session() as s:
-        return (await s.execute(select(SymbolsSettings))).scalars().all()
+# async def get_all_symbols_conf():
+#     async with Session() as s:
+#         return (await s.execute(select(SymbolsSettings))).scalars().all()
 
         # result = await s.execute(
         #     select(Symbols).where(Symbols.tradingview_symbol.is_(True))
         # )
         # symbols = result.scalars().all()
         # return [s.binance_symbol for s in symbols]
+
+async def get_all_symbols_conf():
+    async with Session() as s:
+        try:
+            # Получаем все символы, поддерживаемые TradingView
+            result = await s.execute(
+                select(Symbols).where(Symbols.tradingview_symbol.is_(True))
+            )
+            all_symbols = result.scalars().all()
+
+            # Получаем уже существующие настройки
+            result = await s.execute(select(SymbolsSettings.symbol))
+            existing_settings = {row[0] for row in result.all()}
+
+            added = 0
+            for symbol_obj in all_symbols:
+                if symbol_obj.binance_symbol not in existing_settings:
+                    s.add(SymbolsSettings(symbol=symbol_obj.binance_symbol))
+                    added += 1
+
+            if added:
+                await s.commit()
+                logging.info(f"Добавлены настройки по умолчанию для {added} новых символов.")
+
+            # Возвращаем все настройки
+            result = await s.execute(select(SymbolsSettings))
+            return result.scalars().all()
+
+        except Exception as e:
+            logging.error(f"Ошибка при получении или создании настроек символов: {e}")
+            return []
 
 
 
@@ -245,9 +288,36 @@ async def save_signal_to_db(symbol: str, timeframe: str, signal: str, entry_pric
             )
             await s.execute(stmt)
             await s.commit()
+
         except Exception as db_e:
             logging.error(f"Ошибка при сохранении сигнала {symbol}: {db_e}")
             await s.rollback()
+
+
+
+async def save_signals_batch_to_db(signals: list[tuple[str, str, str, float]]):
+    """
+    Пакетное сохранение сигналов TradingView.
+    Формат signals: [(symbol, interval, signal, entry_price), ...]
+    """
+    async with Session() as s:
+        try:
+            stmt = insert(TradingviewSignals).values([
+                {
+                    'symbol': symbol,
+                    'interval': timeframe,
+                    'signal': signal,
+                    'entry_price': entry_price,
+                    'utc_time': datetime.now(timezone.utc)
+                }
+                for symbol, timeframe, signal, entry_price in signals
+            ])
+            await s.execute(stmt)
+            await s.commit()
+        except Exception as db_e:
+            logging.error(f"Ошибка при батч сохранении сигналов: {db_e}")
+            await s.rollback()
+
 
 
 
@@ -323,8 +393,6 @@ async def periodic_symbol_update(client, executor, lock: asyncio.Lock, hour=17, 
         # 🔒 Блокируем сбор сигналов на время обновления
         async with lock:
             await daily_update_symbols(client, executor)
-
-
 
 
 
