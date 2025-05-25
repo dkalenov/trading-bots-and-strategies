@@ -498,7 +498,7 @@ all_prices: dict[str, binance.SymbolFutures] = {}
 IMPORTANT_SYMBOLS = ['BTCUSDT', 'ETHUSDT']
 VALID_SIGNALS = ['STRONG_BUY', 'STRONG_SELL']
 
-timeframes = ["5m", "1m", "15m"]
+timeframes = ["1m", "5m", "15m"]
 
 btc_signal = None
 
@@ -514,7 +514,7 @@ symbol_conf_cache: dict[str, db.SymbolsSettings] = {}
 
 
 async def main():
-    global session, conf, client, all_symbols, all_prices, debug, symbol_conf_cache
+    global session, conf, client, all_symbols, all_prices, debug, symbol_conf_cache, positions
 
     config.read('config.ini')
     session = await db.connect(config['DB']['host'], int(config['DB']['port']), config['DB']['user'],
@@ -547,7 +547,7 @@ async def main():
         *(timed_collector(tf, symbol_update_lock) for tf in timeframes),
         db.periodic_symbol_update(client, executor, symbol_update_lock, hour=17, minute=35),
         tg.run(),
-        connect_ws()
+        # connect_ws()
     )
 
 
@@ -569,7 +569,7 @@ async def timed_collector(timeframe: str, lock: asyncio.Lock):
                     conf = await db.load_config()
                     await process_main_timeframe_signals()
                 else:
-                    await asyncio.sleep(15)
+                    # await asyncio.sleep(15)
                     await collect_signals(timeframe)
 
             except Exception as e:
@@ -623,11 +623,62 @@ async def process_main_timeframe_signals():
 
     tasks = [process_trade_signal(symbol, interval) for symbol in symbols_ordered]
     results = await asyncio.gather(*tasks)
+    logging.info(f"Результаты сигналов: {results}")
 
     signals_to_save = [r for r in results if r is not None]
 
     if signals_to_save:
+        logging.info(f"Сохраняем {len(signals_to_save)} сигналов в БД")
         await db.save_signals_batch_to_db(signals_to_save)
+    else:
+        logging.warning("Нет сигналов для сохранения — список пуст.")
+#
+#
+#
+# async def process_trade_signal(symbol, interval):
+#     global debug, conf
+#     signal_to_return = None
+#
+#     loop = asyncio.get_running_loop()
+#     data = await loop.run_in_executor(executor, get_data.get_tradingview_data, symbol, interval)
+#     if not data:
+#         print('NO DATA')
+#         return None
+#
+#     entry_price = all_prices.get(symbol)
+#     if entry_price is None:
+#         logging.warning(f"Цена не найдена для {symbol}, сохраняем с NaN")
+#         entry_price = float('nan')
+#
+#     recommendation = data['RECOMMENDATION']
+#     is_valid = recommendation in VALID_SIGNALS
+#
+#     # Подготовим сигнал для batch-сохранения
+#     signal_to_return = (symbol, interval, recommendation, entry_price)
+
+# async def process_main_timeframe_signals():
+#     global btc_signal
+#     logging.info(f"Обработка сигналов {timeframes[0]} и открытие сделок...")
+#
+#     interval = timeframes[0]
+#
+#     # Сначала обрабатываем BTC отдельно
+#     loop = asyncio.get_running_loop()
+#     btc_data = await loop.run_in_executor(executor, get_data.get_tradingview_data, 'BTCUSDT', interval)
+#     if not btc_data:
+#         logging.error("Не удалось получить сигнал BTCUSDT — пропускаем обработку.")
+#         return
+#     btc_signal = btc_data['RECOMMENDATION']
+#     logging.info(f"Сигнал BTCUSDT {timeframes[0]}: {btc_signal}")
+#
+#     available_symbols = list(symbol_conf_cache.keys())
+#     # print(f"AVAILABLE {available_symbols}")
+#     symbols_ordered = IMPORTANT_SYMBOLS + [s for s in available_symbols if s not in IMPORTANT_SYMBOLS]
+#
+#     tasks = []
+#     for symbol in symbols_ordered:
+#         tasks.append(process_trade_signal(symbol, interval))
+#     await asyncio.gather(*tasks)
 
 
 
@@ -638,6 +689,7 @@ async def process_trade_signal(symbol, interval):
     loop = asyncio.get_running_loop()
     data = await loop.run_in_executor(executor, get_data.get_tradingview_data, symbol, interval)
     if not data:
+        print('NO DATA')
         return None
 
     entry_price = all_prices.get(symbol)
@@ -646,29 +698,45 @@ async def process_trade_signal(symbol, interval):
         entry_price = float('nan')
 
     recommendation = data['RECOMMENDATION']
-    is_valid = recommendation in VALID_SIGNALS
 
     # Подготовим сигнал для batch-сохранения
     signal_to_return = (symbol, interval, recommendation, entry_price)
+    # print(f'SIGNAL TO RETURN {signal_to_return}')
 
-    # Проверка: торговля включена?
+
+#
+#
+# async def process_trade_signal(symbol, interval):
+#     global debug, conf, positions
+#
+#
+#     loop = asyncio.get_running_loop()
+#     data = await loop.run_in_executor(executor, get_data.get_tradingview_data, symbol, interval)
+#     if not data:
+#         return
+#
+#     entry_price = all_prices.get(symbol)
+#     recommendation = data['RECOMMENDATION']
+#     # is_valid = recommendation in VALID_SIGNALS
+#
+#     # Сохраняем сигнал независимо от открытия сделки
+#     await db.save_signal_to_db(symbol, interval, recommendation, entry_price)
+
+    # Торговля выключена — только сохраняем сигнал
     if not conf.trade_mode:
         return signal_to_return
 
-    # Проверка: есть ли API-ключи
+    # Нет API ключей — выключаем торговлю
     if not conf.api_key or not conf.api_secret:
         await db.config_update(trade_mode='0')
         return signal_to_return
 
-    # Проверка: разрешён ли трейдинг по символу
+    # Проверка, разрешена ли торговля по символу
     symbol_conf = symbol_conf_cache.get(symbol)
     if not symbol_conf or not symbol_conf.status:
         return signal_to_return
 
-    # Условия открытия сделок
-    open_long = False
-    open_short = False
-
+    # Логика открытия сделки
     if debug:
         open_long = recommendation in ['STRONG_BUY', 'BUY']
         open_short = recommendation in ['STRONG_SELL', 'SELL']
@@ -676,12 +744,21 @@ async def process_trade_signal(symbol, interval):
         open_long = recommendation == 'STRONG_BUY' and btc_signal in ['STRONG_BUY', 'BUY', 'NEUTRAL']
         open_short = recommendation == 'STRONG_SELL' and btc_signal in ['STRONG_SELL', 'SELL', 'NEUTRAL']
 
-    if (open_long or open_short) and (is_valid or debug) and symbol not in positions:
-        direction = "BUY" if open_long else "SELL"
-        logging.info(f"Открытие {direction} по {symbol} @ {entry_price} | BTC = {btc_signal}")
-        await new_trade(symbol, interval, direction)
+    signal = None
 
+    if open_long:
+        signal = "BUY"
+    elif open_short:
+        signal = "SELL"
+
+    if signal and positions[symbol] == False:
+    # if signal and (is_valid or debug) and positions[symbol] == False:
+        logging.info(f"Открытие {signal} по {symbol} @ {entry_price} | BTC = {btc_signal}")
+        await new_trade(symbol, interval, signal)
+
+    logging.debug(f"Сигнал signal_to_return {symbol}: {signal_to_return}")
     return signal_to_return
+
 
 
 
@@ -698,6 +775,7 @@ async def new_trade(symbol, interval, signal):
 
         # получаем информацию о символе
         if not (symbol_info := all_symbols.get(symbol)):
+            print('NO SYMBOL INFO')
             return
 
         #получаем настройки для символа
@@ -754,28 +832,31 @@ async def new_trade(symbol, interval, signal):
         quantity = float(entry_order['executedQty'])
         # расчитываем цены стопа и тейка
         if signal == "BUY":
-            take_price = entry_price + atr * symbol_conf.take2
+            take_price1 = entry_price + atr * symbol_conf.take1
+            take_price2 = entry_price + atr * symbol_conf.take2
             stop_price = entry_price - atr * symbol_conf.stop
         else:
-            take_price = entry_price - atr * symbol_conf.take2
+            take_price1 = entry_price - atr * symbol_conf.take1
+            take_price2 = entry_price - atr * symbol_conf.take2
             stop_price = entry_price + atr * symbol_conf.stop
 
-        # округляем их
-        take_price = round(take_price, symbol_info.tick_size)
+        # округляем
+        take_price1 = round(take_price1, symbol_info.tick_size)
+        take_price2 = round(take_price2, symbol_info.tick_size)
         stop_price = round(stop_price, symbol_info.tick_size)
         # создаем ордеры на стоп и тейк
         stop_order = await client.new_order(symbol=symbol, side='SELL' if signal == "BUY" else 'BUY', type='STOP_MARKET',
                                             quantity=quantity, stopPrice=stop_price, timeInForce='GTE_GTC', reduceOnly=True)
         take_order = await client.new_order(symbol=symbol, side='SELL' if signal == "BUY" else 'BUY', type='LIMIT',
-                                            quantity=quantity, price=take_price, timeInForce='GTC', reduceOnly=True)
-        print(f"Открыли сделку по {symbol} по цене {entry_price} с тейком {take_price} и стопом {stop_price}")
+                                            quantity=quantity, price=take_price2, timeInForce='GTC', reduceOnly=True)
+        print(f"Открыл {signal} позицию по {symbol} по цене {entry_price} с тейком {take_price2} и стопом {stop_price}")
         # создаем сессию для работы с базой данных
         async with session() as s:
             # записывает сделку в БД
             trade = db.Trades(symbol=symbol, order_size=float(entry_order['cumQuote']), side = 1 if signal == "BUY" else 0,
                               status='NEW', open_time=entry_order['updateTime'], interval=interval, leverage=symbol_conf.leverage,
-                              atr_length=atr_length, atr=atr, entry_price=entry_price, quantity=quantity, take1_price=(take_price / 2),
-                              take2_price=take_price, stop_price=stop_price)
+                              atr_length=atr_length, atr=atr, entry_price=entry_price, quantity=quantity, take1_price=take_price1,
+                              take2_price=take_price2, stop_price=stop_price, take1_triggered=False, position_open=True)
 
 
 
@@ -794,7 +875,7 @@ async def new_trade(symbol, interval, signal):
                 # формируем текст поста в канал
                 text = (f"Открыл в <b>{'ЛОНГ' if signal=="BUY" else 'ШОРТ'}</b> {quantity} <b>{symbol}</b>\n"
                         f"Цена входа: <b>{entry_price}</b>\n"
-                        f"Тейк / стоп: <b>{take_price} / {stop_price}</b>\n")
+                        f"Тейк / стоп: <b>{take_price2} / {stop_price}</b>\n")
                 # отправляем сообщение в канал
                 msg = await tg.bot.send_message(config['TG']['channel'], text, parse_mode='HTML')
                 # записываем идентификатор сообщения в БД
@@ -809,60 +890,79 @@ async def new_trade(symbol, interval, signal):
                                reduceOnly=True)
 
 
-async def connect_ws():
-    global websockets_list, symbol_conf_cache
+# async def connect_ws():
+#     global websockets_list, symbol_conf_cache
+#
+#     logging.info("Подключаемся к вебсокетам...")
+#     streams = []
+#
+#     available_symbols = list(symbol_conf_cache.keys())
+#     symbols_ordered = IMPORTANT_SYMBOLS + [s for s in available_symbols if s not in IMPORTANT_SYMBOLS]
+#
+#     for symbol in symbols_ordered:
+#         conf = symbol_conf_cache.get(symbol)
+#         # print(f"WS {symbol}")
+#         if conf and conf.status:
+#             # print('STREAMS APPENDED')
+#             streams.append(f"{symbol.lower()}@kline_{conf.interval}")
+#
+#     # Разбиваем по чанкам по 100 стримов (лимит Binance)
+#     chunk_size = 100
+#     streams_list = [streams[i:i + chunk_size] for i in range(0, len(streams), chunk_size)]
+#
+#     for stream_chunk in streams_list:
+#         ws = await client.websocket(stream_chunk, on_message=ws_msg)
+#         websockets_list.append(ws)
+#
+# async def ws_msg(ws, msg):
+#     if 'data' not in msg:
+#         # print('NO DATA')
+#         return
+#
+#     kline = msg['data']['k']
+#     symbol = kline['s']
+#     interval = kline['i']
+#     is_closed = kline['x']  # завершена ли свеча
+#
+#     # if not is_closed:
+#     #     print('NOT CLOSED')
+#     #     return  # только завершенные свечи обрабатываем
+#
+#     pprint.pprint({
+#         'symbol': symbol,
+#         'interval': interval,
+#         'close': kline['c'],
+#         'high': kline['h'],
+#         'low': kline['l'],
+#         'volume': kline['v'],
+#         'is_closed': is_closed
+#     })
 
-    logging.info("Подключаемся к вебсокетам...")
-    streams = []
-
-    available_symbols = list(symbol_conf_cache.keys())
-    symbols_ordered = IMPORTANT_SYMBOLS + [s for s in available_symbols if s not in IMPORTANT_SYMBOLS]
-
-    for symbol in symbols_ordered:
-        conf = symbol_conf_cache.get(symbol)
-        # print(f"WS {symbol}")
-        if conf and conf.status:
-            # print('STREAMS APPENDED')
-            streams.append(f"{symbol.lower()}@kline_{conf.interval}")
-
-    # Разбиваем по чанкам по 100 стримов (лимит Binance)
-    chunk_size = 100
-    streams_list = [streams[i:i + chunk_size] for i in range(0, len(streams), chunk_size)]
-
-    for stream_chunk in streams_list:
-        ws = await client.websocket(stream_chunk, on_message=ws_msg)
-        websockets_list.append(ws)
-
-async def ws_msg(ws, msg):
-    if 'data' not in msg:
-        # print('NO DATA')
-        return
-
-    kline = msg['data']['k']
-    symbol = kline['s']
-    interval = kline['i']
-    is_closed = kline['x']  # завершена ли свеча
-
-    # if not is_closed:
-    #     print('NOT CLOSED')
-    #     return  # только завершенные свечи обрабатываем
-
-    # pprint.pprint({
-    #     'symbol': symbol,
-    #     'interval': interval,
-    #     'close': kline['c'],
-    #     'high': kline['h'],
-    #     'low': kline['l'],
-    #     'volume': kline['v'],
-    #     'is_closed': is_closed
-    # })
-
-    # при необходимости: обновление цены в all_prices
-    try:
-        all_prices[symbol] = float(kline['c'])
-        print(f'WS {symbol} price: {all_prices[symbol]}')
-    except Exception as e:
-        logging.error(f"Ошибка при обновлении цены {symbol}: {e}")
+    # # при необходимости: обновление цены в all_prices
+    # try:
+    #     trade = await db.get_open_trade(symbol)
+    #
+    #     if trade and not trade.take1_triggered:
+    #         # print("Отслеживаем цену")
+    #         current_price = float(kline['c'])
+    #         direction = "BUY" if trade.side else "SELL"
+    #         take1_price = trade.take1_price
+    #
+    #         price_hit = current_price >= take1_price if direction == "BUY" else current_price <= take1_price
+    #
+    #         if price_hit:
+    #             async with session() as s:
+    #                 logging.info(f"{symbol}: достигнут цена {take1_price}. Закрытие части и перенос стопа.")
+    #                 take1_triggered = db.Trades(take1_triggered=True)
+    #
+    #             s.add(take1_triggered)
+    #             await s.commit()
+    #
+    #             # asyncio.create_task(partial_close_and_move_stop(trade))
+    #     all_prices[symbol] = float(kline['c'])
+    #     # print(f'WS {symbol} price: {all_prices[symbol]}')
+    # except Exception as e:
+    #     logging.error(f"Ошибка при обновлении цены {symbol}: {e}")
 
 
 
