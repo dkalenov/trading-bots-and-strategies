@@ -434,6 +434,53 @@ async def daily_update_symbols(client, executor):
         logging.error(f"Ошибка в daily_update_symbols: {e}")
 
 
-# async def get_all_symbols():
-#     async with Session as s:
-#         return (await s.execute(select(SymbolsSettings))).scalars().all()
+
+async def get_open_trade(symbol: str) -> Trades | None:
+    async with Session() as session:
+        try:
+            stmt = select(Trades).where(
+                Trades.symbol == symbol,
+                Trades.position_open.is_(True)
+            ).order_by(Trades.open_time.desc()).limit(1)
+
+            result = await session.execute(stmt)
+            return result.scalar_one_or_none()
+
+        except Exception as e:
+            # логируй или обрабатывай исключения при необходимости
+            print(f"Ошибка при получении открытой сделки по {symbol}: {e}")
+            return None
+
+
+async def sync_positions_with_exchange(client, positions: dict):
+    position_info = await client.get_position_risk()
+
+    for pos in position_info:
+        symbol = pos['symbol']
+        if '_' in symbol:
+            continue  # Пропуск нестандартных контрактов
+
+        amt = float(pos['positionAmt'])
+
+
+        if amt != 0.0:
+            positions[symbol] = True
+        elif symbol in positions:
+            continue
+            positions[symbol] = False
+
+# async def sync_positions_with_exchange(client, positions: dict):
+#     position_info = await client.get_position_risk()
+#
+#     for pos in position_info:
+#         symbol = pos['symbol']
+#         amt = float(pos['positionAmt'])
+#
+#         if amt != 0.0:
+#             if symbol not in positions or not positions[symbol]:
+#                 # print(f"[SYNC] Найдена активная позиция на бирже: {symbol}")
+#                 positions[symbol] = True
+#         else:
+#             if symbol not in positions:
+#                 continue
+#                 # positions[symbol] = False
