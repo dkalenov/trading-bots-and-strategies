@@ -17,7 +17,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# Первый таймфрейм самый главный 
 TIMEFRAMES = ['4h', '30m', '1h']
+
 INTERVAL_MAPPING = {
     "1m": Interval.INTERVAL_1_MINUTE,
     "5m": Interval.INTERVAL_5_MINUTES,
