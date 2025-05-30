@@ -60,7 +60,7 @@ class Trades(Base):
 
 class Orders(Base):
     __tablename__ = 'orders'
-    order_id = Column(Integer, primary_key=True, autoincrement=True)
+    order_id = Column(BigInteger, primary_key=True, autoincrement=True)
     trade_id = Column(Integer)
     symbol = Column(String)
     time = Column(BigInteger)
@@ -447,7 +447,7 @@ async def get_open_trade(symbol: str) -> Trades | None:
             return result.scalar_one_or_none()
 
         except Exception as e:
-            # логируй или обрабатывай исключения при необходимости
+
             print(f"Ошибка при получении открытой сделки по {symbol}: {e}")
             return None
 
@@ -484,3 +484,43 @@ async def sync_positions_with_exchange(client, positions: dict):
 #             if symbol not in positions:
 #                 continue
 #                 # positions[symbol] = False
+
+
+
+async def get_active_entry_order_info(symbol: str, client):
+    async with Session() as session:
+        try:
+            # Получаем открытую сделку
+            trade_stmt = select(Trades).where(
+                Trades.symbol == symbol,
+                Trades.position_open.is_(True)
+            ).order_by(Trades.open_time.desc()).limit(1)
+            trade_result = await session.execute(trade_stmt)
+            trade = trade_result.scalar_one_or_none()
+            if not trade:
+                print(f"❗ Нет открытой сделки по {symbol}")
+                return None
+
+            # Получаем входной MARKET-ордер из базы
+            order_stmt = select(Orders).where(
+                Orders.trade_id == trade.id,
+                Orders.type == 'MARKET',
+                Orders.reduce.is_(False)
+            ).order_by(Orders.time.desc()).limit(1)
+            order_result = await session.execute(order_stmt)
+            order = order_result.scalar_one_or_none()
+            if not order:
+                print(f"❗ Входной ордер не найден по trade_id={trade.id} для {symbol}")
+                return None
+
+            # Получаем ПОДТВЕРЖДЁННЫЕ данные с Binance (даже если ордер FILLED)
+            order_info = await client.get_all_orders(symbol=symbol, orderId=order.order_id, limit=1)
+            if order_info:
+                return order_info[0]
+            else:
+                print(f"❗ Binance не вернул данных по ордеру {order.order_id}")
+                return None
+
+        except Exception as e:
+            print(f"❗ Ошибка при получении информации по ордеру {symbol}: {e}")
+            return None
