@@ -23,9 +23,10 @@ executor = ThreadPoolExecutor(max_workers=20)
 all_symbols: dict[str, binance.SymbolFutures] = {}
 all_prices: dict[str, binance.SymbolFutures] = {}
 
-
+# Символы, по которым в приоритетном порядке собираются сигналы
 IMPORTANT_SYMBOLS = ['BTCUSDT', 'ETHUSDT']
 VALID_SIGNALS = ['STRONG_BUY', 'STRONG_SELL']
+
 
 timeframes = ["1m", "5m", "15m"]
 
