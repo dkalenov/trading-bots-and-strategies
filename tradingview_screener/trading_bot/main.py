@@ -30,6 +30,7 @@ VALID_SIGNALS = ['STRONG_BUY', 'STRONG_SELL']
 # Первый таймфрейм в приоритете, по нему открываются сделки
 timeframes = ["1m", "5m", "15m"]
 
+# сигнал по BTC
 btc_signal = None
 
 # список открытых позиций
