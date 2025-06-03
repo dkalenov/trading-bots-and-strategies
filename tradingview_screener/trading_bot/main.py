@@ -19,7 +19,11 @@ logging.basicConfig(level=logging.INFO)
 conf: db.ConfigInfo
 client: binance.Futures
 session = None
+
+# Потоки для параллельного выполнния задач
 executor = ThreadPoolExecutor(max_workers=20)
+
+
 all_symbols: dict[str, binance.SymbolFutures] = {}
 all_prices: dict[str, binance.SymbolFutures] = {}
 
