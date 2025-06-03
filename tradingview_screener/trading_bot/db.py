@@ -13,6 +13,8 @@ import get_data
 
 
 Base = declarative_base()
+
+# класс для асинхронных операций с базой данных
 Session: async_sessionmaker
 client: binance.Futures
 
