@@ -151,7 +151,7 @@ async def connect(host, port, user, password, dbname):
 
 
 
-
+# загрузка конфигурации 
 async def load_config():
     for key in ConfigInfo.__annotations__.keys():
         try:
