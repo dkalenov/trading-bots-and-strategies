@@ -23,10 +23,10 @@ session = None
 # Потоки для параллельного выполнния задач
 executor = ThreadPoolExecutor(max_workers=20)
 
-# все символы для первого запуска
+# Все символы для первого запуска
 all_symbols: dict[str, binance.SymbolFutures] = {}
 
-
+# Все цены разом, полученные за один запрос
 all_prices: dict[str, binance.SymbolFutures] = {}
 
 # Символы, по которым в приоритетном порядке собираются сигналы
