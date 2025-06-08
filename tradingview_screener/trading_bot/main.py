@@ -42,6 +42,7 @@ btc_signal = None
 # список открытых позиций
 positions = {}
 
+# подключение к вебсокетам
 websockets_list: list[binance.futures.WebsocketAsync] = []
 
 debug = None
