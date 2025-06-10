@@ -48,6 +48,7 @@ websockets_list: list[binance.futures.WebsocketAsync] = []
 # мод для тестирования  
 debug = None
 
+# кэш с кофигурациями символов
 symbol_conf_cache: dict[str, db.SymbolsSettings] = {}
 
 
