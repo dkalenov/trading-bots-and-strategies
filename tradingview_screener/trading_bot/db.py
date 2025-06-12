@@ -193,7 +193,7 @@ async def config_update(**kwargs):
         await s.commit()
 
 
-
+# Получаем конфигурацию по символам
 async def get_symbol_conf(symbol):
     async with Session() as s:
         try:
