@@ -24,7 +24,7 @@ def get_prices_binance(symbols):
         logging.error(f"Ошибка получения цен с Binance: {e}")
         return {}
 
-
+# Получаем символы с Binance
 def get_binance_symbols():
     """ Получает список доступных символов с Binance (только USDT) """
     try:
