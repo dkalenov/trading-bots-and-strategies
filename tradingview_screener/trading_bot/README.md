@@ -2,4 +2,4 @@ The bot opens trades based on signals from tradingview.
 
 tradingview request limits
 
-indicators
+Test 21, 25, 29 indicators. Tradingview_ta has 26 original indicators.
