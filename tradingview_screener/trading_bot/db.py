@@ -12,10 +12,7 @@ import asyncio
 import get_data
 
 
-# базовый класс для определения моделей базы данных, из него будут унаследованы структуры таблиц в бд
 Base = declarative_base()
-
-# класс для асинхронных операций с базой данных
 Session: async_sessionmaker
 client: binance.Futures
 
@@ -57,7 +54,8 @@ class Trades(Base):
     stop_price = Column(Float)
     breakeven_stop_price = Column(Float)
     take1_triggered = Column(Boolean, default=False)
-    result = Column(Float)
+    partial_exit_done = Column(Boolean, default=False)
+    result = Column(Float, default=0)
     msg_id = Column(Integer)
 
 
@@ -151,7 +149,7 @@ async def connect(host, port, user, password, dbname):
 
 
 
-# загрузка конфигурации 
+
 async def load_config():
     for key in ConfigInfo.__annotations__.keys():
         try:
@@ -193,7 +191,7 @@ async def config_update(**kwargs):
         await s.commit()
 
 
-# Получаем конфигурацию по символам
+
 async def get_symbol_conf(symbol):
     async with Session() as s:
         try:
@@ -527,3 +525,46 @@ async def get_active_entry_order_info(symbol: str, client):
         except Exception as e:
             print(f"❗ Ошибка при получении информации по ордеру {symbol}: {e}")
             return None
+
+
+
+
+
+async def get_order_trade(order_id) -> tuple[Orders, Trades]:
+    # создание сессии для работы с БД
+    async with Session() as s:
+        # получаем ордер
+        order = (await s.execute(select(Orders).where(Orders.order_id == order_id))).scalar_one_or_none()
+        # если ордер найден
+        if order:
+            # получаем трейд
+            trade = (await s.execute(select(Trades).where(Trades.id == order.trade_id))).scalar_one_or_none()
+        else:
+            trade = None
+        # возвращаем результат
+        return order, trade
+
+
+
+
+
+# функция для обновления ордера и трейда
+async def update_order_trade(order, trade):
+    # создание сессии для работы с БД
+    async with Session() as s:
+        # обновляем ордер
+        s.add(order)
+        # обновляем трейд
+        s.add(trade)
+        # записываем изменения в БД
+        await s.commit()
+
+
+# функция для получения последней сделки по паре
+async def get_last_trade(symbol):
+    # создание сессии для работы с БД
+    async with Session() as s:
+        # получаем последнюю сделку
+        trade = await s.execute(select(Trades).where(Trades.symbol == symbol).order_by(Trades.open_time.desc()).limit(1))
+        # возвращаем результат
+        return trade.scalar_one_or_none()
