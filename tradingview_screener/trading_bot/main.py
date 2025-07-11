@@ -11,6 +11,9 @@ import get_data
 import tg
 import pprint
 from sqlalchemy import select, update
+from datetime import datetime
+from collections import defaultdict
+import asyncio
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -43,11 +46,52 @@ symbol_conf_cache: dict[str, db.SymbolsSettings] = {}
 
 in_progress = {}
 
+userdata_ws = None
 
-from collections import defaultdict
-import asyncio
+
+
 
 symbol_locks = defaultdict(asyncio.Lock)
+
+
+
+# async def main():
+#     global session, conf, client, all_symbols, all_prices, debug, symbol_conf_cache, positions
+#
+#     config.read('config.ini')
+#     session = await db.connect(config['DB']['host'], int(config['DB']['port']), config['DB']['user'],
+#         config['DB']['password'], config['DB']['db'])
+#
+#     conf = await db.load_config()
+#     client = binance.Futures(
+#         conf.api_key, conf.api_secret,
+#         asynced=True, testnet=config.getboolean('BOT', 'testnet')
+#     )
+#     debug = config.getboolean('BOT', 'debug')
+#
+#     # ЗАГРУЖАЕМ КОНФИГИ СИМВОЛОВ ДО подключения к WS
+#     symbol_confs = await db.get_all_symbols_conf()
+#     symbol_conf_cache = {s.symbol: s for s in symbol_confs}
+#
+#     # Загружаем позиции
+#     await get_data.sync_positions_with_exchange(client, positions)
+#
+#     open_symbols = [symbol for symbol, status in positions.items() if status]
+#     print(f"Открытых позиций: {len(open_symbols)}")
+#
+#     # Загружаем данные о символах и ценах
+#     all_symbols = await get_data.load_binance_symbols(client)
+#     all_prices = await get_data.get_all_prices(client)
+#
+#
+#     symbol_update_lock = asyncio.Lock()
+#
+#     await asyncio.gather(
+#         *(timed_collector(tf, symbol_update_lock) for tf in timeframes),
+#         db.periodic_symbol_update(client, executor, symbol_update_lock, hour=17, minute=35),
+#         tg.run(),
+#         connect_ws()
+#     )
 
 
 
@@ -55,9 +99,12 @@ async def main():
     global session, conf, client, all_symbols, all_prices, debug, symbol_conf_cache, positions
 
     config.read('config.ini')
-    session = await db.connect(config['DB']['host'], int(config['DB']['port']), config['DB']['user'],
-        config['DB']['password'], config['DB']['db'])
 
+    # подключение к БД
+    session = await db.connect(config['DB']['host'], int(config['DB']['port']),
+        config['DB']['user'], config['DB']['password'], config['DB']['db'])
+
+    # конфиг и клиент
     conf = await db.load_config()
     client = binance.Futures(
         conf.api_key, conf.api_secret,
@@ -65,31 +112,30 @@ async def main():
     )
     debug = config.getboolean('BOT', 'debug')
 
-    # ЗАГРУЖАЕМ КОНФИГИ СИМВОЛОВ ДО подключения к WS
+    # символы и конфиги
     symbol_confs = await db.get_all_symbols_conf()
     symbol_conf_cache = {s.symbol: s for s in symbol_confs}
 
-    # Загружаем позиции
+    # загрузка всех позиций
     await get_data.sync_positions_with_exchange(client, positions)
-
     open_symbols = [symbol for symbol, status in positions.items() if status]
     print(f"Открытых позиций: {len(open_symbols)}")
 
-    # Загружаем данные о символах и ценах
+    # данные Binance
     all_symbols = await get_data.load_binance_symbols(client)
     all_prices = await get_data.get_all_prices(client)
 
-
-
-
+    # запуск параллельных задач
     symbol_update_lock = asyncio.Lock()
-
     await asyncio.gather(
         *(timed_collector(tf, symbol_update_lock) for tf in timeframes),
         db.periodic_symbol_update(client, executor, symbol_update_lock, hour=17, minute=35),
         tg.run(),
         connect_ws()
     )
+
+
+
 
 
 async def timed_collector(timeframe: str, lock: asyncio.Lock):
@@ -174,7 +220,7 @@ async def process_main_timeframe_signals():
 
     if signals_to_save:
         logging.info(f"Сохраняем {len(signals_to_save)} сигналов в БД")
-        await db.save_signals_batch_to_db(signals_to_save)
+        # await db.save_signals_batch_to_db(signals_to_save)
     else:
         logging.warning("Нет сигналов для сохранения — список пуст.")
 
@@ -372,11 +418,190 @@ async def new_trade(symbol, interval, signal):
                                reduceOnly=True)
 
 
-async def connect_ws():
-    global websockets_list, symbol_conf_cache
 
-    logging.info("Подключаемся к вебсокетам...")
+
+
+
+# old, working
+# async def connect_ws():
+#     global websockets_list, symbol_conf_cache
+#
+#     logging.info("Подключаемся к вебсокетам...")
+#     streams = []
+#
+#     available_symbols = list(symbol_conf_cache.keys())
+#     symbols_ordered = IMPORTANT_SYMBOLS + [s for s in available_symbols if s not in IMPORTANT_SYMBOLS]
+#
+#     for symbol in symbols_ordered:
+#         conf = symbol_conf_cache.get(symbol)
+#         # print(f"WS {symbol}")
+#         if conf and conf.status:
+#             # print('STREAMS APPENDED')
+#             streams.append(f"{symbol.lower()}@kline_{conf.interval}")
+#
+#     # Разбиваем по чанкам по 100 стримов (лимит Binance)
+#     chunk_size = 100
+#     streams_list = [streams[i:i + chunk_size] for i in range(0, len(streams), chunk_size)]
+#
+#     for stream_chunk in streams_list:
+#         ws = await client.websocket(stream_chunk, on_message=ws_msg)
+#         websockets_list.append(ws)
+#
+#
+#
+# # ok old
+
+# async def ws_msg(ws, msg):
+#     if 'data' not in msg:
+#         return
+#
+#     kline = msg['data']['k']
+#     symbol = kline['s']
+#     interval = kline['i']
+#     is_closed = kline['x']
+#     current_price = float(kline['c'])
+#
+#     try:
+#         trade = await db.get_open_trade(symbol)
+#         if not trade:
+#             return
+#
+#         direction = "BUY" if trade.side else "SELL"
+#
+#         take1_hit = current_price >= trade.take1_price if direction == "BUY" else current_price <= trade.take1_price
+#         take2_hit = current_price >= trade.take2_price if direction == "BUY" else current_price <= trade.take2_price
+#         stop_hit = current_price <= trade.stop_price if direction == "BUY" else current_price >= trade.stop_price
+#
+#         async with session() as s:
+#
+#             # ☑️ Частичное закрытие по Take1 и перенос стопа
+#             if not trade.take1_triggered and take1_hit:
+#                 logging.info(f"{symbol}: достигнут Take1 {trade.take1_price}. Частичное закрытие и перенос стопа.")
+#
+#                 stmt = (
+#                     update(db.Trades)
+#                     .where(db.Trades.id == trade.id)
+#                     .values(take1_triggered=True)
+#                 )
+#                 await s.execute(stmt)
+#                 await s.commit()
+#
+#                 asyncio.create_task(partial_close_and_move_stop(trade))
+#                 return
+#
+#             # ✅ Полное закрытие по Take2 или Stop (НЕ зависит от take1)
+#             if take2_hit or stop_hit:
+#                 reason = "🎯 Закрытие по TAKE2" if take2_hit else "⛔️ Закрытие по СТОПУ"
+#                 close_price = trade.take2_price if take2_hit else trade.stop_price
+#
+#                 logging.info(f"{symbol}: {reason} по цене {close_price}")
+#
+#                 stmt = (
+#                     update(db.Trades)
+#                     .where(db.Trades.id == trade.id)
+#                     .values(
+#                         position_open=False,
+#                         close_time=int(datetime.utcnow().timestamp() * 1000),
+#                         status='TAKE2' if take2_hit else 'STOP1'
+#                     )
+#                 )
+#                 await s.execute(stmt)
+#                 await s.commit()
+#
+#                 try:
+#                     text = (
+#                         f"<b>{symbol}</b> {reason}\n"
+#                         f"Цена закрытия: <b>{close_price}</b>"
+#                     )
+#                     if trade.msg_id:
+#                         await tg.bot.send_message(config['TG']['channel'], text, parse_mode='HTML')
+#                 except Exception as e:
+#                     logging.error(f"Ошибка при отправке сообщения о закрытии {symbol}: {e}")
+#
+#                 positions.pop(symbol, None)
+#                 return
+#
+#
+#             if trade.breakeven_stop_price:
+#                 close_breakeven_hit = current_price <= trade.breakeven_stop_price if direction == "BUY" else current_price >= trade.breakeven_stop_price
+#
+#                 if close_breakeven_hit:
+#
+#                     reason = "🎯 Закрылись в БУ"
+#                     close_breakeven= trade.breakeven_stop_price
+#
+#                     logging.info(f"{symbol}: {reason} по цене {close_breakeven}")
+#
+#                     stmt = (
+#                         update(db.Trades)
+#                         .where(db.Trades.id == trade.id)
+#                         .values(
+#                             position_open=False,
+#                             close_time=int(datetime.utcnow().timestamp() * 1000),
+#                             status='STOP2'
+#                         )
+#                     )
+#                     await s.execute(stmt)
+#                     await s.commit()
+#
+#                     try:
+#                         text = (
+#                             f"<b>{symbol}</b> {reason}\n"
+#                             f"Цена закрытия: <b>{close_breakeven}</b>"
+#                         )
+#                         if trade.msg_id:
+#                             await tg.bot.send_message(config['TG']['channel'], text, parse_mode='HTML')
+#                     except Exception as e:
+#                         logging.error(f"Ошибка при отправке сообщения о закрытии {symbol}: {e}")
+#
+#                     positions.pop(symbol, None)
+#                     return
+#
+#
+#
+#     except Exception as e:
+#         logging.error(f"Ошибка при обработке цены {symbol}: {e}")
+
+
+
+
+# async def connect_ws():
+#     global websockets_list, symbol_conf_cache
+#
+#     logging.info("Подключаемся к вебсокетам...")
+#     streams = []
+#
+#     available_symbols = list(symbol_conf_cache.keys())
+#     symbols_ordered = IMPORTANT_SYMBOLS + [s for s in available_symbols if s not in IMPORTANT_SYMBOLS]
+#
+#     for symbol in symbols_ordered:
+#         conf = symbol_conf_cache.get(symbol)
+#         # print(f"WS {symbol}")
+#         if conf and conf.status:
+#             # print('STREAMS APPENDED')
+#             streams.append(f"{symbol.lower()}@kline_{conf.interval}")
+#
+#     # Разбиваем по чанкам по 100 стримов (лимит Binance)
+#     chunk_size = 100
+#     streams_list = [streams[i:i + chunk_size] for i in range(0, len(streams), chunk_size)]
+#
+#     for stream_chunk in streams_list:
+#         ws = await client.websocket(stream_chunk, on_message=ws_msg)
+#         websockets_list.append(ws)
+
+
+
+# подключение к вебсокетам
+async def connect_ws():
+    global websockets_list, userdata_ws
     streams = []
+
+    print("🔌 Подключаемся к WebSocket'ам...")
+    conf = await db.load_config()
+    if not conf.trade_mode or not conf.api_key or not conf.api_secret:
+        await db.config_update(trade_mode='0')
+        return
+
 
     available_symbols = list(symbol_conf_cache.keys())
     symbols_ordered = IMPORTANT_SYMBOLS + [s for s in available_symbols if s not in IMPORTANT_SYMBOLS]
@@ -388,25 +613,78 @@ async def connect_ws():
             # print('STREAMS APPENDED')
             streams.append(f"{symbol.lower()}@kline_{conf.interval}")
 
-    # Разбиваем по чанкам по 100 стримов (лимит Binance)
     chunk_size = 100
     streams_list = [streams[i:i + chunk_size] for i in range(0, len(streams), chunk_size)]
 
-    for stream_chunk in streams_list:
-        ws = await client.websocket(stream_chunk, on_message=ws_msg)
-        websockets_list.append(ws)
+    for stream_list in streams_list:
+        # запускаем вебсокеты
+        websockets_list.append(await client.websocket(stream_list, on_message=ws_msg, on_error=ws_error))
+    # подключение к вебсокету userdata
+    userdata_ws = await client.websocket_userdata(on_message=ws_user_msg, on_error=ws_error)
 
 
-from datetime import datetime
 
+
+
+
+
+
+
+
+# отключение от вебсокетов
+async def disconnect_ws():
+    global websockets_list, userdata_ws, indicators
+
+    print("🔌 Отключаемся от WebSocket'ов...")
+    for ws in websockets_list:
+        try:
+            await ws.close()
+        except:
+            pass
+
+    indicators = {}
+
+    try:
+        await userdata_ws.close()
+    except:
+        pass
+
+# подписка на стрим свечей по символу
+async def subscribe_ws(symbol, interval):
+    global websockets_list
+    stream = f"{symbol.lower()}@kline_{interval}"
+    for ws in websockets_list:
+        if len(ws.stream) < ws.streams_limit:
+            await ws.subscribe([stream])
+            return
+
+    ws = await client.websocket([stream], on_message=ws_msg, on_error=ws_error)
+    websockets_list.append(ws)
+
+# отписка от стрима по символу
+async def unsubscribe_ws(symbol):
+    global websockets_list
+    for ws in websockets_list:
+        for stream in ws.stream:
+            if stream.split('@')[0] == symbol.lower():
+                await ws.unsubscribe(stream)
+
+# обработка ошибок вебсокета
+async def ws_error(ws, error):
+    print(f"❌ WS ERROR: {error}")
+    print(traceback.format_exc())
+
+
+
+
+
+# Реакция на изменение цены из потока свечей
 async def ws_msg(ws, msg):
     if 'data' not in msg:
         return
 
     kline = msg['data']['k']
     symbol = kline['s']
-    interval = kline['i']
-    is_closed = kline['x']
     current_price = float(kline['c'])
 
     try:
@@ -422,7 +700,7 @@ async def ws_msg(ws, msg):
 
         async with session() as s:
 
-            # ☑️ Частичное закрытие по Take1 и перенос стопа
+            # Частичное закрытие и перенос стопа
             if not trade.take1_triggered and take1_hit:
                 logging.info(f"{symbol}: достигнут Take1 {trade.take1_price}. Частичное закрытие и перенос стопа.")
 
@@ -437,7 +715,6 @@ async def ws_msg(ws, msg):
                 asyncio.create_task(partial_close_and_move_stop(trade))
                 return
 
-            # ✅ Полное закрытие по Take2 или Stop (НЕ зависит от take1)
             if take2_hit or stop_hit:
                 reason = "🎯 Закрытие по TAKE2" if take2_hit else "⛔️ Закрытие по СТОПУ"
                 close_price = trade.take2_price if take2_hit else trade.stop_price
@@ -449,126 +726,161 @@ async def ws_msg(ws, msg):
                     .where(db.Trades.id == trade.id)
                     .values(
                         position_open=False,
-                        close_time=int(datetime.utcnow().timestamp() * 1000),
+                        # close_time=int(datetime.utcnow().timestamp() * 1000),
+                        close_time=kline['T'],
                         status='TAKE2' if take2_hit else 'STOP1'
                     )
                 )
                 await s.execute(stmt)
                 await s.commit()
 
-                try:
-                    text = (
-                        f"<b>{symbol}</b> {reason}\n"
-                        f"Цена закрытия: <b>{close_price}</b>"
-                    )
-                    if trade.msg_id:
-                        await tg.bot.send_message(config['TG']['channel'], text, parse_mode='HTML')
-                except Exception as e:
-                    logging.error(f"Ошибка при отправке сообщения о закрытии {symbol}: {e}")
-
-                positions.pop(symbol, None)
-                return
-
+            # Если цена достигла уровня безубытка
+            # if trade.breakeven_stop_price:
+            #     breakeven_hit = current_price <= trade.breakeven_stop_price if direction == "BUY" else current_price >= trade.breakeven_stop_price
+            #
+                # if breakeven_hit:
+                #     logging.info(f"{symbol}: достигнут уровень безубытка, ставим ордер")
+                #
+                #     close_side = "SELL" if direction == "BUY" else "BUY"
+                #     qty = trade.quantity
+                #
+                #     await client.new_order(
+                #         symbol=symbol,
+                #         side=close_side,
+                #         type='MARKET',
+                #         quantity=qty,
+                #         reduceOnly=True
+                #     )
+                #     return
 
             if trade.breakeven_stop_price:
-                close_breakeven_hit = current_price <= trade.breakeven_stop_price if direction == "BUY" else current_price >= trade.breakeven_stop_price
+                    close_breakeven_hit = current_price <= trade.breakeven_stop_price if direction == "BUY" else current_price >= trade.breakeven_stop_price
 
-                if close_breakeven_hit:
+                    if close_breakeven_hit:
 
-                    reason = "🎯 Закрылись в БУ"
-                    close_breakeven= trade.breakeven_stop_price
+                        reason = "🎯 Закрылись в БУ"
+                        close_breakeven= trade.breakeven_stop_price
 
-                    logging.info(f"{symbol}: {reason} по цене {close_breakeven}")
+                        logging.info(f"{symbol}: {reason} по цене {close_breakeven}")
 
-                    stmt = (
-                        update(db.Trades)
-                        .where(db.Trades.id == trade.id)
-                        .values(
-                            position_open=False,
-                            close_time=int(datetime.utcnow().timestamp() * 1000),
-                            status='STOP2'
+                        stmt = (
+                            update(db.Trades)
+                            .where(db.Trades.id == trade.id)
+                            .values(
+                                position_open=False,
+                                close_time=kline['T'],
+                                status='STOP2'
+                            )
                         )
-                    )
-                    await s.execute(stmt)
-                    await s.commit()
-
-                    try:
-                        text = (
-                            f"<b>{symbol}</b> {reason}\n"
-                            f"Цена закрытия: <b>{close_breakeven}</b>"
-                        )
-                        if trade.msg_id:
-                            await tg.bot.send_message(config['TG']['channel'], text, parse_mode='HTML')
-                    except Exception as e:
-                        logging.error(f"Ошибка при отправке сообщения о закрытии {symbol}: {e}")
-
-                    positions.pop(symbol, None)
-                    return
 
 
 
     except Exception as e:
-        logging.error(f"Ошибка при обработке цены {symbol}: {e}")
+        logging.error(f"{symbol}: ошибка в ws_msg: {e}")
 
 
 
 
 
-# async def ws_msg(ws, msg):
-#     if 'data' not in msg:
-#         # print('NO DATA')
-#         return
-#
-#     kline = msg['data']['k']
-#     symbol = kline['s']
-#     interval = kline['i']
-#     is_closed = kline['x']  # завершена ли свеча
-#
-#
-#     try:
-#         trade = await db.get_open_trade(symbol)
-#
-#         if trade and not trade.take1_triggered:
-#             # print("Отслеживаем цену")
-#             current_price = float(kline['c'])
-#             direction = "BUY" if trade.side else "SELL"
-#             take1_price = trade.take1_price
-#
-#             price_hit = current_price >= take1_price if direction == "BUY" else current_price <= take1_price
-#
-#             if price_hit:
-#
-#                 async with session() as s:
-#                     logging.info(f"{symbol}: достигнут цена {take1_price}. Закрытие части и перенос стопа.")
-#
-#                     stmt = (
-#                         update(db.Trades)
-#                         .where(db.Trades.id == trade.id)
-#                         .values(take1_triggered=True)
-#                     )
-#                     await s.execute(stmt)
-#                     await s.commit()
-#
-#                 asyncio.create_task(partial_close_and_move_stop(trade))
-#         # all_prices[symbol] = float(kline['c'])
-#         # print(f'WS {symbol} price: {all_prices[symbol]}')
-#
-#
-#     except Exception as e:
-#         logging.error(f"Ошибка при обновлении цены {symbol}: {e}")
+
+# Обработчик сообщений от user stream Binance WebSocket
+async def ws_user_msg(ws, msg):
+    global positions
+
+    if msg.get('e') != 'ORDER_TRADE_UPDATE':
+        return
+
+    o = msg['o']
+    symbol = o['s']
+
+    # Обрабатываем только reduceOnly ордера (закрытие позиции)
+    if o['R'] and o['X'] in ('FILLED', 'PARTIALLY_FILLED', 'CANCELLED', 'EXPIRED'):
+
+        # Получаем ордер и сделку
+        order, trade = await db.get_order_trade(o['i'])
+
+        # Если ордера нет в базе — возможно, он только что был создан на частичное закрытие
+        if not order:
+            if trade := await db.get_open_trade(symbol):
+                async with session() as s:
+                    order = db.Orders(
+                        order_id=o['i'],
+                        trade_id=trade.id,
+                        symbol=symbol,
+                        time=o['T'],
+                        side=o['S'] == 'BUY',
+                        type=o['o'],
+                        status='NEW',
+                        reduce=o['R'],
+                        price=float(o['ap']),
+                        quantity=float(o['z'])
+                    )
+                    s.add(order)
+                    await s.commit()
+
+        if order and trade:
+            order.status = o['X']
+            order.time = o['T']
+            if qty := float(o['z']):
+                order.quantity = qty
+            if price := float(o['ap']):
+                order.price = price
+
+            # обновляем результат сделки (например, полученная прибыль/убыток)
+            # if o['X'] in ('FILLED', 'PARTIALLY_FILLED'):
+            #     trade.result += float(o['rp'])
+            if o['X'] in ('FILLED', 'PARTIALLY_FILLED'):
+                if trade.result is None:
+                    trade.result = 0.0
+                trade.result += float(o['rp'])
+
+            # если полностью закрыта — обновляем статус и отправляем уведомление
+            if o['X'] == 'FILLED':
+                trade.close_time = o['T']
+                trade.status = 'CLOSED'
+
+            await db.update_order_trade(order, trade)
+
+            # Уведомление в Telegram при полном закрытии
+            if o['X'] == 'FILLED':
+                match o['ot']:
+                    case 'STOP_MARKET':
+                        order_type = '⛔️ по СТОПУ'
+                    case 'LIMIT':
+                        order_type = '🎯 по ТЕЙКУ'
+                    case _:
+                        order_type = '📉 по рынку'
+
+                try:
+                    text = (
+                        f"<b>{symbol}</b> сделка в <b>{'ЛОНГ' if trade.side else 'ШОРТ'}</b> "
+                        # f"Take1: {trade.take1_price}, Take2: {trade.take2_price}, BU-стоп: {trade.breakeven_stop_price}"
+                        f"закрыта {order_type}\n"
+                        f"Цена закрытия: <b>{order.price}</b>\n"
+                        f"{'Прибыль' if trade.result > 0 else 'Убыток'}: <b>{round(trade.result, 4)} USDT</b>"
+                    )
+                    if trade.msg_id:
+                        await tg.bot.send_message(config['TG']['channel'], text,
+                                                  reply_to_message_id=trade.msg_id,
+                                                  parse_mode='HTML')
+                except Exception as e:
+                    logging.error(f"{symbol}: ошибка при отправке уведомления: {e}")
+
+                positions.pop(symbol, None)
+                print(f"Сделка по {symbol} закрыта.")
+
+
+
+
+
+
 
 
 async def partial_close_and_move_stop(trade):
     global positions
 
-    close_portion = False
-    move_stop = False
-
-    portion_close_order = None
-
-    msgs = []
-
     symbol = trade.symbol
+    msgs = []
 
     if trade.partial_exit_done:
         logging.info(f"{symbol}: частичное закрытие уже выполнено ранее, пропуск.")
@@ -578,7 +890,6 @@ async def partial_close_and_move_stop(trade):
         direction = "BUY" if trade.side else "SELL"
         close_side = "SELL" if direction == "BUY" else "BUY"
 
-        # Получаем позицию с Binance
         binace_positions = await client.get_position_risk(symbol=symbol)
         position_info = next((p for p in binace_positions if p["symbol"] == symbol), None)
 
@@ -586,129 +897,90 @@ async def partial_close_and_move_stop(trade):
             logging.warning(f"{symbol}: позиция не найдена.")
             return
 
-        position_amt = float(position_info["positionAmt"])
-
+        position_amt = abs(float(position_info["positionAmt"]))
         if position_amt == 0:
             logging.warning(f"{symbol}: позиция уже закрыта.")
             return
 
-        position_side = "BUY" if position_amt > 0 else "SELL"
-        if position_side != direction:
-            logging.warning(f"{symbol}: направление позиции не совпадает с ожидаемым.")
-            return
-
-        position_amt = abs(position_amt)
         portion = symbol_conf_cache.get(symbol).portion
-        qty = trade.quantity * portion
-        qty = utils.round_down(qty, all_symbols[symbol].step_size)
+        step_size = all_symbols[symbol].step_size
+        min_qty = all_symbols[symbol].min_qty
 
+        qty = utils.round_down(trade.quantity * portion, step_size)
 
-        # Частичное закрытие позиции
-        try:
-            if qty == 0 or qty > position_amt:
-                    logging.warning(f"{symbol}: невозможно закрыть {qty}, позиция только {position_amt}")
-            else:
-                portion_close_order = await client.new_order(
-                symbol=symbol,
-                side=close_side,
-                type='MARKET',
-                quantity=qty,
-                reduceOnly=True
-            )
-            logging.info(f"{symbol}: частично закрыто {portion * 100:.1f}% позиции ({qty})")
-
-            msg = f"{symbol}: частично закрыто {portion * 100:.1f}% позиции ({qty})"
-            msgs.append(msg)
-
-
-            # Обновляем флаг частичного выхода
+        # --- ЗАЩИТА: если qty меньше минимального допустимого, НЕ закрываем частично ---
+        if qty < min_qty:
+            logging.warning(f"{symbol}: объём {qty} меньше минимального лота {min_qty}, пропускаем частичное закрытие.")
+            msgs.append(f"{symbol}: объём ({qty}) меньше минимального лота, частичное закрытие пропущено.")
+        else:
             try:
+                portion_close_order = await client.new_order(
+                    symbol=symbol,
+                    side=close_side,
+                    type='MARKET',
+                    quantity=qty,
+                    reduceOnly=True
+                )
+                logging.info(f"{symbol}: частично закрыто {portion * 100:.1f}% позиции ({qty})")
+                msgs.append(f"{symbol}: частично закрыто {portion * 100:.1f}% позиции ({qty})")
+
                 async with session() as s:
                     stmt = update(db.Trades).where(db.Trades.id == trade.id).values(partial_exit_done=True)
                     await s.execute(stmt)
                     await s.commit()
                     logging.info(f"{symbol}: флаг partial_exit_done установлен.")
 
-
-
-                    s.add(db.Orders(order_id=portion_close_order['orderId'], trade_id=trade.id, symbol=symbol, time=portion_close_order['updateTime'],
-                                    side=portion_close_order['side'] == 'BUY', type=portion_close_order['type'], status=portion_close_order['status'],
-                                    reduce=portion_close_order['reduceOnly'], price=float(portion_close_order['avgPrice']),
-                                    quantity=float(portion_close_order['executedQty'])))
-                    # отправляем данные в БД
+                    s.add(db.Orders(
+                        order_id=portion_close_order['orderId'],
+                        trade_id=trade.id,
+                        symbol=symbol,
+                        time=portion_close_order['updateTime'],
+                        side=portion_close_order['side'] == 'BUY',
+                        type=portion_close_order['type'],
+                        status=portion_close_order['status'],
+                        reduce=portion_close_order['reduceOnly'],
+                        price=float(portion_close_order['avgPrice']),
+                        quantity=float(portion_close_order['executedQty'])
+                    ))
                     await s.commit()
-                    logging.info(f"{symbol}: portion close order сохранён в бд.")
-
+                    logging.info(f"{symbol}: portion close order сохранён в БД.")
             except Exception as e:
-                logging.error(f"{symbol}: ошибка при обновлении partial_exit_done в БД: {e}")
+                logging.error(f"{symbol}: ошибка при MARKET-закрытии части позиции: {e}")
+                msgs.append(f"{symbol}: ошибка при MARKET-закрытии части позиции: {e}")
 
+        # --- ПЕРЕНОС СТОПА В БЕЗУБЫТОК ---
+        binace_positions = await client.get_position_risk(symbol=symbol)
+        position_info = next((p for p in binace_positions if p["symbol"] == symbol), None)
+        remaining_amt = abs(float(position_info["positionAmt"]))
 
+        if remaining_amt == 0:
+            logging.warning(f"{symbol}: позиция полностью закрыта после частичного выхода.")
+            msgs.append(f"{symbol}: позиция полностью закрыта после частичного выхода.")
+            positions[symbol] = False
+            return
 
-        except Exception as e:
-            logging.error(f"{symbol}: ошибка при MARKET-закрытии части позиции: {e}")
+        entry_price = trade.entry_price
+        new_stop = entry_price * (0.999 if direction == "BUY" else 1.001)
+        new_stop = round(new_stop, all_symbols[symbol].tick_size)
+        remaining_qty = utils.round_down(remaining_amt, step_size)
 
-            msg = f"{symbol}: ошибка при MARKET-закрытии части позиции: {e}"
-            msgs.append(msg)
-
-
-
-            # Отмена старых стопов
         try:
-            # Повторно проверяем позицию
-            binace_positions = await client.get_position_risk(symbol=symbol)
-            position_info = next((p for p in binace_positions if p["symbol"] == symbol), None)
-            remaining_amt = abs(float(position_info["positionAmt"]))
-
-            if remaining_amt == 0:
-                logging.warning(f"{symbol}: позиция полностью закрыта после частичного выхода.")
-                msg = f"{symbol}: позиция полностью закрыта после частичного выхода."
-                msgs.append(msg)
-
-                positions[symbol] = False
-                return
-
-            # Новый стоп в безубыток
-            entry_price = trade.entry_price
-
-            # Для теста Поменял всё местами и увеличил сильно значения
-            new_stop = entry_price * (0.999 if direction == "BUY" else 1.001)
-
-            # new_stop = entry_price * (1.001 if direction == "BUY" else 0.999)
-
-            new_stop = round(new_stop, all_symbols[symbol].tick_size)
-
-            remaining_qty = utils.round_down(remaining_amt, all_symbols[symbol].step_size)
-
-            stop_order_params = {
-                "symbol": symbol,
-                "side": close_side,
-                "type": 'STOP_MARKET',
-                "stopPrice": new_stop,
-                "quantity": remaining_qty,
-                "reduceOnly": True
-            }
-
-
-            new_stop_order = await client.new_order(**stop_order_params)
+            new_stop_order = await client.new_order(
+                symbol=symbol,
+                side=close_side,
+                type='STOP_MARKET',
+                stopPrice=new_stop,
+                quantity=remaining_qty,
+                reduceOnly=True
+            )
             logging.info(f"{symbol}: новый стоп установлен в безубыток @ {new_stop}, объём {remaining_qty}")
-
-            msg = f"{symbol}: новый стоп установлен в безубыток @ {new_stop}, объём {remaining_qty}"
-            msgs.append(msg)
-
-
+            msgs.append(f"{symbol}: новый стоп установлен в безубыток @ {new_stop}, объём {remaining_qty}")
         except Exception as e:
             error_text = str(e)
             logging.error(f"{symbol}: ошибка при установке нового стопа: {error_text}")
+            msgs.append(f"{symbol}: ошибка при установке нового стопа: {error_text}")
+            return
 
-            msg = f"{symbol}: ошибка при установке нового стопа: {error_text}"
-            msgs.append(msg)
-
-            if "ReduceOnly Order is rejected" in error_text:
-                logging.error(f"{symbol}: Binance отклонил стоп — возможно, позиция уже закрыта.")
-                return
-
-
-        # Обновляем БД
         try:
             async with session() as s:
                 stmt = update(db.Trades).where(db.Trades.id == trade.id).values(breakeven_stop_price=new_stop)
@@ -716,82 +988,283 @@ async def partial_close_and_move_stop(trade):
                 await s.commit()
                 logging.info(f"{symbol}: новая цена стопа ({new_stop}) записана в БД.")
 
-                s.add(db.Orders(order_id=new_stop_order['orderId'], trade_id=trade.id, symbol=symbol,
-                                time=new_stop_order['updateTime'],
-                                side=new_stop_order['side'] == 'BUY', type=new_stop_order['type'],
-                                status=new_stop_order['status'],
-                                reduce=new_stop_order['reduceOnly'], price=float(new_stop_order['avgPrice']),
-                                quantity=float(new_stop_order['executedQty'])))
-                # отправляем данные в БД
+                s.add(db.Orders(
+                    order_id=new_stop_order['orderId'],
+                    trade_id=trade.id,
+                    symbol=symbol,
+                    time=new_stop_order['updateTime'],
+                    side=new_stop_order['side'] == 'BUY',
+                    type=new_stop_order['type'],
+                    status=new_stop_order['status'],
+                    reduce=new_stop_order['reduceOnly'],
+                    price=float(new_stop_order['avgPrice']),
+                    quantity=float(new_stop_order['executedQty'])
+                ))
                 await s.commit()
-                logging.info(f"{symbol}: new_stop_order сохранён в бд.")
-
+                logging.info(f"{symbol}: новый стоп-ордер сохранён в БД.")
         except Exception as e:
             logging.error(f"{symbol}: ошибка при записи стопа в БД: {e}")
 
+        # --- Уведомление в Telegram ---
+        try:
+            text_parts = [f"<b>{symbol}</b> — частичное закрытие и перенос стопа"]
+            if msgs:
+                text_parts.append("\n".join(msgs))
+            text = "\n".join(text_parts)
 
-
-            if new_stop_order:
-                try:
-                    open_orders = await client.get_orders(symbol=symbol)
-                    # print("OPEN ORDERS", open_orders)
-                    for order in open_orders:
-                        if order['type'] == 'STOP_MARKET' and order.get('reduceOnly') and order['status'] == 'NEW':
-                            cancel_order = await client.cancel_order(symbol=symbol, orderId=order['orderId'])
-                            logging.info(f"{symbol}: отменён стоп-ордер {order['orderId']}")
-                            # print('CANCEL ORDER', cancel_order)
-
-                            try:
-                                async with session() as s:
-                                    s.add(db.Orders(order_id=cancel_order['orderId'], trade_id=trade.id, symbol=symbol,
-                                                    time=cancel_order['updateTime'],
-                                                    side=cancel_order['side'] == 'BUY', type=cancel_order['type'],
-                                                    status=cancel_order['status'],
-                                                    reduce=cancel_order['reduceOnly'],
-                                                    price=float(cancel_order['avgPrice']),
-                                                    quantity=float(cancel_order['executedQty'])))
-                                    # отправляем данные в БД
-                                    await s.commit()
-                                    logging.info(f"{symbol}: portion close order сохранён в бд.")
-
-                            except Exception as e:
-                                logging.error(f"{symbol}: ошибка при обновлении partial_exit_done в БД: {e}")
-
-                except Exception as e:
-                    logging.warning(f"{symbol}: не удалось отменить стоп-ордера: {e}")
-
+            # msg = await tg.bot.send_message(config['TG']['channel'], text, parse_mode='HTML')
+            msg = await tg.bot.send_message(config['TG']['channel'], text, reply_to_message_id=trade.msg_id, parse_mode='HTML')
+            if msg:
+                # async with session() as s:
+                #     stmt = update(db.Trades).where(db.Trades.id == trade.id).values(msg_id=msg.message_id)
+                #     await s.execute(stmt)
+                #     await s.commit()
+                logging.info(f"{symbol}: сообщение отправлено в Telegram")
+            else:
+                logging.warning(f"{symbol}: сообщение не отправлено, msg = None")
+        except Exception as e:
+            logging.error(f"{symbol}: ошибка при отправке сообщения в Telegram: {e}")
 
     except Exception as e:
         logging.error(f"{symbol}: критическая ошибка в partial_close_and_move_stop: {e}")
 
-        msg = f"{symbol}: критическая ошибка в partial_close_and_move_stop: {e}"
-        msgs.append(msg)
 
 
-    try:
 
-        text_parts = [f"<b>{symbol}</b> — частичное закрытие и перенос стопа\n"]
-
-        # # Добавим сообщения, если были
-        if msgs:
-            text_parts.append("\n".join(msgs))
-
-        text = '\n'.join(text_parts)
-
-        msg = await tg.bot.send_message(config['TG']['channel'], text, parse_mode='HTML')
-
-        if msg:
-            async with session() as s:
-                stmt = update(db.Trades).where(db.Trades.id == trade.id).values(msg_id=msg.message_id)
-                await s.execute(stmt)
-                await s.commit()
-            logging.info(f"{symbol}: сообщение отправлено в Telegram")
-        else:
-            logging.warning(f"{symbol}: сообщение не отправлено, msg = None")
-
-
-    except Exception as e:
-        logging.error(f"{symbol}: ошибка при отправке сообщения в Telegram: {e}")
+# async def partial_close_and_move_stop(trade):
+#     global positions
+#
+#     close_portion = False
+#     move_stop = False
+#
+#     portion_close_order = None
+#
+#     msgs = []
+#
+#     symbol = trade.symbol
+#
+#     if trade.partial_exit_done:
+#         logging.info(f"{symbol}: частичное закрытие уже выполнено ранее, пропуск.")
+#         return
+#
+#     try:
+#         direction = "BUY" if trade.side else "SELL"
+#         close_side = "SELL" if direction == "BUY" else "BUY"
+#
+#         # Получаем позицию с Binance
+#         binace_positions = await client.get_position_risk(symbol=symbol)
+#         position_info = next((p for p in binace_positions if p["symbol"] == symbol), None)
+#
+#         if not position_info:
+#             logging.warning(f"{symbol}: позиция не найдена.")
+#             return
+#
+#         position_amt = float(position_info["positionAmt"])
+#
+#         if position_amt == 0:
+#             logging.warning(f"{symbol}: позиция уже закрыта.")
+#             return
+#
+#         position_side = "BUY" if position_amt > 0 else "SELL"
+#         if position_side != direction:
+#             logging.warning(f"{symbol}: направление позиции не совпадает с ожидаемым.")
+#             return
+#
+#         position_amt = abs(position_amt)
+#         portion = symbol_conf_cache.get(symbol).portion
+#         qty = trade.quantity * portion
+#         qty = utils.round_down(qty, all_symbols[symbol].step_size)
+#
+#
+#         # Частичное закрытие позиции
+#         try:
+#             if qty == 0 or qty > position_amt:
+#                     logging.warning(f"{symbol}: невозможно закрыть {qty}, позиция только {position_amt}")
+#             else:
+#                 portion_close_order = await client.new_order(
+#                 symbol=symbol,
+#                 side=close_side,
+#                 type='MARKET',
+#                 quantity=qty,
+#                 reduceOnly=True
+#             )
+#             logging.info(f"{symbol}: частично закрыто {portion * 100:.1f}% позиции ({qty})")
+#
+#             msg = f"{symbol}: частично закрыто {portion * 100:.1f}% позиции ({qty})"
+#             msgs.append(msg)
+#
+#
+#             # Обновляем флаг частичного выхода
+#             try:
+#                 async with session() as s:
+#                     stmt = update(db.Trades).where(db.Trades.id == trade.id).values(partial_exit_done=True)
+#                     await s.execute(stmt)
+#                     await s.commit()
+#                     logging.info(f"{symbol}: флаг partial_exit_done установлен.")
+#
+#
+#
+#                     s.add(db.Orders(order_id=portion_close_order['orderId'], trade_id=trade.id, symbol=symbol, time=portion_close_order['updateTime'],
+#                                     side=portion_close_order['side'] == 'BUY', type=portion_close_order['type'], status=portion_close_order['status'],
+#                                     reduce=portion_close_order['reduceOnly'], price=float(portion_close_order['avgPrice']),
+#                                     quantity=float(portion_close_order['executedQty'])))
+#                     # отправляем данные в БД
+#                     await s.commit()
+#                     logging.info(f"{symbol}: portion close order сохранён в бд.")
+#
+#             except Exception as e:
+#                 logging.error(f"{symbol}: ошибка при обновлении partial_exit_done в БД: {e}")
+#
+#
+#
+#         except Exception as e:
+#             logging.error(f"{symbol}: ошибка при MARKET-закрытии части позиции: {e}")
+#
+#             msg = f"{symbol}: ошибка при MARKET-закрытии части позиции: {e}"
+#             msgs.append(msg)
+#
+#
+#
+#             # Отмена старых стопов
+#         try:
+#             # Повторно проверяем позицию
+#             binace_positions = await client.get_position_risk(symbol=symbol)
+#             position_info = next((p for p in binace_positions if p["symbol"] == symbol), None)
+#             remaining_amt = abs(float(position_info["positionAmt"]))
+#
+#             if remaining_amt == 0:
+#                 logging.warning(f"{symbol}: позиция полностью закрыта после частичного выхода.")
+#                 msg = f"{symbol}: позиция полностью закрыта после частичного выхода."
+#                 msgs.append(msg)
+#
+#                 positions[symbol] = False
+#                 return
+#
+#             # Новый стоп в безубыток
+#             entry_price = trade.entry_price
+#
+#             # Для теста Поменял всё местами и увеличил сильно значения
+#             new_stop = entry_price * (0.999 if direction == "BUY" else 1.001)
+#
+#             # new_stop = entry_price * (1.001 if direction == "BUY" else 0.999)
+#
+#             new_stop = round(new_stop, all_symbols[symbol].tick_size)
+#
+#             remaining_qty = utils.round_down(remaining_amt, all_symbols[symbol].step_size)
+#
+#             stop_order_params = {
+#                 "symbol": symbol,
+#                 "side": close_side,
+#                 "type": 'STOP_MARKET',
+#                 "stopPrice": new_stop,
+#                 "quantity": remaining_qty,
+#                 "reduceOnly": True
+#             }
+#
+#
+#             new_stop_order = await client.new_order(**stop_order_params)
+#             logging.info(f"{symbol}: новый стоп установлен в безубыток @ {new_stop}, объём {remaining_qty}")
+#
+#             msg = f"{symbol}: новый стоп установлен в безубыток @ {new_stop}, объём {remaining_qty}"
+#             msgs.append(msg)
+#
+#
+#         except Exception as e:
+#             error_text = str(e)
+#             logging.error(f"{symbol}: ошибка при установке нового стопа: {error_text}")
+#
+#             msg = f"{symbol}: ошибка при установке нового стопа: {error_text}"
+#             msgs.append(msg)
+#
+#             if "ReduceOnly Order is rejected" in error_text:
+#                 logging.error(f"{symbol}: Binance отклонил стоп — возможно, позиция уже закрыта.")
+#                 return
+#
+#
+#         # Обновляем БД
+#         try:
+#             async with session() as s:
+#                 stmt = update(db.Trades).where(db.Trades.id == trade.id).values(breakeven_stop_price=new_stop)
+#                 await s.execute(stmt)
+#                 await s.commit()
+#                 logging.info(f"{symbol}: новая цена стопа ({new_stop}) записана в БД.")
+#
+#                 s.add(db.Orders(order_id=new_stop_order['orderId'], trade_id=trade.id, symbol=symbol,
+#                                 time=new_stop_order['updateTime'],
+#                                 side=new_stop_order['side'] == 'BUY', type=new_stop_order['type'],
+#                                 status=new_stop_order['status'],
+#                                 reduce=new_stop_order['reduceOnly'], price=float(new_stop_order['avgPrice']),
+#                                 quantity=float(new_stop_order['executedQty'])))
+#                 # отправляем данные в БД
+#                 await s.commit()
+#                 logging.info(f"{symbol}: new_stop_order сохранён в бд.")
+#
+#         except Exception as e:
+#             logging.error(f"{symbol}: ошибка при записи стопа в БД: {e}")
+#
+#
+#
+#             if new_stop_order:
+#                 try:
+#                     open_orders = await client.get_orders(symbol=symbol)
+#                     # print("OPEN ORDERS", open_orders)
+#                     for order in open_orders:
+#                         if order['type'] == 'STOP_MARKET' and order.get('reduceOnly') and order['status'] == 'NEW':
+#                             cancel_order = await client.cancel_order(symbol=symbol, orderId=order['orderId'])
+#                             logging.info(f"{symbol}: отменён стоп-ордер {order['orderId']}")
+#                             # print('CANCEL ORDER', cancel_order)
+#
+#                             try:
+#                                 async with session() as s:
+#                                     s.add(db.Orders(order_id=cancel_order['orderId'], trade_id=trade.id, symbol=symbol,
+#                                                     time=cancel_order['updateTime'],
+#                                                     side=cancel_order['side'] == 'BUY', type=cancel_order['type'],
+#                                                     status=cancel_order['status'],
+#                                                     reduce=cancel_order['reduceOnly'],
+#                                                     price=float(cancel_order['avgPrice']),
+#                                                     quantity=float(cancel_order['executedQty'])))
+#                                     # отправляем данные в БД
+#                                     await s.commit()
+#                                     logging.info(f"{symbol}: portion close order сохранён в бд.")
+#
+#                             except Exception as e:
+#                                 logging.error(f"{symbol}: ошибка при обновлении partial_exit_done в БД: {e}")
+#
+#                 except Exception as e:
+#                     logging.warning(f"{symbol}: не удалось отменить стоп-ордера: {e}")
+#
+#
+#     except Exception as e:
+#         logging.error(f"{symbol}: критическая ошибка в partial_close_and_move_stop: {e}")
+#
+#         msg = f"{symbol}: критическая ошибка в partial_close_and_move_stop: {e}"
+#         msgs.append(msg)
+#
+#
+#     try:
+#
+#         text_parts = [f"<b>{symbol}</b> — частичное закрытие и перенос стопа\n"]
+#
+#         # # Добавим сообщения, если были
+#         if msgs:
+#             text_parts.append("\n".join(msgs))
+#
+#         text = '\n'.join(text_parts)
+#
+#         msg = await tg.bot.send_message(config['TG']['channel'], text, parse_mode='HTML')
+#
+#         if msg:
+#             async with session() as s:
+#                 stmt = update(db.Trades).where(db.Trades.id == trade.id).values(msg_id=msg.message_id)
+#                 await s.execute(stmt)
+#                 await s.commit()
+#             logging.info(f"{symbol}: сообщение отправлено в Telegram")
+#         else:
+#             logging.warning(f"{symbol}: сообщение не отправлено, msg = None")
+#
+#
+#     except Exception as e:
+#         logging.error(f"{symbol}: ошибка при отправке сообщения в Telegram: {e}")
 
 
 
