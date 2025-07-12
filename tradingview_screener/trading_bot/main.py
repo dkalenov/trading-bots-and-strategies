@@ -8,12 +8,13 @@ from concurrent.futures import ThreadPoolExecutor
 import utils
 import traceback
 import get_data
-import tg
+import tg_old
 import pprint
 from sqlalchemy import select, update
 from datetime import datetime
 from collections import defaultdict
 import asyncio
+import tg
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -130,7 +131,8 @@ async def main():
     await asyncio.gather(
         *(timed_collector(tf, symbol_update_lock) for tf in timeframes),
         db.periodic_symbol_update(client, executor, symbol_update_lock, hour=17, minute=35),
-        tg.run(),
+        # tg.run(),
+        tg.run(session, client, connect_ws, disconnect_ws, subscribe_ws, unsubscribe_ws),
         connect_ws()
     )
 
@@ -726,8 +728,8 @@ async def ws_msg(ws, msg):
                     .where(db.Trades.id == trade.id)
                     .values(
                         position_open=False,
-                        # close_time=int(datetime.utcnow().timestamp() * 1000),
-                        close_time=kline['T'],
+                        close_time = int(datetime.now(timezone.utc).timestamp() * 1000),
+                        # close_time=kline['T'],
                         status='TAKE2' if take2_hit else 'STOP1'
                     )
                 )
@@ -768,18 +770,16 @@ async def ws_msg(ws, msg):
                             .where(db.Trades.id == trade.id)
                             .values(
                                 position_open=False,
-                                close_time=kline['T'],
+                                   close_time = int(datetime.now(timezone.utc).timestamp() * 1000),
+
+                        # close_time=kline['T'],
                                 status='STOP2'
                             )
                         )
 
 
-
     except Exception as e:
         logging.error(f"{symbol}: ошибка в ws_msg: {e}")
-
-
-
 
 
 
@@ -948,9 +948,67 @@ async def partial_close_and_move_stop(trade):
                 logging.error(f"{symbol}: ошибка при MARKET-закрытии части позиции: {e}")
                 msgs.append(f"{symbol}: ошибка при MARKET-закрытии части позиции: {e}")
 
+        # # --- ПЕРЕНОС СТОПА В БЕЗУБЫТОК ---
+        # binace_positions = await client.get_position_risk(symbol=symbol)
+        # position_info = next((p for p in binace_positions if p["symbol"] == symbol), None)
+        # remaining_amt = abs(float(position_info["positionAmt"]))
+        #
+        # if remaining_amt == 0:
+        #     logging.warning(f"{symbol}: позиция полностью закрыта после частичного выхода.")
+        #     msgs.append(f"{symbol}: позиция полностью закрыта после частичного выхода.")
+        #     positions[symbol] = False
+        #     return
+        #
+        # entry_price = trade.entry_price
+        # new_stop = entry_price * (0.999 if direction == "BUY" else 1.001)
+        # new_stop = round(new_stop, all_symbols[symbol].tick_size)
+        # remaining_qty = utils.round_down(remaining_amt, step_size)
+        #
+        # try:
+        #     new_stop_order = await client.new_order(
+        #         symbol=symbol,
+        #         side=close_side,
+        #         type='STOP_MARKET',
+        #         stopPrice=new_stop,
+        #         quantity=remaining_qty,
+        #         reduceOnly=True
+        #     )
+        #     logging.info(f"{symbol}: новый стоп установлен в безубыток @ {new_stop}, объём {remaining_qty}")
+        #     msgs.append(f"{symbol}: новый стоп установлен в безубыток @ {new_stop}, объём {remaining_qty}")
+        # except Exception as e:
+        #     error_text = str(e)
+        #     logging.error(f"{symbol}: ошибка при установке нового стопа: {error_text}")
+        #     msgs.append(f"{symbol}: ошибка при установке нового стопа: {error_text}")
+        #     return
+        #
+        # try:
+        #     async with session() as s:
+        #         stmt = update(db.Trades).where(db.Trades.id == trade.id).values(breakeven_stop_price=new_stop)
+        #         await s.execute(stmt)
+        #         await s.commit()
+        #         logging.info(f"{symbol}: новая цена стопа ({new_stop}) записана в БД.")
+        #
+        #         s.add(db.Orders(
+        #             order_id=new_stop_order['orderId'],
+        #             trade_id=trade.id,
+        #             symbol=symbol,
+        #             time=new_stop_order['updateTime'],
+        #             side=new_stop_order['side'] == 'BUY',
+        #             type=new_stop_order['type'],
+        #             status=new_stop_order['status'],
+        #             reduce=new_stop_order['reduceOnly'],
+        #             price=float(new_stop_order['avgPrice']),
+        #             quantity=float(new_stop_order['executedQty'])
+        #         ))
+        #         await s.commit()
+        #         logging.info(f"{symbol}: новый стоп-ордер сохранён в БД.")
+        # except Exception as e:
+        #     logging.error(f"{symbol}: ошибка при записи стопа в БД: {e}")
+
         # --- ПЕРЕНОС СТОПА В БЕЗУБЫТОК ---
-        binace_positions = await client.get_position_risk(symbol=symbol)
-        position_info = next((p for p in binace_positions if p["symbol"] == symbol), None)
+
+        binance_positions = await client.get_position_risk(symbol=symbol)
+        position_info = next((p for p in binance_positions if p["symbol"] == symbol), None)
         remaining_amt = abs(float(position_info["positionAmt"]))
 
         if remaining_amt == 0:
@@ -964,6 +1022,11 @@ async def partial_close_and_move_stop(trade):
         new_stop = round(new_stop, all_symbols[symbol].tick_size)
         remaining_qty = utils.round_down(remaining_amt, step_size)
 
+
+        # Получаем предыдущий стоп-ордер перед установкой нового
+        old_stop_order = await db.get_last_active_stop_order(trade.id)
+
+        # Ставим новый стоп
         try:
             new_stop_order = await client.new_order(
                 symbol=symbol,
@@ -981,6 +1044,17 @@ async def partial_close_and_move_stop(trade):
             msgs.append(f"{symbol}: ошибка при установке нового стопа: {error_text}")
             return
 
+        #  Отменяем старый стоп
+        if old_stop_order and old_stop_order.order_id != new_stop_order['orderId']:
+            try:
+                await client.cancel_order(symbol=symbol, orderId=old_stop_order.order_id)
+                logging.info(f"{symbol}: старый стоп-ордер {old_stop_order.order_id} отменён")
+                msgs.append(f"{symbol}: старый стоп-ордер отменён")
+            except Exception as e:
+                logging.error(f"{symbol}: ошибка при отмене старого стопа: {e}")
+                msgs.append(f"{symbol}: ошибка при отмене старого стопа: {e}")
+
+        # Сохраняем новый стоп в БД и обновляем цену breakeven
         try:
             async with session() as s:
                 stmt = update(db.Trades).where(db.Trades.id == trade.id).values(breakeven_stop_price=new_stop)
@@ -997,13 +1071,16 @@ async def partial_close_and_move_stop(trade):
                     type=new_stop_order['type'],
                     status=new_stop_order['status'],
                     reduce=new_stop_order['reduceOnly'],
-                    price=float(new_stop_order['avgPrice']),
-                    quantity=float(new_stop_order['executedQty'])
+                    price=float(new_stop_order.get('stopPrice', 0)),  # STOP_MARKET не всегда возвращает avgPrice
+                    quantity=float(new_stop_order['origQty'])
                 ))
                 await s.commit()
                 logging.info(f"{symbol}: новый стоп-ордер сохранён в БД.")
         except Exception as e:
-            logging.error(f"{symbol}: ошибка при записи стопа в БД: {e}")
+            logging.error(f"{symbol}: ошибка при записи нового стопа в БД: {e}")
+
+
+
 
         # --- Уведомление в Telegram ---
         try:
