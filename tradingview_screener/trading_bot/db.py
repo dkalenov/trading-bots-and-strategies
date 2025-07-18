@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import Column, Integer, BigInteger, String, Float, Boolean, DateTime, select
+from sqlalchemy import Column, Integer, BigInteger, String, Float, Boolean, DateTime, select, delete, update
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 import logging
@@ -10,6 +10,7 @@ from tradingview_ta import TA_Handler, Interval
 import binance
 import asyncio
 import get_data
+
 
 
 Base = declarative_base()
@@ -71,6 +72,7 @@ class Orders(Base):
     reduce = Column(Boolean)
     price = Column(Float)
     quantity = Column(Float)
+    realized_profit = Column(Float, default=0.0)
 
 
 
@@ -233,7 +235,65 @@ async def get_symbol_conf(symbol):
             logging.error(f"Ошибка при получении данных из настройки символа: {e}")
             return None
 
+# функция для получения всех пар
+async def get_all_symbols():
+    async with Session() as s:
+        # получение настроек для всех символов
+        symbols = await s.execute(select(SymbolsSettings))
+        # возвращаем результат
+        return symbols.scalars().all()
 
+
+# функция для обновления пары
+async def symbol_update(symbol):
+    # создание сессии для работы с БД
+    async with Session() as s:
+        # обновляем параметры для пары
+        s.add(symbol)
+        # записываем изменения в БД
+        await s.commit()
+
+
+# функция для добавления пары
+async def symbol_add(symbol):
+    # создание сессии для работы с БД
+    async with Session() as s:
+        # добавляем новую пару
+        s.add(SymbolsSettings(symbol=symbol))
+        # записываем изменения в БД
+        await s.commit()
+
+
+# функция для удаления пары
+async def symbol_delete(symbol):
+    # создание сессии для работы с БД
+    async with Session() as s:
+        # удаляем пару
+        await s.execute(delete(SymbolsSettings).where(SymbolsSettings.symbol == symbol))
+        # записываем изменения в БД
+        await s.commit()
+
+
+# функция для получения открытых трейдов
+async def get_open_trades():
+    # создание сессии для работы с БД
+    async with Session() as s:
+        # получаем открытые трейды
+        trades = await s.execute(select(Trades).where(Trades.status != 'CLOSED'))
+        # возвращаем результат
+        return trades.scalars().all()
+
+
+# функция для обновления конфигурации
+async def config_update(**kwargs):
+    # создание сессии для работы с БД
+    async with Session() as s:
+        # перебираем все параметры
+        for key, value in kwargs.items():
+            # записываем изменения в БД
+            await s.execute(update(Config).where(Config.key == key).values(value=value))
+        # записываем изменения в БД
+        await s.commit()
 
 
 # async def get_all_symbols_conf():
@@ -560,6 +620,28 @@ async def update_order_trade(order, trade):
         await s.commit()
 
 
+
+from sqlalchemy import func, select, update
+
+async def update_trade_result(trade_id: int):
+    async with Session() as s:
+        result = await s.execute(
+            select(func.sum(Orders.realized_profit)).where(Orders.trade_id == trade_id)
+        )
+        total_profit = result.scalar() or 0.0
+
+        await s.execute(
+            update(Trades)
+            .where(Trades.id == trade_id)
+            .values(result=total_profit)
+        )
+        await s.commit()
+
+
+
+
+
+
 # функция для получения последней сделки по паре
 async def get_last_trade(symbol):
     # создание сессии для работы с БД
@@ -568,3 +650,31 @@ async def get_last_trade(symbol):
         trade = await s.execute(select(Trades).where(Trades.symbol == symbol).order_by(Trades.open_time.desc()).limit(1))
         # возвращаем результат
         return trade.scalar_one_or_none()
+
+
+
+async def get_last_active_stop_order(trade_id: int):
+    async with Session() as s:
+        result = await s.execute(
+            select(Orders).where(
+                Orders.trade_id == trade_id,
+                Orders.type == 'STOP_MARKET',
+                Orders.reduce == True,
+                Orders.status == 'NEW'
+            ).order_by(Orders.time.desc())
+        )
+        return result.scalar_one_or_none()
+
+
+async def check_stop_order_exists(trade_id, stop_price):
+    async with Session() as s:
+        result = await s.execute(
+            select(Orders)
+            .where(
+                Orders.trade_id == trade_id,
+                Orders.price == stop_price,
+                Orders.type.in_(["STOP_MARKET", "LIMIT"]),
+                Orders.status.in_(["NEW", "PARTIALLY_FILLED"])
+            )
+        )
+        return result.scalars().first() is not None
