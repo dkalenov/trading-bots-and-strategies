@@ -2,6 +2,7 @@ import asyncio
 import configparser
 import binance
 import db
+import get_data
 import os
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
@@ -105,13 +106,6 @@ async def skip(_):
 async def start(message: Message, state: FSMContext):
     # устанавливаем состояние
     await state.set_state(States.main_menu)
-    # создаем клавиатуру
-    # keyboard = ReplyKeyboardMarkup(keyboard=[
-    #     [KeyboardButton(text="Открытые позиции"), KeyboardButton(text="Торговые пары")],
-    #     [KeyboardButton(text="Настройки"), KeyboardButton(text="Главное меню")]
-    # ], resize_keyboard=True)
-    # # отправляем сообщение
-    # await answer(message, "Главное меню", reply_markup=keyboard)
 
     keyboard = ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="Открытые позиции"), KeyboardButton(text="Торговые пары")],
@@ -121,80 +115,155 @@ async def start(message: Message, state: FSMContext):
      # отправляем сообщение
     await answer(message, "Главное меню", reply_markup=keyboard)
 
+#
+#
+# # торговые пары
+# @dp.message(F.text == "Торговые пары")
+# @dp.callback_query(F.data == "symbols")
+# async def list_symbols(message: Message | CallbackQuery, state: FSMContext):
+#     # устанавливаем состояние
+#     await state.set_state(States.symbols)
+#     # загружаем список торговых пар из базы данных
+#     symbols = await db.get_all_symbols()
+#     keyboard = []
+#     # создаем клавиатуру
+#     for symbol in symbols:
+#         keyboard.append([InlineKeyboardButton(text=symbol.symbol, callback_data=f"symbol:{symbol.symbol}")])
+#     # добавляем кнопку для добавления пары
+#     keyboard.append([InlineKeyboardButton(text="Добавить пару", callback_data="add_symbol")])
+#     await answer(message, "Список торговых пар", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+#
+#
+#
+#
+# @dp.message(F.text == "Торговые пары")
+# async def handle_symbols_menu(message: Message, state: FSMContext):
+#     await state.set_state(States.symbols)
+#
+#     # Загружаем список символов из базы
+#     symbols = await db.get_all_symbols()
+#
+#     # Извлекаем первые буквы/цифры
+#     first_chars = sorted(set(symbol.symbol[0].upper() for symbol in symbols))
+#
+#     # Создаём клавиатуру выбора по буквам
+#     keyboard = [
+#         [InlineKeyboardButton(text=char, callback_data=f"symbol_group:{char}")]
+#         for char in first_chars
+#     ]
+#     await message.answer("Выберите первую букву или цифру:", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+#
+#
+#
+#
+#
+#
+# @dp.callback_query(F.data.startswith("symbol_group:"))
+# async def handle_symbol_group(callback: CallbackQuery, state: FSMContext):
+#     prefix = callback.data.split(":")[1].upper()
+#     symbols = await db.get_all_symbols()
+#
+#     # Фильтрация по первой букве
+#     filtered = [s.symbol for s in symbols if s.symbol.upper().startswith(prefix)]
+#
+#     # Создание клавиатуры с подходящими символами
+#     keyboard = [
+#         [InlineKeyboardButton(text=s, callback_data=f"symbol:{s}")]
+#         for s in filtered
+#     ]
+#
+#     # Кнопка назад к выбору буквы
+#     keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="symbols")])
+#
+#     await callback.message.edit_text(f"Символы, начинающиеся с «{prefix}»", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+#
+#
+#
+# @dp.callback_query(F.data == "symbols")
+# async def return_to_symbol_menu(callback: CallbackQuery, state: FSMContext):
+#     symbols = await db.get_all_symbols()
+#     first_chars = sorted(set(symbol.symbol[0].upper() for symbol in symbols))
+#
+#     keyboard = [
+#         [InlineKeyboardButton(text=char, callback_data=f"symbol_group:{char}")]
+#         for char in first_chars
+#     ]
+#     await callback.message.edit_text("Выберите первую букву или цифру:", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
 
 
-# торговые пары
+
+
+# Показ торговых пар: либо все сразу, либо по группам
 @dp.message(F.text == "Торговые пары")
-@dp.callback_query(F.data == "symbols")
 async def list_symbols(message: Message | CallbackQuery, state: FSMContext):
-    # устанавливаем состояние
-    await state.set_state(States.symbols)
-    # загружаем список торговых пар из базы данных
-    symbols = await db.get_all_symbols()
-    keyboard = []
-    # создаем клавиатуру
-    for symbol in symbols:
-        keyboard.append([InlineKeyboardButton(text=symbol.symbol, callback_data=f"symbol:{symbol.symbol}")])
-    # добавляем кнопку для добавления пары
-    keyboard.append([InlineKeyboardButton(text="Добавить пару", callback_data="add_symbol")])
-    await answer(message, "Список торговых пар", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
-
-
-
-
-@dp.message(F.text == "Торговые пары")
-async def handle_symbols_menu(message: Message, state: FSMContext):
     await state.set_state(States.symbols)
 
-    # Загружаем список символов из базы
     symbols = await db.get_all_symbols()
 
-    # Извлекаем первые буквы/цифры
-    first_chars = sorted(set(symbol.symbol[0].upper() for symbol in symbols))
+    # Если символов мало — показываем все сразу
+    if len(symbols) <= 30:
+        keyboard = [
+            [InlineKeyboardButton(text=s.symbol, callback_data=f"symbol:{s.symbol}")]
+            for s in symbols
+        ]
+        keyboard.append([InlineKeyboardButton(text="➕ Добавить пару", callback_data="add_symbol")])
+        await message.answer("Список торговых пар:", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+        return
 
-    # Создаём клавиатуру выбора по буквам
+    # Иначе — показываем группы по первой букве
+    first_chars = sorted(set(s.symbol[0].upper() for s in symbols))
     keyboard = [
         [InlineKeyboardButton(text=char, callback_data=f"symbol_group:{char}")]
         for char in first_chars
     ]
-    await message.answer("Выберите первую букву или цифру:", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+    keyboard.append([InlineKeyboardButton(text="➕ Добавить пару", callback_data="add_symbol")])
+    await message.answer("Слишком много пар. Выберите первую букву:", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
 
 
-
-
-
-
+# Обработка выбора группы по первой букве
 @dp.callback_query(F.data.startswith("symbol_group:"))
 async def handle_symbol_group(callback: CallbackQuery, state: FSMContext):
     prefix = callback.data.split(":")[1].upper()
     symbols = await db.get_all_symbols()
-
-    # Фильтрация по первой букве
     filtered = [s.symbol for s in symbols if s.symbol.upper().startswith(prefix)]
 
-    # Создание клавиатуры с подходящими символами
+    if not filtered:
+        await callback.message.answer(f"Нет символов, начинающихся с «{prefix}»")
+        return
+
     keyboard = [
         [InlineKeyboardButton(text=s, callback_data=f"symbol:{s}")]
         for s in filtered
     ]
-
-    # Кнопка назад к выбору буквы
     keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="symbols")])
+    await callback.message.edit_text(
+        f"Символы, начинающиеся с «{prefix}»:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
+    )
 
-    await callback.message.edit_text(f"Символы, начинающиеся с «{prefix}»", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
 
-
-
+# Возврат к посимвольному меню
 @dp.callback_query(F.data == "symbols")
 async def return_to_symbol_menu(callback: CallbackQuery, state: FSMContext):
     symbols = await db.get_all_symbols()
-    first_chars = sorted(set(symbol.symbol[0].upper() for symbol in symbols))
-
+    first_chars = sorted(set(s.symbol[0].upper() for s in symbols))
     keyboard = [
         [InlineKeyboardButton(text=char, callback_data=f"symbol_group:{char}")]
         for char in first_chars
     ]
-    await callback.message.edit_text("Выберите первую букву или цифру:", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+    keyboard.append([InlineKeyboardButton(text="➕ Добавить пару", callback_data="add_symbol")])
+    await callback.message.edit_text("Выберите первую букву или цифру:",
+                                     reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+
+
+# # Обработка выбора конкретной пары
+# @dp.callback_query(F.data.startswith("symbol:"))
+# async def symbol(callback: CallbackQuery, state: FSMContext):
+#     symbol = callback.data.split(':')[1]
+#     await state.update_data(symbol=symbol)
+#     await symbol_menu(callback, state, symbol)
+
+
 
 
 
@@ -472,80 +541,50 @@ async def get_positions():
     return positions, trades
 
 
+
+
+
+MAX_MESSAGE_LENGTH = 4096
+
+
 # @dp.message(F.text == "Открытые позиции")
 # @dp.callback_query(F.data == "positions")
 # async def open_positions(message: Message, state: FSMContext):
-#     # загружаем кофиг
 #     conf = await db.load_config()
-#     # если торговля отключена
 #     if not conf.trade_mode:
-#         # отправляем сообщение
 #         await answer(message, "Торговля отключена")
 #         return
-#     # устанавливаем состояние
+#
 #     await state.set_state(States.positions)
-#     text = "Открытые позиции:"
 #     positions, trades = await get_positions()
-#     for pos in positions:
-#         size = float(pos['positionAmt'])
-#         trade = trades[pos['symbol']]
-#         # формируем сообщение
-#         text += (f"\n\n<b>{'ЛОНГ' if size > 0 else 'ШОРТ'}</b> <i>X{pos['leverage']}</i> #{pos['symbol']}\n"
-#                  f"Размер позиции: <b>{abs(size)}</b>\n"
-#                  f"Цена входа: <b>{pos['entryPrice']}</b>\n"
-#                  f"Тейк 1: <b>{trade.take1_price}</b>\n"
-#                  f"Тейк 2: <b>{trade.take2_price}</b>\n"
-#                  f"Стоп: <b>{trade.stop_price}</b>\n"
-#                  f"PNL: <b>{round(float(pos['unRealizedProfit']), 2)} USDT</b>")
-#     # если есть позиции
-#     if "\n" in text:
-#         # создаем клавиатуру
-#         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-#             [InlineKeyboardButton(text="Закрыть позицию", callback_data="close_pos")],
-#             [InlineKeyboardButton(text="Закрыть все позиции", callback_data="close_pos_all")],
-#             [InlineKeyboardButton(text="Обновить", callback_data="positions")]
-#         ])
-#         # отправляем сообщение
-#         await answer(message, text, reply_markup=keyboard)
-#     else:
+#
+#     if not positions:
 #         await answer(message, "Открытых позиций нет")
-
-
-
-#
-# MAX_MESSAGE_LENGTH = 3000
-#
-# async def send_long_message(message_or_query, full_text, reply_markup=None):
-#     for i in range(0, len(full_text), MAX_MESSAGE_LENGTH):
-#         chunk = full_text[i:i + MAX_MESSAGE_LENGTH]
-#         if i + MAX_MESSAGE_LENGTH >= len(full_text) and reply_markup:
-#             await answer(message_or_query, chunk, reply_markup=reply_markup)
-#         else:
-#             await answer(message_or_query, chunk)
-
-
-
-#
-# @dp.message(F.text == "Открытые позиции")
-# @dp.callback_query(F.data == "positions")
-# async def open_positions(message: Message, state: FSMContext):
-#     conf = await db.load_config()
-#     if not conf.trade_mode:
-#         await answer(message, "Торговля отключена")
 #         return
 #
-#     await state.set_state(States.positions)
-#     text = "Открытые позиции:"
-#     positions, trades = await get_positions()
+#     keyboard = InlineKeyboardMarkup(inline_keyboard=[
+#         [InlineKeyboardButton(text="Закрыть позицию", callback_data="close_pos")],
+#         [InlineKeyboardButton(text="Закрыть все позиции", callback_data="close_pos_all")],
+#         [InlineKeyboardButton(text="Обновить", callback_data="positions")]
+#     ])
+#
+#     blocks = ["<b>Открытые позиции:</b>"]
+#     block = ""
 #
 #     for pos in positions:
 #         size = float(pos['positionAmt'])
+#         if size == 0:
+#             continue
+#
 #         symbol = pos['symbol']
 #         entry_price = float(pos['entryPrice'])
 #         leverage = int(pos['leverage'])
 #         unrealized_pnl = float(pos['unRealizedProfit'])
 #
-#         trade = trades[pos['symbol']]
+#         trade = trades.get(pos['symbol'])
+#         if not trade:
+#             continue
+#
 #         take1 = float(trade.take1_price)
 #         take2 = float(trade.take2_price)
 #         stop = float(trade.stop_price)
@@ -553,49 +592,59 @@ async def get_positions():
 #         symbol_conf = await db.get_symbol_conf(symbol)
 #         portion = float(symbol_conf.portion)
 #
-#
 #         position_value = abs(size * entry_price)
 #         own_funds = round(position_value / leverage, 2)
-#
-#         # PNL при тейке (всегда положительный)
 #         pnl_take1 = portion * abs(size) * abs(entry_price - take1)
 #         pnl_take2 = (1 - portion) * abs(size) * abs(entry_price - take2)
-#         # pnl_total_take = round(pnl_take1 + pnl_take2, 2)
-#
-#         # PNL при стопе (всегда отрицательный)
 #         pnl_stop = - round(abs(size) * abs(entry_price - stop), 2)
 #
+#         all_prices = await get_data.get_all_prices(client)
+#         current_price = all_prices.get(symbol)
 #
-#         price_info = await client.ticker_price(symbol)
-#         current_price = float(price_info['price'])
+#         # price_info = await client.ticker_price(symbol)
+#         # current_price = float(price_info['price'])
 #
-#         text += (
+#
+#
+#         pos_text = (
 #             f"\n\n<b>{'ЛОНГ' if size > 0 else 'ШОРТ'}</b> <i>X{leverage}</i> #{symbol}\n"
 #             f"Размер позиции: <b>{abs(size)}</b> ≈ <b>{round(position_value, 2)} USDT</b>\n"
 #             f"Собственные средства: <b>{own_funds} USDT</b>\n"
+#             f"\n"
 #             f"Цена входа: <b>{entry_price}</b>\n"
 #             f"Текущая цена: <b>{current_price}</b>\n"
-#             f"{'-' * 30}\n"
+#             f"\n"
 #             f"Тейк 1: <b>{take1}</b> ➜ <i>PNL ≈ {round(pnl_take1, 3)} USDT</i>\n"
 #             f"Тейк 2: <b>{take2}</b> ➜ <i>PNL ≈ {round(pnl_take2, 3)} USDT</i>\n"
 #             f"Стоп: <b>{stop}</b> ➜ <i>PNL ≈ {round(pnl_stop, 3)} USDT</i>\n"
-#             f"{'-' * 30}\n"
-#             f"Текущий PNL: <b>{round(unrealized_pnl, 3)} USDT</b>"
+#             f"\n"
+#             f"Текущий PNL: <b>{round(unrealized_pnl, 3)} USDT</b>\n"
+#             f"{'-' * 30}"
 #         )
 #
-#     if "\n" in text:
-#         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-#             [InlineKeyboardButton(text="Закрыть позицию", callback_data="close_pos")],
-#             [InlineKeyboardButton(text="Закрыть все позиции", callback_data="close_pos_all")],
-#             [InlineKeyboardButton(text="Обновить", callback_data="positions")]
-#         ])
-#         # await send_long_message(message, text, reply_markup=keyboard)
-#         await answer(message, text, reply_markup=keyboard)
-#     else:
-#         await answer(message, "Открытых позиций нет")
+#         # ⛔ если блок + новый текст > лимита, сохранить старый и начать новый
+#         if len(block) + len(pos_text) > MAX_MESSAGE_LENGTH:
+#             blocks.append(block)
+#             block = pos_text
+#         else:
+#             block += pos_text
+#
+#     if block:
+#         blocks.append(block)
+#
+#     # ⏎ Отправляем каждую часть по очереди
+#     for i, part in enumerate(blocks):
+#         if i == len(blocks) - 1:
+#             await answer(message, part, reply_markup=keyboard)
+#         else:
+#             await answer(message, part)
+#             # await asyncio.sleep(1.0)
 
-MAX_MESSAGE_LENGTH = 4000
 
+
+
+
+MAX_MESSAGE_LENGTH = 4096
 
 @dp.message(F.text == "Открытые позиции")
 @dp.callback_query(F.data == "positions")
@@ -612,6 +661,10 @@ async def open_positions(message: Message, state: FSMContext):
         await answer(message, "Открытых позиций нет")
         return
 
+    # Загружаем сразу все настройки символов и создаём словарь для быстрого доступа
+    all_symbol_configs = await db.get_all_symbols_conf()
+    symbol_conf_map = {conf.symbol: conf for conf in all_symbol_configs}
+
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Закрыть позицию", callback_data="close_pos")],
         [InlineKeyboardButton(text="Закрыть все позиции", callback_data="close_pos_all")],
@@ -620,6 +673,9 @@ async def open_positions(message: Message, state: FSMContext):
 
     blocks = ["<b>Открытые позиции:</b>"]
     block = ""
+
+    # Загрузка всех цен один раз, чтобы не дергать API в цикле
+    all_prices = await get_data.get_all_prices(client)
 
     for pos in positions:
         size = float(pos['positionAmt'])
@@ -631,7 +687,7 @@ async def open_positions(message: Message, state: FSMContext):
         leverage = int(pos['leverage'])
         unrealized_pnl = float(pos['unRealizedProfit'])
 
-        trade = trades.get(pos['symbol'])
+        trade = trades.get(symbol)
         if not trade:
             continue
 
@@ -639,32 +695,37 @@ async def open_positions(message: Message, state: FSMContext):
         take2 = float(trade.take2_price)
         stop = float(trade.stop_price)
 
-        symbol_conf = await db.get_symbol_conf(symbol)
+        symbol_conf = symbol_conf_map.get(symbol)
+        if not symbol_conf:
+            # Если настройки для символа нет — пропускаем или ставим дефолтное значение
+            continue
         portion = float(symbol_conf.portion)
 
         position_value = abs(size * entry_price)
         own_funds = round(position_value / leverage, 2)
         pnl_take1 = portion * abs(size) * abs(entry_price - take1)
         pnl_take2 = (1 - portion) * abs(size) * abs(entry_price - take2)
-        pnl_stop = - round(abs(size) * abs(entry_price - stop), 2)
-        price_info = await client.ticker_price(symbol)
-        current_price = float(price_info['price'])
+        pnl_stop = -round(abs(size) * abs(entry_price - stop), 2)
+
+        current_price = all_prices.get(symbol)
 
         pos_text = (
             f"\n\n<b>{'ЛОНГ' if size > 0 else 'ШОРТ'}</b> <i>X{leverage}</i> #{symbol}\n"
             f"Размер позиции: <b>{abs(size)}</b> ≈ <b>{round(position_value, 2)} USDT</b>\n"
             f"Собственные средства: <b>{own_funds} USDT</b>\n"
+            f"\n"
             f"Цена входа: <b>{entry_price}</b>\n"
             f"Текущая цена: <b>{current_price}</b>\n"
-            f"{'-' * 30}\n"
+            f"\n"
             f"Тейк 1: <b>{take1}</b> ➜ <i>PNL ≈ {round(pnl_take1, 3)} USDT</i>\n"
             f"Тейк 2: <b>{take2}</b> ➜ <i>PNL ≈ {round(pnl_take2, 3)} USDT</i>\n"
             f"Стоп: <b>{stop}</b> ➜ <i>PNL ≈ {round(pnl_stop, 3)} USDT</i>\n"
-            f"{'-' * 30}\n"
-            f"Текущий PNL: <b>{round(unrealized_pnl, 3)} USDT</b>"
+            f"\n"
+            f"Текущий PNL: <b>{round(unrealized_pnl, 3)} USDT</b>\n"
+            f"{'-' * 30}"
         )
 
-        # ⛔ если блок + новый текст > лимита, сохранить старый и начать новый
+        # Разбиваем по частям, чтобы не превышать лимит телеграма
         if len(block) + len(pos_text) > MAX_MESSAGE_LENGTH:
             blocks.append(block)
             block = pos_text
@@ -674,13 +735,15 @@ async def open_positions(message: Message, state: FSMContext):
     if block:
         blocks.append(block)
 
-    # ⏎ Отправляем каждую часть по очереди
+    # Отправляем блоки сообщений
     for i, part in enumerate(blocks):
         if i == len(blocks) - 1:
             await answer(message, part, reply_markup=keyboard)
         else:
             await answer(message, part)
-            await asyncio.sleep(1.0)
+            # Можно добавить await asyncio.sleep(0.3) для плавности, если нужно
+
+
 
 
 # настройки
@@ -855,23 +918,89 @@ async def trade_mode_yes(callback: CallbackQuery, state: FSMContext):
     await settings(callback.message, state)
 
 
+
+
+
+
+
 # закрытие позиции
+# @dp.callback_query(F.data == "close_pos")
+# async def close_pos(callback: CallbackQuery, state: FSMContext):
+#     # устанавливаем состояние для закрытия позиций
+#     await state.set_state(States.close_pos)
+#     # получаем открытые позиции
+#     positions, _ = await get_positions()
+#     # формируем клавиатуру с выбором торговой пары для закрытия позиции
+#     keyboard = []
+#     for pos in positions:
+#         keyboard.append([InlineKeyboardButton(text=pos['symbol'], callback_data=f"close_pos_yes:{pos['symbol']}")])
+#     keyboard.append([InlineKeyboardButton(text="Отмена", callback_data="positions")])
+#     # формируем клавиатуру с подтверждением закрытия всех позиций
+#     keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard)
+#     await callback.answer()
+#     # отправляем сообщение с подтверждением
+#     await callback.message.answer(f"Выберите торговую пару, которую вы хотите закрыть", reply_markup=keyboard)
+#
+
+
+
+
 @dp.callback_query(F.data == "close_pos")
 async def close_pos(callback: CallbackQuery, state: FSMContext):
-    # устанавливаем состояние для закрытия позиций
     await state.set_state(States.close_pos)
-    # получаем открытые позиции
     positions, _ = await get_positions()
-    # формируем клавиатуру с выбором торговой пары для закрытия позиции
-    keyboard = []
-    for pos in positions:
-        keyboard.append([InlineKeyboardButton(text=pos['symbol'], callback_data=f"close_pos_yes:{pos['symbol']}")])
-    keyboard.append([InlineKeyboardButton(text="Отмена", callback_data="positions")])
-    # формируем клавиатуру с подтверждением закрытия всех позиций
-    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard)
-    await callback.answer()
-    # отправляем сообщение с подтверждением
-    await callback.message.answer(f"Выберите торговую пару, которую вы хотите закрыть", reply_markup=keyboard)
+
+    # Если символов мало, можно сразу вывести все
+    if len(positions) <= 20:
+        keyboard = [
+            [InlineKeyboardButton(text=pos['symbol'], callback_data=f"close_pos_yes:{pos['symbol']}")]
+            for pos in positions
+        ]
+        keyboard.append([InlineKeyboardButton(text="Отмена", callback_data="positions")])
+        await callback.message.answer("Выберите торговую пару, которую вы хотите закрыть:",
+                                      reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+        return
+
+    # Иначе — группировка по первой букве
+    first_chars = sorted(set(pos['symbol'][0].upper() for pos in positions))
+
+    keyboard = [
+        [InlineKeyboardButton(text=char, callback_data=f"close_pos_group:{char}")]
+        for char in first_chars
+    ]
+    keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="positions")])
+
+    await callback.message.answer("Слишком много позиций. Выберите первую букву символа:",
+                                  reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+
+
+
+@dp.callback_query(F.data.startswith("close_pos_group:"))
+async def close_pos_group(callback: CallbackQuery, state: FSMContext):
+    _, prefix = callback.data.split(":")
+    prefix = prefix.upper()
+
+    positions, _ = await get_positions()
+    filtered = [pos for pos in positions if pos['symbol'].upper().startswith(prefix)]
+
+    if not filtered:
+        await callback.message.answer("Нет позиций на эту букву.")
+        return
+
+    keyboard = [
+        [InlineKeyboardButton(text=pos['symbol'], callback_data=f"close_pos_yes:{pos['symbol']}")]
+        for pos in filtered
+    ]
+    keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="close_pos")])
+
+    await callback.message.edit_text(f"Выберите позицию, начинающуюся на «{prefix}»:",
+                                     reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+
+
+
+
+
+
 
 
 # закрытие всех позиций
@@ -932,27 +1061,7 @@ async def close_pos_order(symbol, side, qty):
     await client.new_order(symbol=symbol, side=side, type='MARKET', quantity=qty, reduceOnly="True")
 
 
-# @dp.callback_query(F.data == "check_balance")
-# async def check_balance(callback: CallbackQuery, state: FSMContext):
-#     await callback.answer()  # закрываем спиннер
-#     try:
-#         balances = await client.balance()
-#         usdt_balances = [b for b in balances if b['asset'] == 'USDT']
-#         text = "<b>Баланс USDT:</b>\n"
-#
-#         if usdt_balances:
-#             b = usdt_balances[0]
-#             text += (
-#                 f"Общий: <b>{b['balance']}</b>\n"
-#                 f"Доступно: <b>{b['availableBalance']}</b>\n"
-#                 f"В ордерах: <b>{float(b['balance']) - float(b['availableBalance']):.4f}</b>"
-#             )
-#         else:
-#             text += "Нет данных по USDT."
-#
-#         await callback.message.answer(text)
-#     except Exception as e:
-#         await callback.message.answer(f"Ошибка при запросе баланса: {e}")
+
 
 @dp.message(F.text == "Баланс")
 async def show_balance(message: Message):
