@@ -1,4 +1,3 @@
-import asyncio
 import configparser
 import logging
 import binance
@@ -8,13 +7,15 @@ from concurrent.futures import ThreadPoolExecutor
 import utils
 import traceback
 import get_data
-import tg_old
-import pprint
 from sqlalchemy import select, update
 from datetime import datetime
 from collections import defaultdict
 import asyncio
+from asyncio import Future
 import tg
+
+
+
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -45,6 +46,12 @@ symbol_locks = defaultdict(asyncio.Lock)
 
 updated_take_stop: dict[str, tuple[float, float]] = {}
 updated_event = asyncio.Event()
+message_queue = asyncio.Queue()
+
+
+
+
+
 
 async def main():
     global session, conf, client, all_symbols, all_prices, debug, symbol_conf_cache, positions
@@ -84,6 +91,7 @@ async def main():
         db.periodic_symbol_update(client, executor, symbol_update_lock, hour=17, minute=35),
         # tg.run(),
         tg.run(session, client, connect_ws, disconnect_ws, subscribe_ws, unsubscribe_ws),
+        message_sender(),
         connect_ws()
     )
 
@@ -235,6 +243,32 @@ async def process_trade_signal(symbol, interval):
         logging.exception(f"Ошибка при обработке сигнала {symbol}: {e}")
         return signal_to_return
 
+
+
+
+async def message_sender():
+    while True:
+        chat_id, text = await message_queue.get()
+        try:
+            await tg.bot.send_message(chat_id, text, parse_mode='HTML')
+            await asyncio.sleep(1.2)  # защита от Flood
+        except Exception as e:
+            logging.error(f"Ошибка отправки сообщения: {e}")
+        message_queue.task_done()
+
+
+
+async def message_sender():
+    while True:
+        chat_id, text, future = await message_queue.get()
+        try:
+            msg = await tg.bot.send_message(chat_id, text, parse_mode='HTML')
+            future.set_result(msg.message_id)
+            await asyncio.sleep(1.2)  # защита от флуда
+        except Exception as e:
+            logging.error(f"Ошибка отправки сообщения: {e}")
+            future.set_exception(e)
+        message_queue.task_done()
 
 
 
@@ -394,10 +428,29 @@ async def new_trade(symbol, interval, signal):
                         f"Стоп: <b>{stop_price}</b>\n"
                         )
                 # отправляем сообщение в канал
-                msg = await tg.bot.send_message(config['TG']['channel'], text, parse_mode='HTML')
-                # записываем идентификатор сообщения в БД
-                trade.msg_id = msg.message_id
-                await s.commit()
+                # msg = await tg.bot.send_message(config['TG']['channel'], text, parse_mode='HTML')
+                # # записываем идентификатор сообщения в БД
+                # trade.msg_id = msg.message_id
+                # await s.commit()
+                try:
+                    # создаём объект future
+                    future = Future()
+
+                    # добавляем в очередь: (чат, текст, future)
+                    await message_queue.put((config['TG']['channel'], text, future))
+
+                    # ждём результат (message_id или ошибка)
+                    msg_id = await future
+
+                    # записываем его в БД
+                    trade.msg_id = msg_id
+                    await s.commit()
+
+                except Exception as e:
+                    print(f"Ошибка при отправке сообщения для {symbol}, {e}")
+
+
+
             except Exception as e:
                 print(f"Ошибка при отправки сообщения для {symbol}, {e}")
     except:
