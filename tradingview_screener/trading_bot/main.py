@@ -36,7 +36,7 @@ IMPORTANT_SYMBOLS = ['BTCUSDT', 'ETHUSDT']
 VALID_SIGNALS = ['STRONG_BUY', 'STRONG_SELL']
 
 
-timeframes = ["5m"]
+timeframes = ["4h"]
 btc_signal = None
 
 # список открытых позиций
@@ -263,7 +263,7 @@ async def process_main_timeframe_signals():
 
     if signals_to_save:
         logging.info(f"Сохраняем {len(signals_to_save)} сигналов в БД")
-        # await db.save_signals_batch_to_db(signals_to_save)
+        await db.save_signals_batch_to_db(signals_to_save)
     else:
         logging.warning("Нет сигналов для сохранения — список пуст.")
 
@@ -1133,6 +1133,9 @@ async def partial_close_and_move_stop(trade):
 
 
 if __name__ == '__main__':
+
+    # logging.info('START')
+    # tg.bot.send_message('START')
     config = configparser.ConfigParser()
     config.read('config.ini')
     asyncio.run(main())
