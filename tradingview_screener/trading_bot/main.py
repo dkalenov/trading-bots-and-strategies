@@ -57,55 +57,9 @@ error_queue = asyncio.Queue()
 symbol_locks = defaultdict(asyncio.Lock)
 
 
-
-# --- ⏱ Антиспам параметры ---
+# Антиспам параметры
 error_send_cache = defaultdict(lambda: 0)  # key -> время последней отправки
 ERROR_SEND_INTERVAL = 300  # 5 минут
-
-
-
-# async def main():
-#     global session, conf, client, all_symbols, all_prices, debug, symbol_conf_cache, positions
-#
-#     config.read('config.ini')
-#
-#     # подключение к БД
-#     session = await db.connect(config['DB']['host'], int(config['DB']['port']),
-#         config['DB']['user'], config['DB']['password'], config['DB']['db'])
-#
-#     # конфиг и клиент
-#     conf = await db.load_config()
-#     client = binance.Futures(
-#         conf.api_key, conf.api_secret,
-#         asynced=True, testnet=config.getboolean('BOT', 'testnet')
-#     )
-#     debug = config.getboolean('BOT', 'debug')
-#
-#     # символы и конфиги
-#     symbol_confs = await db.get_all_symbols_conf()
-#     symbol_conf_cache = {s.symbol: s for s in symbol_confs}
-#
-#     # загрузка всех позиций
-#     await get_data.sync_positions_with_exchange(client, positions)
-#     open_symbols = [symbol for symbol, status in positions.items() if status]
-#     print(f"Открытых позиций: {len(open_symbols)}")
-#
-#     # данные Binance
-#     all_symbols = await get_data.load_binance_symbols(client)
-#     all_prices = await get_data.get_all_prices(client)
-#
-#
-#     # запуск параллельных задач
-#     symbol_update_lock = asyncio.Lock()
-#     await asyncio.gather(
-#         *(timed_collector(tf, symbol_update_lock) for tf in timeframes),
-#         db.periodic_symbol_update(client, executor, symbol_update_lock, hour=9, minute=53),
-#         # tg.run(),
-#         tg.run(session, client, connect_ws, disconnect_ws, subscribe_ws, unsubscribe_ws),
-#         message_sender(),
-#         error_sender(),
-#         connect_ws()
-#     )
 
 
 
@@ -115,13 +69,8 @@ async def main():
     config.read('config.ini')
 
     # подключение к БД
-    session = await db.connect(
-        config['DB']['host'],
-        int(config['DB']['port']),
-        config['DB']['user'],
-        config['DB']['password'],
-        config['DB']['db']
-    )
+    session = await db.connect(config['DB']['host'], int(config['DB']['port']), config['DB']['user'],
+                               config['DB']['password'], config['DB']['db'])
 
     # загрузка конфига
     conf = await db.load_config()
@@ -131,17 +80,12 @@ async def main():
 
     # проверка наличия API ключей
     if not conf.api_key or not conf.api_secret:
-        print("❌ API ключи не заданы. Запущен только Telegram-бот.")
+        print("API ключи не заданы. Запускаем только Telegram-бот для обновления ключей.")
         await tg.run(session, None, connect_ws, disconnect_ws, subscribe_ws, unsubscribe_ws)
         return
 
     # инициализация клиента Binance
-    client = binance.Futures(
-        conf.api_key,
-        conf.api_secret,
-        asynced=True,
-        testnet=config.getboolean('BOT', 'testnet')
-    )
+    client = binance.Futures(conf.api_key, conf.api_secret, asynced=True, testnet=config.getboolean('BOT', 'testnet'))
 
     # загрузка конфигов символов
     symbol_confs = await db.get_all_symbols_conf()
@@ -160,7 +104,7 @@ async def main():
     symbol_update_lock = asyncio.Lock()
     await asyncio.gather(
         *(timed_collector(tf, symbol_update_lock) for tf in timeframes),
-        db.periodic_symbol_update(client, executor, symbol_update_lock, hour=9, minute=53),
+        db.periodic_symbol_update(client, executor, symbol_update_lock, hour=17, minute=36),
         tg.run(session, client, connect_ws, disconnect_ws, subscribe_ws, unsubscribe_ws),
         message_sender(),
         error_sender(),
@@ -316,10 +260,7 @@ async def process_trade_signal(symbol, interval):
         elif open_short:
             signal = "SELL"
 
-        # print('POSITIONS PROCESS TRADE SIGNAL RUN', datetime.now(timezone.utc), positions)
-        # if signal and not positions.get(symbol, False):
-        #     logging.info(f"Открытие {signal} по {symbol} @ {entry_price} | BTC = {btc_signal}")
-        #     await new_trade(symbol, interval, signal)
+
 
         if signal:
             async with symbol_locks[symbol]:
@@ -362,8 +303,6 @@ async def message_sender():
         message_queue.task_done()
 
 
-
-
 # Отправка критических ошибок с защитой от спама
 async def notify_critical_error(message: str, key: str = None, force_send=False):
     now = time.time()
@@ -382,9 +321,6 @@ async def notify_critical_error(message: str, key: str = None, force_send=False)
             logging.error(f"Ошибка при отправке критического уведомления в Telegram: {e}")
     else:
         logging.info(f"[Telegram Notify] Подавлено повторное сообщение: {key}")
-
-
-
 
 
 
@@ -415,26 +351,18 @@ async def error_sender():
         error_queue.task_done()
 
 
-
-
-
-
-
-
-
-
 async def new_trade(symbol, interval, signal):
     global positions
     loop = asyncio.get_running_loop()
 
 
-    # --- 🚫 Блокировка при уже активной позиции ---
+    # Блокировка при уже активной позиции
     if positions.get(symbol):
         logging.warning(f"{symbol}: позиция уже открыта (по флагу positions), повторный вход запрещён.")
         return
 
     try:
-        # --- 🔎 Проверка позиции на Binance ---
+        # Проверка позиции на Binance
         binance_positions = await client.get_position_risk(symbol=symbol)
         position_info = next((p for p in binance_positions if p["symbol"] == symbol), None)
 
@@ -443,7 +371,7 @@ async def new_trade(symbol, interval, signal):
             positions[symbol] = True  # Синхронизируем флаг
             return
 
-        # --- 🔎 Проверка в БД ---
+        # Проверка в БД
         # existing_trade = await db.get_open_trade(symbol)
         # if existing_trade and existing_trade.position_open:
         #     logging.warning(f"{symbol}: открытая сделка уже есть в БД (id={existing_trade.id}), вход запрещён.")
@@ -506,7 +434,6 @@ async def new_trade(symbol, interval, signal):
                                              quantity=quantity, newOrderRespType='RESULT')
 
 
-
         # order_info = await db.get_active_entry_order_info(symbol, client)
         #
         # if order_info:
@@ -514,10 +441,7 @@ async def new_trade(symbol, interval, signal):
 
 
 
-
-
     except Exception as e:
-
         msg = f"🚫 Ошибка при открытии {'ЛОНГОВОЙ' if signal == 'BUY' else 'ШОРТОВОЙ'} позиции по {symbol}\n{e}"
         print(msg)
         logging.exception(msg)
@@ -686,6 +610,7 @@ async def disconnect_ws():
     except:
         pass
 
+
 # подписка на стрим свечей по символу
 async def subscribe_ws(symbol, interval):
     global websockets_list
@@ -710,7 +635,6 @@ async def unsubscribe_ws(symbol):
 async def ws_error(ws, error):
     print(f"❌ WS ERROR: {error}")
     print(traceback.format_exc())
-
 
 
 
@@ -877,28 +801,6 @@ async def ws_user_msg(ws, msg):
                     )
                     await s.commit()
 
-            # --- Полное закрытие ---
-            # if not position_open and not trade.status.startswith('CLOSED'):
-            #     trade.close_time = int(datetime.now(timezone.utc).timestamp() * 1000)
-            #     trade.position_open = False
-            #
-            #     ot = o.get('ot')
-            #     if ot == 'STOP_MARKET':
-            #         trade.status = 'CLOSED_BREAKEVEN' if trade.take1_triggered and trade.breakeven_stop_price else 'CLOSED_STOP'
-            #     elif ot == 'LIMIT':
-            #         trade.status = 'CLOSED_TAKE'
-            #     else:
-            #         trade.status = 'CLOSED_MARKET'
-            #
-            #     await db.update_order_trade(order, trade)
-            #     await db.update_trade_result(trade.id)
-            #
-            #     status_text = {
-            #         'CLOSED_BREAKEVEN': '🔄 стоп в БУ (после Take1)',
-            #         'CLOSED_STOP': '⛔️ по СТОПУ',
-            #         'CLOSED_TAKE': '🎯 по Take2',
-            #         'CLOSED_MARKET': '📉 по рынку'
-            #     }.get(trade.status, '📉 закрыта')
 
             # --- Полное закрытие ---
             if not position_open and not trade.status.startswith('CLOSED'):
@@ -926,8 +828,8 @@ async def ws_user_msg(ws, msg):
                             await s.commit()
                     except Exception as e:
                         logging.exception(f"{symbol}: ошибка при отмене оставшегося стопа после закрытия позиции\n{e}")
-                        msg = f"{symbol}:❌ ошибка при отмене оставшегося стопа после закрытия позиции\n{e}"
-                        await notify_critical_error(msg, key=f"{symbol}_new_stop_error")
+                        # msg = f"{symbol}:❌ ошибка при отмене оставшегося стопа после закрытия позиции\n{e}"
+                        # await notify_critical_error(msg, key=f"{symbol}_new_stop_error")
 
                 await db.update_order_trade(order, trade)
                 await db.update_trade_result(trade.id)
@@ -960,7 +862,6 @@ async def ws_user_msg(ws, msg):
 
                 positions.pop(symbol, None)
                 print(f"Сделка по {symbol} закрыта.")
-
 
 
 
