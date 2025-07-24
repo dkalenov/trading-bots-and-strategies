@@ -9,3 +9,5 @@ Trying to reproduce the indicator signals.
 Connect to websockets
 
 Telegram alerts 
+
+Testing
