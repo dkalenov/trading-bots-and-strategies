@@ -696,6 +696,8 @@ async def ws_msg(ws, msg):
 
 
 
+
+
 async def ws_user_msg(ws, msg):
     global positions
 
@@ -816,7 +818,28 @@ async def ws_user_msg(ws, msg):
                     trade.status = 'CLOSED_MARKET'
 
                 # отмена оставшегося стопа
+                # active_stop = await db.get_last_active_stop_order(trade.id)
+                # if active_stop:
+                #     try:
+                #         await client.cancel_order(symbol=symbol, orderId=active_stop.order_id)
+                #         logging.info(
+                #             f"{symbol}: оставшийся стоп-ордер {active_stop.order_id} отменён после полного закрытия")
+                #         async with session() as s:
+                #             active_stop.status = 'CANCELED'
+                #             s.add(active_stop)
+                #             await s.commit()
+                #     except Exception as e:
+                #         logging.exception(f"{symbol}: ошибка при отмене оставшегося стопа после закрытия позиции\n{e}")
+                #         # msg = f"{symbol}:❌ ошибка при отмене оставшегося стопа после закрытия позиции\n{e}"
+                #         # await notify_critical_error(msg, key=f"{symbol}_new_stop_error")
+
+
+
+
+                # --- Попытка найти активный стоп из БД ---
                 active_stop = await db.get_last_active_stop_order(trade.id)
+                cancelled = False
+
                 if active_stop:
                     try:
                         await client.cancel_order(symbol=symbol, orderId=active_stop.order_id)
@@ -826,10 +849,31 @@ async def ws_user_msg(ws, msg):
                             active_stop.status = 'CANCELED'
                             s.add(active_stop)
                             await s.commit()
+                        cancelled = True
                     except Exception as e:
-                        logging.exception(f"{symbol}: ошибка при отмене оставшегося стопа после закрытия позиции\n{e}")
-                        # msg = f"{symbol}:❌ ошибка при отмене оставшегося стопа после закрытия позиции\n{e}"
-                        # await notify_critical_error(msg, key=f"{symbol}_new_stop_error")
+
+                        logging.exception(f"{symbol}: ❌ ошибка при отмене оставшегося стопа из БД\n{e}")
+                        msg = f"{symbol}: ❌ ошибка при отмене оставшегося стопа из БД\n{e}"
+                        await notify_critical_error(msg, key=f"{symbol}_cancel_stop_error")
+
+                # --- Fallback: проверка открытых ордеров, если в БД не нашли ---
+                if not cancelled:
+                    try:
+                        open_orders = await client.get_open_orders(symbol=symbol)
+                        for o in open_orders:
+                            if o['type'] == 'STOP_MARKET' and o.get('reduceOnly',
+                                                                    True):  # Binance часто не возвращает reduceOnly
+                                await client.cancel_order(symbol=symbol, orderId=o['orderId'])
+                                logging.info(f"{symbol}: fallback — отменён открытый STOP_MARKET ордер {o['orderId']}")
+                    except Exception as e:
+
+                        logging.exception(f"{symbol}: ❌ ошибка при fallback-отмене стопов\n{e}")
+                        msg = f"{symbol}: ❌ ошибка при fallback-отмене стопов\n{e}"
+                        await notify_critical_error(msg, key=f"{symbol}_cancel_stop_error")
+
+
+
+
 
                 await db.update_order_trade(order, trade)
                 await db.update_trade_result(trade.id)
@@ -946,7 +990,7 @@ async def partial_close_and_move_stop(trade):
             return
 
         remaining_qty = utils.round_down(remaining_amt, step_size)
-        new_stop = round(entry_price * (0.999 if direction == "BUY" else 1.001), tick_size)
+        new_stop = round(entry_price * (1.001 if direction == "BUY" else 0.999), tick_size)
         take2_price = trade.take2_price
 
         old_stop_order = await db.get_last_active_stop_order(trade.id)
