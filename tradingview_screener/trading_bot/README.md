@@ -10,4 +10,4 @@ Connect to websockets
 
 Telegram alerts 
 
-Testing
+Testing. After a week of work, the deposit decreased by 8 percent.
