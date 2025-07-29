@@ -11,3 +11,5 @@ Connect to websockets
 Telegram alerts 
 
 Testing. After a week of work, the deposit decreased by 8 percent.
+
+Optimising the strategy trying to find the best symbols to trade
