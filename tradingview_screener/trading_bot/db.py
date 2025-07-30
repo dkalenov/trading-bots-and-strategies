@@ -1,16 +1,14 @@
-from datetime import datetime
 from sqlalchemy import Column, Integer, BigInteger, String, Float, Boolean, DateTime, select, delete, update
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+from sqlalchemy.ext.asyncio import async_sessionmaker
 import logging
 from sqlalchemy.dialects.postgresql import insert
 from datetime import datetime, timezone, timedelta, time
-from sqlalchemy import select, update
 from tradingview_ta import TA_Handler, Interval
 import binance
 import asyncio
 import get_data
-
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 
 
 Base = declarative_base()
@@ -29,7 +27,7 @@ class TradingviewSignals(Base):
     __tablename__ = 'tradingview_signals'
     id = Column(Integer, primary_key=True, autoincrement=True)
     symbol = Column(String)
-    interval = Column(String)
+    interval = Column("timeframe", String)
     signal = Column(String)
     entry_price = Column(Float)
     utc_time = Column(DateTime(timezone=True))
@@ -116,17 +114,8 @@ class ConfigInfo:
             setattr(self, key, value)
 
 
-# async def connect(host, port, user, password, db):
-#     global Session
-#     engine = create_async_engine(f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{db}")
-#     async with engine.begin() as conn:
-#         await conn.run_sync(Base.metadata.create_all)
-#     Session = async_sessionmaker(engine, expire_on_commit=False)
-#     return Session
 
 
-
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 
 async def connect(host, port, user, password, dbname):
     global Session
@@ -135,10 +124,14 @@ async def connect(host, port, user, password, dbname):
     engine = create_async_engine(
         DATABASE_URL,
         echo=False,
-        pool_size=20,       # увеличиваем пул
-        max_overflow=30,    # сколько можно создать поверх основного пула
-        pool_timeout=10,    # сколько ждать свободное соединение
+        pool_size=20,
+        max_overflow=30,
+        pool_timeout=10,
     )
+
+    # создаем таблицы
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
 
     Session = async_sessionmaker(
         bind=engine,
@@ -169,15 +162,6 @@ async def load_config():
     result = await s.execute(select(Config))
     data = {row.key: row.value for row in result.scalars()}
 
-
-# # функция для получения настроек для символа
-# async def get_symbol_conf(symbol):
-#     # создание сессии для работы с БД
-#     async with Session() as s:
-#         # получение настроек для символа
-#         symbols = await s.execute(select(SymbolsSettings).where(SymbolsSettings.symbol == symbol))
-#         # берем одну строку и возвращаем результат
-#         return symbols.scalars().one_or_none()
 
 
 
@@ -296,15 +280,6 @@ async def config_update(**kwargs):
         await s.commit()
 
 
-# async def get_all_symbols_conf():
-#     async with Session() as s:
-#         return (await s.execute(select(SymbolsSettings))).scalars().all()
-
-        # result = await s.execute(
-        #     select(Symbols).where(Symbols.tradingview_symbol.is_(True))
-        # )
-        # symbols = result.scalars().all()
-        # return [s.binance_symbol for s in symbols]
 
 async def get_all_symbols_conf():
     async with Session() as s:
@@ -530,21 +505,6 @@ async def sync_positions_with_exchange(client, positions: dict):
             continue
             positions[symbol] = False
 
-# async def sync_positions_with_exchange(client, positions: dict):
-#     position_info = await client.get_position_risk()
-#
-#     for pos in position_info:
-#         symbol = pos['symbol']
-#         amt = float(pos['positionAmt'])
-#
-#         if amt != 0.0:
-#             if symbol not in positions or not positions[symbol]:
-#                 # print(f"[SYNC] Найдена активная позиция на бирже: {symbol}")
-#                 positions[symbol] = True
-#         else:
-#             if symbol not in positions:
-#                 continue
-#                 # positions[symbol] = False
 
 
 
@@ -607,7 +567,6 @@ async def get_order_trade(order_id) -> tuple[Orders, Trades]:
 
 
 
-
 # функция для обновления ордера и трейда
 async def update_order_trade(order, trade):
     # создание сессии для работы с БД
@@ -660,7 +619,8 @@ async def get_last_active_stop_order(trade_id: int):
                 Orders.trade_id == trade_id,
                 Orders.type == 'STOP_MARKET',
                 Orders.reduce == True,
-                Orders.status == 'NEW'
+                Orders.status == 'NEW',
+                Orders.order_id.isnot(None)
             ).order_by(Orders.time.desc())
         )
         return result.scalar_one_or_none()
