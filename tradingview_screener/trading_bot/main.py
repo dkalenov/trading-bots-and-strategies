@@ -251,8 +251,10 @@ async def process_trade_signal(symbol, interval):
             open_short = recommendation in ['STRONG_SELL', 'SELL']
             # open_short = recommendation in ['STRONG_BUY', 'BUY', 'NEUTRAL', 'STRONG_SELL', 'SELL']
         else:
-            open_long = recommendation == 'STRONG_BUY' and btc_signal in ['STRONG_BUY', 'BUY', 'NEUTRAL']
-            open_short = recommendation == 'STRONG_SELL' and btc_signal in ['STRONG_SELL', 'SELL', 'NEUTRAL']
+            open_long = recommendation == 'STRONG_BUY' and btc_signal in ['STRONG_BUY', 'BUY']
+            open_short = recommendation == 'STRONG_SELL' and btc_signal in ['STRONG_SELL', 'SELL']
+            # open_long = recommendation == 'STRONG_BUY' and btc_signal in ['STRONG_BUY', 'BUY', 'NEUTRAL']
+            # open_short = recommendation == 'STRONG_SELL' and btc_signal in ['STRONG_SELL', 'SELL', 'NEUTRAL']
 
         signal = None
         if open_long:
@@ -836,11 +838,79 @@ async def ws_user_msg(ws, msg):
 
 
 
+                # # --- Попытка найти активный стоп из БД ---
+                # active_stop = await db.get_last_active_stop_order(trade.id)
+                # cancelled = False
+                #
+                # if active_stop:
+                #     try:
+                #         await client.cancel_order(symbol=symbol, orderId=active_stop.order_id)
+                #         logging.info(
+                #             f"{symbol}: оставшийся стоп-ордер {active_stop.order_id} отменён после полного закрытия")
+                #         async with session() as s:
+                #             active_stop.status = 'CANCELED'
+                #             s.add(active_stop)
+                #             await s.commit()
+                #         cancelled = True
+                #     except Exception as e:
+                #
+                #         logging.exception(f"{symbol}: ❌ ошибка при отмене оставшегося стопа из БД\n{e}")
+                #         msg = f"{symbol}: ❌ ошибка при отмене оставшегося стопа из БД\n{e}"
+                #         await notify_critical_error(msg, key=f"{symbol}_cancel_stop_error")
+                #
+                # # --- Fallback: проверка открытых ордеров, если в БД не нашли ---
+                # if not cancelled:
+                #     try:
+                #         open_orders = await client.get_open_orders(symbol=symbol)
+                #         for o in open_orders:
+                #             if o['type'] == 'STOP_MARKET' and o.get('reduceOnly',
+                #                                                     True):  # Binance часто не возвращает reduceOnly
+                #                 await client.cancel_order(symbol=symbol, orderId=o['orderId'])
+                #                 logging.info(f"{symbol}: fallback — отменён открытый STOP_MARKET ордер {o['orderId']}")
+                #     except Exception as e:
+                #
+                #         logging.exception(f"{symbol}: ❌ ошибка при fallback-отмене стопов\n{e}")
+                #         msg = f"{symbol}: ❌ ошибка при fallback-отмене стопов\n{e}"
+                #         await notify_critical_error(msg, key=f"{symbol}_cancel_stop_error")
+
+                # --- Попытка найти активный стоп из БД ---
+                # active_stop = await db.get_last_active_stop_order(trade.id)
+                # cancelled = False
+                #
+                # if active_stop and active_stop.order_id:
+                #     try:
+                #         await client.cancel_order(symbol=symbol, orderId=active_stop.order_id)
+                #         logging.info(
+                #             f"{symbol}: оставшийся стоп-ордер {active_stop.order_id} отменён после полного закрытия")
+                #         async with session() as s:
+                #             active_stop.status = 'CANCELED'
+                #             s.add(active_stop)
+                #             await s.commit()
+                #         cancelled = True
+                #     except Exception as e:
+                #         logging.exception(f"{symbol}: ❌ ошибка при отмене оставшегося стопа из БД\n{e}")
+                #         msg = f"{symbol}: ❌ ошибка при отмене оставшегося стопа из БД\n{e}"
+                #         await notify_critical_error(msg, key=f"{symbol}_cancel_stop_error")
+                #
+                # # --- Всегда проверяй открытые ордера fallback'ом, даже если не нашли в БД ---
+                # try:
+                #     open_orders = await client.get_open_orders(symbol=symbol)
+                #     for o in open_orders:
+                #         if o['type'] == 'STOP_MARKET' and o.get('reduceOnly', True):
+                #             order_id = o.get('orderId')
+                #             if order_id:
+                #                 await client.cancel_order(symbol=symbol, orderId=order_id)
+                #                 logging.info(f"{symbol}: fallback — отменён открытый STOP_MARKET ордер {order_id}")
+                # except Exception as e:
+                #     logging.exception(f"{symbol}: ❌ ошибка при fallback-отмене стопов\n{e}")
+                #     msg = f"{symbol}: ❌ ошибка при fallback-отмене стопов\n{e}"
+                #     await notify_critical_error(msg, key=f"{symbol}_cancel_stop_error")
+
                 # --- Попытка найти активный стоп из БД ---
                 active_stop = await db.get_last_active_stop_order(trade.id)
                 cancelled = False
 
-                if active_stop:
+                if active_stop and active_stop.order_id:
                     try:
                         await client.cancel_order(symbol=symbol, orderId=active_stop.order_id)
                         logging.info(
@@ -851,25 +921,27 @@ async def ws_user_msg(ws, msg):
                             await s.commit()
                         cancelled = True
                     except Exception as e:
-
                         logging.exception(f"{symbol}: ❌ ошибка при отмене оставшегося стопа из БД\n{e}")
                         msg = f"{symbol}: ❌ ошибка при отмене оставшегося стопа из БД\n{e}"
                         await notify_critical_error(msg, key=f"{symbol}_cancel_stop_error")
 
-                # --- Fallback: проверка открытых ордеров, если в БД не нашли ---
-                if not cancelled:
-                    try:
-                        open_orders = await client.get_open_orders(symbol=symbol)
-                        for o in open_orders:
-                            if o['type'] == 'STOP_MARKET' and o.get('reduceOnly',
-                                                                    True):  # Binance часто не возвращает reduceOnly
-                                await client.cancel_order(symbol=symbol, orderId=o['orderId'])
-                                logging.info(f"{symbol}: fallback — отменён открытый STOP_MARKET ордер {o['orderId']}")
-                    except Exception as e:
+                # --- Fallback-проверка открытых ордеров на бирже ---
+                try:
+                    open_orders = await client.get_open_orders(symbol=symbol)
+                    for o in open_orders:
+                        if o['type'] == 'STOP_MARKET' and o.get('reduceOnly', True):
+                            order_id = o.get('orderId')
+                            if order_id:
+                                try:
+                                    await client.cancel_order(symbol=symbol, orderId=order_id)
+                                    logging.info(f"{symbol}: fallback — отменён открытый STOP_MARKET ордер {order_id}")
+                                except Exception as e:
+                                    logging.warning(f"{symbol}: ошибка при fallback-отмене ордера {order_id}: {e}")
+                except Exception as e:
+                    logging.exception(f"{symbol}: ❌ ошибка при fallback-отмене стопов\n{e}")
+                    msg = f"{symbol}: ❌ ошибка при fallback-отмене стопов\n{e}"
+                    await notify_critical_error(msg, key=f"{symbol}_cancel_stop_error")
 
-                        logging.exception(f"{symbol}: ❌ ошибка при fallback-отмене стопов\n{e}")
-                        msg = f"{symbol}: ❌ ошибка при fallback-отмене стопов\n{e}"
-                        await notify_critical_error(msg, key=f"{symbol}_cancel_stop_error")
 
 
 
