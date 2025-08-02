@@ -12,4 +12,4 @@ Telegram alerts
 
 Testing. After a week of work, the deposit decreased by 8 percent.
 
-Optimising the strategy trying to find the best symbols to trade
+Optimising the strategy trying to find the best symbols to trade. With a right stop/take coefficient can get positive results 
