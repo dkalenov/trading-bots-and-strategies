@@ -927,9 +927,9 @@ async def ws_user_msg(ws, msg):
 
                 # --- Fallback-проверка открытых ордеров на бирже ---
                 try:
-                    open_orders = await client.get_open_orders(symbol=symbol)
+                    open_orders = await client.get_orders(symbol=symbol)
                     for o in open_orders:
-                        if o['type'] == 'STOP_MARKET' and o.get('reduceOnly', True):
+                        if o['type'] in ('STOP_MARKET', 'STOP') and o.get('reduceOnly', True):
                             order_id = o.get('orderId')
                             if order_id:
                                 try:
