@@ -14,4 +14,4 @@ Testing. After a week of work, the deposit decreased by 8 percent.
 
 Optimising the strategy trying to find the best symbols to trade. With a right stop/take coefficient can get positive results 
 
-In a flat the trade can drag on for a long time or only catch stops all the time.
+In a flat the trade can drag on for a long time or only catch stops all the time. Very often it closes on stop very soon after opening a position
