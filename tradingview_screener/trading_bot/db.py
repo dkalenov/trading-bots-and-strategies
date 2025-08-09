@@ -341,13 +341,23 @@ async def save_signals_batch_to_db(signals: list[tuple[str, str, str, float]]):
     """
     async with Session() as s:
         try:
+            # stmt = insert(TradingviewSignals).values([
+            #     {
+            #         'symbol': symbol,
+            #         'interval': timeframe,
+            #         'signal': signal,
+            #         'entry_price': entry_price,
+            #         'utc_time': datetime.now(timezone.utc)
+            #     }
+            #     for symbol, timeframe, signal, entry_price in signals
+            # ])
             stmt = insert(TradingviewSignals).values([
                 {
-                    'symbol': symbol,
-                    'interval': timeframe,
-                    'signal': signal,
-                    'entry_price': entry_price,
-                    'utc_time': datetime.now(timezone.utc)
+                    TradingviewSignals.symbol.key: symbol,
+                    TradingviewSignals.interval.key: timeframe,
+                    TradingviewSignals.signal.key: signal,
+                    TradingviewSignals.entry_price.key: entry_price,
+                    TradingviewSignals.utc_time.key: datetime.now(timezone.utc)
                 }
                 for symbol, timeframe, signal, entry_price in signals
             ])

@@ -207,7 +207,12 @@ async def process_main_timeframe_signals():
 
     if signals_to_save:
         logging.info(f"Сохраняем {len(signals_to_save)} сигналов в БД")
-        await db.save_signals_batch_to_db(signals_to_save)
+        try:
+            await db.save_signals_batch_to_db(signals_to_save)
+        except Exception as e:
+            logging.exception(f"❌ Ошибка при сохранении сигналов\n{e}")
+            msg = f"❌ Ошибка при сохранении сигналов в бд\n{e}\n"
+            await notify_critical_error(msg, key="save_signals_error")
     else:
         logging.warning("Нет сигналов для сохранения — список пуст.")
 
