@@ -775,14 +775,40 @@ async def ws_user_msg(ws, msg):
             ):
                 trade.partial_exit_done = True
 
-                await updated_event.wait()  # дождаться, пока словарь обновится
+                # await updated_event.wait()  # дождаться, пока словарь обновится
+                # stop_take = updated_take_stop.get(symbol)
+                # if not stop_take:
+                #     logging.error(f"{symbol}: не удалось получить stop2/take2 из updated_take_stop")
+                #     return
+                #
+                # stop2, take2 = stop_take
+                # updated_event.clear()  # готов к следующему обновлению
+
+                # ждём обновления, но не вечно — ставим таймаут
+                try:
+                    await asyncio.wait_for(updated_event.wait(), timeout=1)
+                except asyncio.TimeoutError:
+                    logging.warning(f"{symbol}: timeout ожидания updated_event")
+
                 stop_take = updated_take_stop.get(symbol)
                 if not stop_take:
-                    logging.error(f"{symbol}: не удалось получить stop2/take2 из updated_take_stop")
-                    return
+                    logging.error(
+                        f"{symbol}: не удалось получить stop2/take2 из updated_take_stop — пробуем взять из БД")
+                    # fallback: читаем из БД
+                    async with session() as s:
+                        fresh = await s.get(db.Trades, trade.id)
+                        if fresh:
+                            stop2 = fresh.breakeven_stop_price
+                            take2 = fresh.take2_price
+                        else:
+                            logging.error(f"{symbol}: не найден трейд в БД (id={trade.id}), пропускаем уведомление")
+                            return
+                else:
+                    stop2, take2 = stop_take
 
-                stop2, take2 = stop_take
-                updated_event.clear()  # готов к следующему обновлению
+                # очистим событие, если оно установлено
+                if updated_event.is_set():
+                    updated_event.clear()
 
                 text = (
                     f"<b>{symbol}</b>: частично закрыта позиция <b>{'ЛОНГ' if trade.side else 'ШОРТ'}</b>\n"
@@ -1070,81 +1096,159 @@ async def partial_close_and_move_stop(trade):
         new_stop = round(entry_price * (1.001 if direction == "BUY" else 0.999), tick_size)
         take2_price = trade.take2_price
 
+        # old_stop_order = await db.get_last_active_stop_order(trade.id)
+        # try:
+        #     # --- Новый стоп ---
+        #     new_stop_order = await client.new_order(
+        #         symbol=symbol,
+        #         side=close_side,
+        #         type='STOP_MARKET',
+        #         stopPrice=new_stop,
+        #         quantity=remaining_qty,
+        #         reduceOnly=True
+        #     )
+        #     logging.info(f"{symbol}: новый стоп установлен @ {new_stop}, объём {remaining_qty}")
+        # except Exception as e:
+        #
+        #     logging.exception(f"{symbol}: ❌ ошибка при установке нового стопа @ {new_stop}, объём {remaining_qty}\n{e}")
+        #     msg = f"{symbol}: ❌ ошибка при установке нового стопа @ {new_stop}, объём {remaining_qty}\n{e}"
+        #
+        #     await notify_critical_error(msg, key=f"{symbol}_new_stop_error")
+        #
+        # if qty < min_qty:
+        #     logging.warning(f"{symbol}: объём {qty} меньше минимального лота. Оставляем старый стоп")
+        # else:
+        # # --- Новый тейк2 ---
+        #     try:
+        #         new_take2_order = await client.new_order(
+        #             symbol=symbol,
+        #             side=close_side,
+        #             type='LIMIT',
+        #             price=take2_price,
+        #             quantity=remaining_qty,
+        #             timeInForce='GTC',
+        #             reduceOnly=True
+        #         )
+        #         logging.info(f"{symbol}: тейк2 обновлён @ {take2_price}, объём {remaining_qty}")
+        #
+        #
+        #     except Exception as e:
+        #
+        #         logging.exception(f"{symbol}: ❌ ошибка при установке нового тейка2 @ {take2_price}, объём {remaining_qty}\n{e}")
+        #
+        #         msg = f"{symbol}: ❌ ошибка при установке нового тейка2 @ {take2_price}, объём {remaining_qty}\n{e}"
+        #         await notify_critical_error(msg, key=f"{symbol}_new_take2_error")
+        #
+        #
+        # # --- Отмена старого стопа ---
+        # if old_stop_order and old_stop_order.order_id != new_stop_order['orderId']:
+        #     try:
+        #         await client.cancel_order(symbol=symbol, orderId=old_stop_order.order_id)
+        #         logging.info(f"{symbol}: старый стоп-ордер {old_stop_order.order_id} отменён")
+        #
+        #
+        #         async with session() as s:
+        #             old_stop_order.status = 'CANCELED'
+        #             s.add(old_stop_order)
+        #             await s.commit()
+        #             logging.info(f"{symbol}: отменённый стоп-ордер сохранён в БД со статусом CANCELED.")
+        #
+        #     except Exception as e:
+        #
+        #             logging.exception(f"{symbol}: ❌ ошибка при отмене старого стопа\n{e}")
+        #             msg = f"{symbol}: ❌ ошибка при отмене старого стопа\n{e}"
+        #             await notify_critical_error(msg, key=f"{symbol}_cancel_stop_error")
+        #
+        #
+        # # --- Фиксируем флаги ---
+        # async with session() as s:
+        #     await s.execute(
+        #         update(db.Trades).where(db.Trades.id == trade.id).values(
+        #             breakeven_stop_price=new_stop,
+        #             partial_exit_done=True
+        #         )
+        #     )
+        #     await s.commit()
+        #     logging.info(f"{symbol}: флаги обновлены в БД.")
+        #
+        # updated_take_stop[symbol] = (new_stop, take2_price)
+        # updated_event.set()
+
+
         old_stop_order = await db.get_last_active_stop_order(trade.id)
+
+        # гарантированно объявляем, чтобы не получить UnboundLocalError
+        new_stop_order = None
+        new_take2_order = None
+
         try:
             # --- Новый стоп ---
-            new_stop_order = await client.new_order(
-                symbol=symbol,
-                side=close_side,
-                type='STOP_MARKET',
-                stopPrice=new_stop,
-                quantity=remaining_qty,
-                reduceOnly=True
-            )
-            logging.info(f"{symbol}: новый стоп установлен @ {new_stop}, объём {remaining_qty}")
-        except Exception as e:
-
-            logging.exception(f"{symbol}: ❌ ошибка при установке нового стопа @ {new_stop}, объём {remaining_qty}\n{e}")
-            msg = f"{symbol}: ❌ ошибка при установке нового стопа @ {new_stop}, объём {remaining_qty}\n{e}"
-
-            await notify_critical_error(msg, key=f"{symbol}_new_stop_error")
-
-        if qty < min_qty:
-            logging.warning(f"{symbol}: объём {qty} меньше минимального лота. Оставляем старый стоп")
-        else:
-        # --- Новый тейк2 ---
             try:
-                new_take2_order = await client.new_order(
+                new_stop_order = await client.new_order(
                     symbol=symbol,
                     side=close_side,
-                    type='LIMIT',
-                    price=take2_price,
+                    type='STOP_MARKET',
+                    stopPrice=new_stop,
                     quantity=remaining_qty,
-                    timeInForce='GTC',
                     reduceOnly=True
                 )
-                logging.info(f"{symbol}: тейк2 обновлён @ {take2_price}, объём {remaining_qty}")
-
-
+                logging.info(f"{symbol}: новый стоп установлен @ {new_stop}, объём {remaining_qty}")
             except Exception as e:
+                logging.exception(f"{symbol}: ❌ ошибка при установке нового стопа @ {new_stop}, объём {remaining_qty}\n{e}")
+                msg = f"{symbol}: ❌ ошибка при установке нового стопа @ {new_stop}, объём {remaining_qty}\n{e}"
+                await notify_critical_error(msg, key=f"{symbol}_new_stop_error")
+                # new_stop_order остаётся None — но мы продолжаем выполнение
 
-                logging.exception(f"{symbol}: ❌ ошибка при установке нового тейка2 @ {take2_price}, объём {remaining_qty}\n{e}")
+            # --- Новый тейк2 (если нужно) ---
+            if qty >= min_qty:
+                try:
+                    new_take2_order = await client.new_order(
+                        symbol=symbol,
+                        side=close_side,
+                        type='LIMIT',
+                        price=take2_price,
+                        quantity=remaining_qty,
+                        timeInForce='GTC',
+                        reduceOnly=True
+                    )
+                    logging.info(f"{symbol}: тейк2 обновлён @ {take2_price}, объём {remaining_qty}")
+                except Exception as e:
+                    logging.exception(f"{symbol}: ❌ ошибка при установке нового тейка2 @ {take2_price}, объём {remaining_qty}\n{e}")
+                    msg = f"{symbol}: ❌ ошибка при установке нового тейка2 @ {take2_price}, объём {remaining_qty}\n{e}"
+                    await notify_critical_error(msg, key=f"{symbol}_new_take2_error")
 
-                msg = f"{symbol}: ❌ ошибка при установке нового тейка2 @ {take2_price}, объём {remaining_qty}\n{e}"
-                await notify_critical_error(msg, key=f"{symbol}_new_take2_error")
+            # --- Отмена старого стопа (только если есть новый стоп) ---
+            if old_stop_order and new_stop_order and old_stop_order.order_id != new_stop_order.get('orderId'):
+                try:
+                    await client.cancel_order(symbol=symbol, orderId=old_stop_order.order_id)
+                    logging.info(f"{symbol}: старый стоп-ордер {old_stop_order.order_id} отменён")
 
-
-        # --- Отмена старого стопа ---
-        if old_stop_order and old_stop_order.order_id != new_stop_order['orderId']:
-            try:
-                await client.cancel_order(symbol=symbol, orderId=old_stop_order.order_id)
-                logging.info(f"{symbol}: старый стоп-ордер {old_stop_order.order_id} отменён")
-
-
-                async with session() as s:
-                    old_stop_order.status = 'CANCELED'
-                    s.add(old_stop_order)
-                    await s.commit()
-                    logging.info(f"{symbol}: отменённый стоп-ордер сохранён в БД со статусом CANCELED.")
-
-            except Exception as e:
-
+                    async with session() as s:
+                        old_stop_order.status = 'CANCELED'
+                        s.add(old_stop_order)
+                        await s.commit()
+                        logging.info(f"{symbol}: отменённый стоп-ордер сохранён в БД со статусом CANCELED.")
+                except Exception as e:
                     logging.exception(f"{symbol}: ❌ ошибка при отмене старого стопа\n{e}")
                     msg = f"{symbol}: ❌ ошибка при отмене старого стопа\n{e}"
                     await notify_critical_error(msg, key=f"{symbol}_cancel_stop_error")
 
-
-        # --- Фиксируем флаги ---
-        async with session() as s:
-            await s.execute(
-                update(db.Trades).where(db.Trades.id == trade.id).values(
-                    breakeven_stop_price=new_stop,
-                    partial_exit_done=True
+            # --- Фиксируем флаги в БД ---
+            async with session() as s:
+                await s.execute(
+                    update(db.Trades).where(db.Trades.id == trade.id).values(
+                        breakeven_stop_price=new_stop,
+                        partial_exit_done=True
+                    )
                 )
-            )
-            await s.commit()
-            logging.info(f"{symbol}: флаги обновлены в БД.")
+                await s.commit()
+                logging.info(f"{symbol}: флаги обновлены в БД.")
 
+        except Exception as e:
+            logging.error(f"{symbol}: ошибка после частичного закрытия: {e}")
+
+        # --- Всегда (даже при ошибке) обновляем словарь и устанавливаем событие,
+        # чтобы ws_user_msg не висел в await forever ---
         updated_take_stop[symbol] = (new_stop, take2_price)
         updated_event.set()
 
