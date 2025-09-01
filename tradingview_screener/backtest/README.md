@@ -19,3 +19,7 @@ Colab talib issue; url = 'https://anaconda.org/conda-forge/libta-lib/0.4.0/downl
 
 failed with error: [Errno 2] No such file or directory: '/content/ta-lib-0.6.4-py312h196c9fc_0.conda'
 mv: cannot stat './ta-lib-0.6.4-py312h196c9fc_0/lib/python3.11/site-packages/talib': No such file or directory
+
+
+
+Talib issue solved
