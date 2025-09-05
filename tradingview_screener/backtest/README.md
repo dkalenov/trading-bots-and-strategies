@@ -25,3 +25,5 @@ mv: cannot stat './ta-lib-0.6.4-py312h196c9fc_0/lib/python3.11/site-packages/tal
 Talib issue solved
 
 Find a way to match real trades and backtest with close to 100% accuracy 
+
+trying to develop the strategy 
