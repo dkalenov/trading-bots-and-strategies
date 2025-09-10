@@ -27,3 +27,5 @@ Talib issue solved
 Find a way to match real trades and backtest with close to 100% accuracy 
 
 trying to develop the strategy 
+
+Wrote a tester comparable to real transactions. Tests show trend cyclical movement on certain settings
