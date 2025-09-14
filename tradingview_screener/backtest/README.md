@@ -32,6 +32,6 @@ Wrote a tester comparable to real transactions. Tests show trend cyclical moveme
 
 File data management 
 
+<img width="850" height="393" alt="download (12)" src="https://github.com/user-attachments/assets/162e1b4d-cccc-4f09-94ce-2bf6e589f247" />
 
-![z6978529432671_1cf894de47f0f3e7106cf54e7ec8492b](https://github.com/user-attachments/assets/b6391d03-c641-4724-8501-280f8c01b405)
 
