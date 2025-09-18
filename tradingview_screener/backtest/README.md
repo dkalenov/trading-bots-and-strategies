@@ -30,7 +30,7 @@ trying to develop the strategy
 
 Wrote a tester comparable to real transactions. Tests show trend cyclical movement on certain settings
 
-File data management 
+Strategy results:
 
 <img width="850" height="393" alt="download (12)" src="https://github.com/user-attachments/assets/162e1b4d-cccc-4f09-94ce-2bf6e589f247" />
 
