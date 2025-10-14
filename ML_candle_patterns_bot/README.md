@@ -1,3 +1,3 @@
 Testing
 The strategy works randomly 
-GradientBoosting shows better results. Buy anyway, the models are not effective
+GradientBoosting shows better results. But anyway, the models are not effective
