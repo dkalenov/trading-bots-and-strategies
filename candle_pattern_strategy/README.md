@@ -28,4 +28,4 @@ They’re often combined with:
 - Support/resistance zones
 - Trendlines or moving averages
 - Volume confirmation
-- Indicators (RSI, MACD, etc.)
+- Indicators (RSI, MACD, EMA, ATR, etc.)
