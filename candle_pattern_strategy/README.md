@@ -21,8 +21,6 @@ Candlestick patterns are combinations (usually 1–3 candles) that indicate poss
 How Candlestick Pattern Strategies Work
 - Traders use these patterns to identify:
 - Reversals (when a trend may change direction)
-
-Reference: https://howtotrade.com/wp-content/uploads/2022/04/Classical-Candlestick-Patterns.pdf 
 - Continuations (when the trend is likely to keep going)
 - Indecision (when neither bulls nor bears are in control)
 
@@ -31,3 +29,6 @@ They’re often combined with:
 - Trendlines or moving averages
 - Volume confirmation
 - Indicators (RSI, MACD, EMA, ATR, etc.)
+  
+
+Reference: https://howtotrade.com/wp-content/uploads/2022/04/Classical-Candlestick-Patterns.pdf 
