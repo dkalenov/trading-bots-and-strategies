@@ -1,0 +1,99 @@
+import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+from statsmodels.tsa.stattools import coint # Engle–Granger
+from itertools import combinations
+
+
+def calculate_cointegration(log1, log2, max_half_life=200):
+
+    # Проверяем, что значения положительные, иначе логарифм будет некорректен
+    # Если есть нули или отрицательные значения — сдвигаем ряд вверх на |min| + 1
+    if np.any(log1 <= 0):
+        log1 = log1 + abs(np.min(log1)) + 1
+    if np.any(log2 <= 0):
+        log2 = log2 + abs(np.min(log2)) + 1
+
+    # Применяем натуральный логарифм
+    log1 = np.log(log1)
+    log2 = np.log(log2)
+
+    safe_p_value = np.nan
+    try:
+        coint_t, p_value, crit_vals = coint(log1, log2)
+        safe_p_value = float(p_value)
+        X = sm.add_constant(log2)
+        model = sm.OLS(log1, X).fit()
+        hedge = float(model.params.iloc[1])
+
+        # if np.isnan(hedge):
+        #     return 0, np.nan, np.nan, safe_p_value
+
+        spread = log1 - hedge * log2
+        hl = calculate_half_life(spread)
+
+        if np.isnan(hl) or hl <= 0 or hl > max_half_life:
+            return 0, hedge, np.nan, safe_p_value
+
+        t_check = coint_t < crit_vals[1] # 5%
+
+        flag = 1 if (safe_p_value < 0.05 and t_check) else 0
+        return flag, hedge, hl, safe_p_value
+
+
+
+
+    except Exception as e:
+        print(f"Colculate cointegration error: {e}")
+        return 0, np.nan, np.nan, safe_p_value
+
+
+
+
+
+
+
+def calculate_half_life(spread):
+    """
+    spread: numpy array or pandas Series (log-spread).
+    Returns half-life in bars or np.nan if not mean-reverting or fail.
+    """
+    try:
+        s = pd.Series(spread).dropna()
+        if len(s) < 10:
+            return np.nan
+        spread_lag = s.shift(1).iloc[1:]
+        delta = (s - s.shift(1)).iloc[1:]
+        X = sm.add_constant(spread_lag)
+        model = sm.OLS(delta, X).fit()
+        b = float(model.params.iloc[1])
+        if np.isnan(b):
+            return np.nan
+        phi = 1.0 + b
+        if phi <= 0 or phi >= 1:
+            return np.nan
+        hl = -np.log(2) / np.log(phi)
+        return float(round(hl, 2))
+
+
+    except Exception as e:
+        print(f"Half-life Calculate error: {e}")
+
+
+
+if __name__ == "__main__":
+    df = pd.read_csv("klines_data_1h_clean_100symbols.csv")
+    df_pivot = df.pivot_table(index="Date", columns="Symbol", values="Close")
+
+    symbols = df_pivot.columns[:3]
+    print(f"First 3 symbols: {list(symbols)}")
+
+    for s1, s2 in combinations(symbols, 2):
+        pair_df = pd.concat([df_pivot[s1], df_pivot[s2]], axis=1).dropna()
+        # print(f"Pair DF: {len(pair_df)} rows")
+        asset1, asset2 = pair_df[s1], pair_df[s2]
+        try:
+            flag, hedge, hl, p = calculate_cointegration(asset1, asset2)
+            print(f"\n{s1} | {s2}: cointegration ={'YES' if flag else 'NO'}, hedge={hedge:.4f}, half-life={hl}, p={p:.5f}")
+        except Exception as e:
+            print(f"Colculate cointegration error: {e}")
