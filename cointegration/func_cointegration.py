@@ -6,24 +6,27 @@ from itertools import combinations
 
 
 def calculate_cointegration(log1, log2, max_half_life=200):
-
-    # Проверяем, что значения положительные, иначе логарифм будет некорректен
-    # Если есть нули или отрицательные значения — сдвигаем ряд вверх на |min| + 1
+    # Log-transform the series for variance stabilization
+    # If there are zeros or negative values, shift the series up by |min|+1
     if np.any(log1 <= 0):
         log1 = log1 + abs(np.min(log1)) + 1
     if np.any(log2 <= 0):
         log2 = log2 + abs(np.min(log2)) + 1
 
-    # Применяем натуральный логарифм
+    # Log-transform the series and calculate the cointegration test
     log1 = np.log(log1)
     log2 = np.log(log2)
 
     safe_p_value = np.nan
     try:
+        # Engle–Granger cointegration test
         coint_t, p_value, crit_vals = coint(log1, log2)
         safe_p_value = float(p_value)
-        X = sm.add_constant(log2)
-        model = sm.OLS(log1, X).fit()
+
+        # Calculate hedge ratio (beta) using OLS regression
+        X = sm.add_constant(log2) # X: add a constant column to include the intercept (a) in the regressionThis allows OLS to fit both slope (b) and intercept
+
+        model = sm.OLS(log1, X).fit() # Ordinary Least Squares.  delta = a + b * spread_lag + error. OLS finds the coefficients (a, b) that minimize the sum of squared errors
         hedge = float(model.params.iloc[1])
 
         # if np.isnan(hedge):
@@ -32,10 +35,11 @@ def calculate_cointegration(log1, log2, max_half_life=200):
         spread = log1 - hedge * log2
         hl = calculate_half_life(spread)
 
+
         if np.isnan(hl) or hl <= 0 or hl > max_half_life:
             return 0, hedge, np.nan, safe_p_value
 
-        t_check = coint_t < crit_vals[1] # 5%
+        t_check = coint_t < crit_vals[1] # 5% significance level
 
         flag = 1 if (safe_p_value < 0.05 and t_check) else 0
         return flag, hedge, hl, safe_p_value
@@ -62,11 +66,14 @@ def calculate_half_life(spread):
         s = pd.Series(spread).dropna()
         if len(s) < 10:
             return np.nan
+
+        # Δs = s_t - s_{t-1}, lagged_s = s_{t-1}
         spread_lag = s.shift(1).iloc[1:]
         delta = (s - s.shift(1)).iloc[1:]
+
         X = sm.add_constant(spread_lag)
         model = sm.OLS(delta, X).fit()
-        b = float(model.params.iloc[1])
+        b = float(model.params.iloc[1]) # slope coefficient (b) from the regression. This tells us how strongly the change in spread (delta) depends on the previous spread value
         if np.isnan(b):
             return np.nan
         phi = 1.0 + b
@@ -89,7 +96,7 @@ if __name__ == "__main__":
     print(f"First 3 symbols: {list(symbols)}")
 
     for s1, s2 in combinations(symbols, 2):
-        pair_df = pd.concat([df_pivot[s1], df_pivot[s2]], axis=1).dropna()
+        pair_df = pd.concat([df_pivot[s1], df_pivot[s2]], axis=1).dropna()  # Combine the two series into one DataFrame for the pair 
         # print(f"Pair DF: {len(pair_df)} rows")
         asset1, asset2 = pair_df[s1], pair_df[s2]
         try:
