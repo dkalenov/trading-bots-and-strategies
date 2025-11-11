@@ -86,7 +86,14 @@ def calculate_half_life(spread):
     except Exception as e:
         print(f"Half-life Calculate error: {e}")
 
-
+def calculate_z_last(spread):
+    """calculate zscore for last bar of spread window: (last - mean)/std"""
+    s = pd.Series(spread)
+    m = s.mean()
+    sd = s.std()
+    if sd == 0 or np.isnan(sd):
+        return np.nan
+    return float((s.iloc[-1] - m) / sd)
 
 if __name__ == "__main__":
     df = pd.read_csv("klines_data_1h_clean_100symbols.csv")
