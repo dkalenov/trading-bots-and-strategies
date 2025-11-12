@@ -95,6 +95,25 @@ def calculate_z_last(spread):
         return np.nan
     return float((s.iloc[-1] - m) / sd)
 
+
+
+def calculate_pair_beta(pair_r, market_r):
+    """ Beta = Cov(pair, market) / Var(market)"""
+
+    if pair_r is None or market_r is None:
+        return np.nan
+    pair_r = np.array(pair_r, dtype=float)
+    market_r = np.array(market_r, dtype=float)
+    if len(pair_r) != len(market_r) or len(pair_r) < 5:
+        return np.nan
+    cov = np.cov(pair_r, market_r)[0, 1] # сovariance between pair and market returns
+    var_m = np.var(market_r)  # variance of market returns (spread of market movement)
+    if var_m == 0: # if variance = 0, market didn't move -> undefined beta
+        return np.nan
+    return float(cov / var_m)
+
+
+
 if __name__ == "__main__":
     df = pd.read_csv("klines_data_1h_clean_100symbols.csv")
     df_pivot = df.pivot_table(index="Date", columns="Symbol", values="Close")
