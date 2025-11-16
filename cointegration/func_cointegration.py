@@ -115,18 +115,42 @@ def calculate_pair_beta(pair_r, market_r):
 
 
 if __name__ == "__main__":
+    # Load and prepare data
     df = pd.read_csv("klines_data_1h_clean_100symbols.csv")
     df_pivot = df.pivot_table(index="Date", columns="Symbol", values="Close")
 
-    symbols = df_pivot.columns[:3]
+    symbols = df_pivot.columns[:10]  # first 10 symbols for a quick test
     print(f"First 3 symbols: {list(symbols)}")
 
+    # Compute BTC returns for beta
+    if "BTCUSDT" in df_pivot.columns:
+        market_returns = df_pivot["BTCUSDT"].pct_change().dropna().values
+    else:
+        market_returns = None
+
     for s1, s2 in combinations(symbols, 2):
-        pair_df = pd.concat([df_pivot[s1], df_pivot[s2]], axis=1).dropna()  # Combine the two series into one DataFrame for the pair 
-        # print(f"Pair DF: {len(pair_df)} rows")
+        pair_df = pd.concat([df_pivot[s1], df_pivot[s2]], axis=1).dropna()
         asset1, asset2 = pair_df[s1], pair_df[s2]
+
         try:
+            # 1. Cointegration test
             flag, hedge, hl, p = calculate_cointegration(asset1, asset2)
-            print(f"\n{s1} | {s2}: cointegration ={'YES' if flag else 'NO'}, hedge={hedge:.4f}, half-life={hl}, p={p:.5f}")
+            print(f"\n{s1} | {s2}: cointegration = {'YES' if flag else 'NO'} | hedge={hedge:.4f} | half-life={hl} | p={p:.5f}")
+
+            # 2. Z-score test (spread)
+            spread = np.log(asset1 + abs(asset1.min()) + 1) - hedge * np.log(asset2 + abs(asset2.min()) + 1)
+            z_last = calculate_z_last(spread)
+            print(f"Z-score (last): {z_last:.3f}")
+
+            # 3. Beta vs BTC
+            if market_returns is not None:
+                pair_returns = pair_df.mean(axis=1).pct_change().dropna().values
+                aligned_len = min(len(pair_returns), len(market_returns))
+                beta = calculate_pair_beta(pair_returns[-aligned_len:], market_returns[-aligned_len:])
+                print(f"Beta vs BTCUSDT: {beta:.3f}")
+            else:
+                print("Beta vs BTCUSDT: N/A (BTC not found)")
+
         except Exception as e:
-            print(f"Colculate cointegration error: {e}")
+            print(f"Calculation error for {s1}-{s2}: {e}")
+
