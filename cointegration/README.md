@@ -115,3 +115,64 @@ Save trade logs, equity curves, and performance reports.
 - **Multi-timeframe analysis:** Explore cross-timeframe cointegration opportunities.  
 - **Trade management:** Test partial take-profits, trailing stops, and dynamic stop adjustments.  
 - **Integration:** Connect to Binance Futures WebSocket for real-time paper trading, then transition to live execution.
+
+
+
+
+
+ #**Beta Analysis** | **Concept Overview**
+
+In classical finance, the **Beta (β)** coefficient measures how strongly an asset’s returns move relative to the overall market.  
+It quantifies the *systematic risk* — the portion of total risk that cannot be diversified away.
+
+Mathematically, it is defined as:
+
+$$
+\beta = \frac{\mathrm{Cov}(R_i, R_m)}{\mathrm{Var}(R_m)}
+$$
+
+Where:
+
+- **Rᵢ** — returns of the individual asset  
+- **Rₘ** — returns of the market portfolio (e.g., S&P 500)  
+- **Cov(Rᵢ, Rₘ)** — covariance between the asset and the market  
+- **Var(Rₘ)** — variance of the market returns
+
+A high β (>1) indicates that the asset amplifies market movements,  
+while a low β (<1) means it moves less than the market.  
+A β close to 0 implies that the asset behaves independently of market swings — **market-neutral**.
+
+
+---
+
+**Application to Cryptocurrencies**
+
+In the cryptocurrency market, **Bitcoin (BTC)** plays the role of the *market benchmark*.  
+Hence, we can rewrite the same formula as:
+
+$$
+\beta_i = \frac{\mathrm{Cov}(r_i, r_{BTC})}{\mathrm{Var}(r_{BTC})}
+$$
+
+Where:
+
+- **rᵢ** — log returns of cryptocurrency *i*  
+- **r₍BTC₎** — log returns of Bitcoin  
+- **Cov(rᵢ, r₍BTC₎)** — covariance between the coin and Bitcoin  
+- **Var(r₍BTC₎)** — variance of Bitcoin’s returns
+
+This approach is inspired by the beta analysis framework presented in
+**[“Cryptocurrency market structure: beta, correlations and risk” (arXiv:1808.02505)](https://arxiv.org/pdf/1808.02505)**.
+
+
+---
+
+**Hypotheses**
+
+
+- **H₀:** There is **no significant dependence** between an altcoin’s returns and Bitcoin’s returns (β = 0).  
+- **H₁:** The altcoin’s returns are **significantly correlated** with Bitcoin’s returns (β > 0.5).  
+
+In practice, we are particularly interested in assets (or pairs) for which **β ≈ 0**,   indicating weak market dependence and suitability for **market-neutral hedging**.
+
+ 
