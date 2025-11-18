@@ -175,4 +175,25 @@ This approach is inspired by the beta analysis framework presented in
 
 In practice, we are particularly interested in assets (or pairs) for which **β ≈ 0**,   indicating weak market dependence and suitability for **market-neutral hedging**.
 
- 
+
+
+ <img width="1320" height="836" alt="image" src="https://github.com/user-attachments/assets/00d05e7b-6072-4496-93da-0f5aed3a6e72" />
+
+After calculating β for 247 cryptocurrencies relative to BTC:
+
+- Average β ≈ 1.25
+
+- Only **PAXGUSDT** has near-zero β (0.06)
+
+- A few (like **TRXUSDT**, **SUNUSDT**) have moderate β (0.4–0.6)
+
+- Most coins show β > 0.5, many even β > 1
+
+- Some (like **ADAUSDT**, **XRPUSDT**, **XLMUSDT**) reach β ≈ 2
+
+Conclusion
+
+We reject H₀ (no correlation).
+Altcoins show a **strong dependence** on BTC — they mostly move in the same direction and often with even higher volatility.
+
+Therefore, analyzing **beta** neutrality should be done on **pairs**, not on single coins.
