@@ -191,9 +191,29 @@ After calculating β for 247 cryptocurrencies relative to BTC:
 
 - Some (like **ADAUSDT**, **XRPUSDT**, **XLMUSDT**) reach β ≈ 2
 
+
+
 Conclusion
 
 We reject H₀ (no correlation).
 Altcoins show a **strong dependence** on BTC — they mostly move in the same direction and often with even higher volatility.
 
 Therefore, analyzing **beta** neutrality should be done on **pairs**, not on single coins.
+
+
+
+
+
+
+### 2 Position Sizing
+
+Based on the **identified cointegrated pairs** and the computed statistical parameters  
+(β — hedge ratio, z-score — deviation from equilibrium),  
+we can generate **market-neutral long/short trading signals**.
+
+The pipeline proceeds as follows:
+- **Volatility-based Position Sizing**
+- **Quantity Conversion**
+
+
+
