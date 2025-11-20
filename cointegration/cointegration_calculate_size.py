@@ -1,3 +1,7 @@
+import numpy as np
+
+
+
 def vol_parity_notional(log1, log2, hedge,  capital=1_000_000, max_notional_per_pair= 0.05, lookback=60):
     """Return dollar allocations for legs based on inverse realized vol (log returns)"""
 
@@ -27,3 +31,4 @@ def calculate_qty(dollar1, dollar2, price1, price2, capital=1_000_000, max_notio
     qty1 = dollar1 / price1 if price1 > 0 else 0.0
     qty2 = dollar2 / price2 if price2 > 0 else 0.0
     return float(qty1), float(qty2)
+
