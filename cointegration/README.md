@@ -215,5 +215,10 @@ The pipeline proceeds as follows:
 - **Volatility-based Position Sizing**
 - **Quantity Conversion**
 
+Calculates USD allocations for both legs of a pair using inverse realized volatility
+over a rolling window. Ensures that both sides contribute equally to total risk
+(“volatility parity” principle). 
 
-
+Converts dollar allocations into trade quantities while enforcing
+a maximum notional exposure per pair (e.g., 5% of capital).
+Prevents over-leverage and keeps exposure consistent.
