@@ -15,10 +15,7 @@ Unlike correlation, cointegration ensures a **stationary linear relationship** b
 This method naturally provides **hedging** since long and short positions offset each other, reducing exposure to overall market movements.
 
 
-
 ## ****Implementation Plan****
-
-
 
 
 
