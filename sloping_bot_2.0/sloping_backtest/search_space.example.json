@@ -1,0 +1,74 @@
+{
+  "length": {
+    "type": "int",
+    "min": 20,
+    "max": 100,
+    "step": 10
+  },
+  "atr_length": {
+    "type": "int",
+    "min": 7,
+    "max": 28,
+    "step": 7
+  },
+  "min_space": {
+    "type": "int",
+    "min": 3,
+    "max": 12,
+    "step": 3
+  },
+  "min_touches": {
+    "type": "int",
+    "min": 1,
+    "max": 3,
+    "step": 1
+  },
+  "breakout_buffer": {
+    "type": "float",
+    "min": 0.0,
+    "max": 0.3,
+    "step": 0.1
+  },
+  "take1": {
+    "type": "float",
+    "min": 0.5,
+    "max": 2.0,
+    "step": 0.25
+  },
+  "take2": {
+    "type": "float",
+    "min": 1.5,
+    "max": 4.0,
+    "step": 0.5
+  },
+  "stop": {
+    "type": "float",
+    "min": 0.5,
+    "max": 2.0,
+    "step": 0.25
+  },
+  "portion": {
+    "type": "float",
+    "min": 0.3,
+    "max": 0.7,
+    "step": 0.1
+  },
+  "risk_pct": {
+    "type": "float",
+    "min": 0.005,
+    "max": 0.02,
+    "step": 0.005
+  },
+  "slope_filter": {
+    "type": "bool"
+  },
+  "use_trend_filter": {
+    "type": "bool"
+  },
+  "trend_sma": {
+    "type": "int",
+    "min": 50,
+    "max": 200,
+    "step": 50
+  }
+}
