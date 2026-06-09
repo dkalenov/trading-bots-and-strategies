@@ -53,6 +53,10 @@ class ConfigInfo:
     stop_loss_ticks: int = 3
     leverage: int = 20
     enable_instant_exits: int = 1
+    enable_be: int = 1
+    be_trigger_pct: float = 0.25
+    be_offset_ticks: int = 1
+    score_threshold: int = 12
 
 
     def __init__(self, data):
