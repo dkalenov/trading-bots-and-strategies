@@ -57,6 +57,7 @@ class Position:
         self.atr = atr
         self.tp_price = None
         self.stop_price = None
+        self.be_activated = False
         # получаем базовый актив торговой пары (например BTC для BTCUSDT)
         for sym in all_symbols.values():
             if sym.symbol == symbol:
@@ -441,8 +442,8 @@ def get_liquidity_class(symbol):
     if vol_24h >= 100_000_000.0:
         return {"name": "Class B", "tp_pct": 0.3, "sl_pct": 0.18, "blocked": True}
     if vol_24h >= 10_000_000.0:
-        return {"name": "Class C", "tp_pct": 0.9, "sl_pct": 0.35, "blocked": False}
-    return {"name": "Class D", "tp_pct": 1.2, "sl_pct": 0.45, "blocked": False}
+        return {"name": "Class C", "tp_pct": 0.45, "sl_pct": 0.35, "blocked": False}
+    return {"name": "Class D", "tp_pct": 0.60, "sl_pct": 0.45, "blocked": False}
 
 
 def get_min_density_floor(symbol, bid_price):
@@ -469,6 +470,153 @@ def is_reward_risk_ok(entry_price, take_price, stop_price):
         return False, 0.0
     ratio = reward / risk
     return ratio >= MIN_REWARD_RISK_RATIO, ratio
+
+
+def calculate_density_score(symbol, bid_price, bid_volume, min_density_floor,
+                            lifetime_sec, refill_count, refill_ratio, absorption_ratio,
+                            buy_vol_5s, sell_vol_5s):
+    # 1. Size Score (Size of density relative to floor)
+    bid_val_usd = bid_price * bid_volume
+    if bid_val_usd >= min_density_floor * 2.0:
+        size_score = 4
+    elif bid_val_usd >= min_density_floor * 1.5:
+        size_score = 3
+    else:
+        size_score = 2
+
+    # 2. Lifetime Score
+    if lifetime_sec < 3.0:
+        lifetime_score = 0
+    elif lifetime_sec < 10.0:
+        lifetime_score = 1
+    elif lifetime_sec < 30.0:
+        lifetime_score = 2
+    elif lifetime_sec < 60.0:
+        lifetime_score = 3
+    else:
+        lifetime_score = 4
+
+    # 3. Refill Score
+    if refill_count == 0:
+        refill_score = 0
+    elif refill_count == 1:
+        refill_score = 2
+    elif refill_count == 2:
+        refill_score = 4
+    else:
+        refill_score = 6
+
+    # 4. Absorption Score
+    if absorption_ratio < 0.5:
+        absorption_score = 1
+    elif absorption_ratio < 1.0:
+        absorption_score = 2
+    elif absorption_ratio < 2.0:
+        absorption_score = 4
+    else:
+        absorption_score = 5
+
+    # 5. Delta Score (Tape confirmation)
+    if sell_vol_5s > 0:
+        delta_ratio = buy_vol_5s / sell_vol_5s
+    elif buy_vol_5s > 0:
+        delta_ratio = 999.0
+    else:
+        delta_ratio = 1.0
+
+    if delta_ratio > 1.2:
+        delta_score = 3
+    else:
+        delta_score = 0
+
+    total_score = size_score + lifetime_score + refill_score + absorption_score + delta_score
+    return total_score, {
+        "size": size_score,
+        "lifetime": lifetime_score,
+        "refill": refill_score,
+        "absorption": absorption_score,
+        "delta": delta_score
+    }
+
+
+async def check_and_apply_breakeven(symbol, current_price):
+    global positions
+    pos = positions.get(symbol)
+    if not pos or not isinstance(pos, Position) or not pos.status:
+        return
+        
+    # Check if BE is enabled and not yet activated for this trade
+    if not getattr(conf, 'enable_be', 0) == 1:
+        return
+    if getattr(pos, 'be_activated', False):
+        return
+        
+    entry_price = pos.entry_price
+    # Check if the price reached the trigger (+be_trigger_pct%)
+    trigger_pct = getattr(conf, 'be_trigger_pct', 0.25)
+    trigger_price = entry_price * (1 + trigger_pct / 100)
+    
+    if current_price >= trigger_price:
+        sym_info = all_symbols.get(symbol)
+        if not sym_info:
+            return
+            
+        tick_size = sym_info.tick_size
+        offset_ticks = getattr(conf, 'be_offset_ticks', 1)
+        new_stop_price = round(entry_price + (10 ** -tick_size) * offset_ticks, tick_size)
+        
+        # Prevent moving stop loss downwards if it was somehow higher
+        if pos.stop_price is not None and new_stop_price <= pos.stop_price:
+            return
+            
+        print(f"[Breakeven] Triggered for {symbol}: current {current_price} >= trigger {trigger_price:.6f}. Moving SL: {pos.stop_price} -> {new_stop_price}", flush=True)
+        
+        # Try updating stop price on Binance
+        if not conf.dry_run:
+            try:
+                # Cancel old SL
+                if getattr(pos, 'sl_order_id', None):
+                    print(f"[Breakeven] Cancelling old SL order {pos.sl_order_id} on Binance", flush=True)
+                    await client.cancel_order(symbol=symbol, orderId=pos.sl_order_id)
+                # Place new SL order
+                sl_order = await client.new_order(
+                    symbol=symbol,
+                    side='SELL',
+                    type='STOP_MARKET',
+                    stopPrice=utils.round_price(new_stop_price, sym_info.tick_size),
+                    closePosition='true'
+                )
+                pos.sl_order_id = sl_order.get('orderId')
+                print(f"[Breakeven] Placed new BE SL order on Binance: ID={pos.sl_order_id}", flush=True)
+            except Exception as e:
+                print(f"[Breakeven ERROR] Failed to adjust SL on Binance for {symbol}: {e}", flush=True)
+                # Don't fail the bot, we will retry or just keep tracking
+                return
+
+        # Update state in memory
+        pos.stop_price = new_stop_price
+        pos.be_activated = True
+        
+        # Update state in DB
+        try:
+            async with session() as s:
+                from sqlalchemy import select, update
+                # Find the open trade in DB and update its stop_price
+                db_trade = (await s.execute(select(db.Trades).where(db.Trades.symbol == symbol).where(db.Trades.status == 'OPEN').order_by(db.Trades.open_time.desc()).limit(1))).scalar_one_or_none()
+                if db_trade:
+                    db_trade.stop_price = new_stop_price
+                    await s.commit()
+                    print(f"[Breakeven] Updated stop_price to {new_stop_price} in DB for {symbol}", flush=True)
+        except Exception as e:
+            print(f"[Breakeven ERROR] Failed to update stop_price in DB: {e}", flush=True)
+            
+        # Send TG alert about Breakeven
+        try:
+            prefix = "🤖 [DRY RUN] " if conf.dry_run else ""
+            text = f"{prefix}Переставил Стоп-Лосс в безубыток по #{symbol} на цену <b>{new_stop_price}</b> (цена {current_price})"
+            asyncio.create_task(tg.bot.send_message(config.getint('TG', 'CHANNEL'), text))
+        except Exception as e:
+            print(f"[Breakeven TG Alert Error] {e}", flush=True)
 
 
 def clear_pending_entry(symbol):
@@ -684,6 +832,7 @@ async def msg_ticker(ws, msg):
                     # 2. Позиция открыта, проверяем достижение TP или SL
                     # Проверяем, готова ли запись в БД во избежание race condition
                     if getattr(pos, 'db_ready', False):
+                        await check_and_apply_breakeven(symbol, current_price)
                         try:
                             sym_info = all_symbols[symbol]
                             take_price = pos.tp_price if pos.tp_price is not None else get_tp_sl_prices(pos.entry_price, sym_info)[0]
@@ -761,7 +910,8 @@ async def delayed_exit(symbol, pos_obj):
         await close_position(symbol, limit_first=True)
 
 # функция для обработки плотности
-async def new_density(symbol, bid_price, bid_volume, ask_volume, num, sent_ns=None, event_time=None, best_bid=None, best_ask=None):
+async def new_density(symbol, bid_price, bid_volume, ask_volume, num, sent_ns=None, event_time=None, best_bid=None, best_ask=None,
+                      lifetime_sec=0.0, refill_count=0, refill_ratio=0.0, absorption_ratio=0.0, buy_vol_5s=0.0, sell_vol_5s=0.0):
     global positions
     global volumes_24h
     global last_prices
@@ -787,6 +937,12 @@ async def new_density(symbol, bid_price, bid_volume, ask_volume, num, sent_ns=No
                 "level": num,
                 "best_bid": best_bid,
                 "best_ask": best_ask,
+                "lifetime_sec": lifetime_sec,
+                "refill_count": refill_count,
+                "refill_ratio": refill_ratio,
+                "absorption_ratio": absorption_ratio,
+                "buy_vol_5s": buy_vol_5s,
+                "sell_vol_5s": sell_vol_5s
             }
         else:
             symbols_densities.pop(symbol, None)
@@ -1185,6 +1341,26 @@ async def open_position_delayed(symbol, bid_price):
     if not rr_ok:
         reject(f"reward/risk {rr:.2f} < {MIN_REWARD_RISK_RATIO:.2f}")
         return
+
+    # 5. РАСЧЕТ И ПРОВЕРКА DENSITY SCORE (v9)
+    lifetime_sec = density_info.get("lifetime_sec", 0.0)
+    refill_count = density_info.get("refill_count", 0)
+    refill_ratio = density_info.get("refill_ratio", 0.0)
+    absorption_ratio = density_info.get("absorption_ratio", 0.0)
+    buy_vol_5s = density_info.get("buy_vol_5s", 0.0)
+    sell_vol_5s = density_info.get("sell_vol_5s", 0.0)
+
+    score, breakdown = calculate_density_score(
+        symbol, live_density_price, live_bid_volume, candidate["min_density_floor"],
+        lifetime_sec, refill_count, refill_ratio, absorption_ratio, buy_vol_5s, sell_vol_5s
+    )
+
+    score_threshold = getattr(conf, "score_threshold", 12)
+    if score < score_threshold:
+        reject(f"low density score: {score} < {score_threshold} (Breakdown: {breakdown})")
+        return
+
+    print(f"[Score Confirm] {symbol}: confirmed score={score} (Size={breakdown['size']}, Life={breakdown['lifetime']}, Refill={breakdown['refill']}, Abs={breakdown['absorption']}, Delta={breakdown['delta']})", flush=True)
 
     candidate.update({
         "density_price": live_density_price,
@@ -1660,6 +1836,7 @@ async def check_positions():
                                     else:
                                         # 2. Позиция открыта, проверяем достижение TP или SL
                                         if getattr(pos, 'db_ready', False):
+                                            await check_and_apply_breakeven(sym, current_price)
                                             sym_info = all_symbols.get(sym)
                                             if not sym_info:
                                                 print(f"[ERROR] Symbol {sym} not found in all_symbols during check_positions!")
