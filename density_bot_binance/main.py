@@ -112,6 +112,12 @@ MAX_SPREAD_PCT = 0.05
 MAX_DROP_5M_PCT = -0.4
 MAX_DROP_15M_PCT = -0.7
 MIN_CONFIRM_RETAINED_RATIO = 0.7
+MAKER_FEE_RATE = 0.0002
+TAKER_FEE_RATE = 0.0005
+MIN_NET_REWARD_RISK_RATIO = 1.25
+MIN_OPPORTUNITY_SCORE_C = 5.5
+MIN_OPPORTUNITY_SCORE_D = 7.0
+MAX_ENTRY_DISTANCE_PCT = 0.50
 
 # Глобальные тренд-фильтры по BTC и ETH
 BTC_MAX_DROP_5M_PCT = -0.15
@@ -392,7 +398,7 @@ async def connect_ws():
     for s_list in symbols_lists:
         # создаем процесс
         proc = multiprocessing.Process(target=ob.run, args=(s_list, conf.depth, conf.ask_volume, main_queue,
-                                                            config.getboolean('BOT', 'TESTNET')))
+                                                            config.getboolean('BOT', 'TESTNET'), conf.min_density_num))
         # добавляем процесс в список
         processes.append(proc)
         # запускаем процесс
@@ -442,8 +448,8 @@ def get_liquidity_class(symbol):
     if vol_24h >= 100_000_000.0:
         return {"name": "Class B", "tp_pct": 0.3, "sl_pct": 0.18, "blocked": True}
     if vol_24h >= 10_000_000.0:
-        return {"name": "Class C", "tp_pct": 0.45, "sl_pct": 0.35, "blocked": False}
-    return {"name": "Class D", "tp_pct": 0.60, "sl_pct": 0.45, "blocked": False}
+        return {"name": "Class C", "tp_pct": 0.70, "sl_pct": 0.35, "blocked": False}
+    return {"name": "Class D", "tp_pct": 0.90, "sl_pct": 0.45, "blocked": False}
 
 
 def get_min_density_floor(symbol, bid_price):
@@ -470,6 +476,43 @@ def is_reward_risk_ok(entry_price, take_price, stop_price):
         return False, 0.0
     ratio = reward / risk
     return ratio >= MIN_REWARD_RISK_RATIO, ratio
+
+
+def estimate_net_reward_risk(entry_price, take_price, stop_price):
+    reward_pct = (take_price - entry_price) / entry_price * 100
+    risk_pct = (entry_price - stop_price) / entry_price * 100
+    net_reward_pct = reward_pct - (MAKER_FEE_RATE + MAKER_FEE_RATE) * 100
+    net_risk_pct = risk_pct + (MAKER_FEE_RATE + TAKER_FEE_RATE) * 100
+    if net_reward_pct <= 0 or net_risk_pct <= 0:
+        return False, 0.0, net_reward_pct, net_risk_pct
+    net_ratio = net_reward_pct / net_risk_pct
+    return net_ratio >= MIN_NET_REWARD_RISK_RATIO, net_ratio, net_reward_pct, net_risk_pct
+
+
+def is_maker_entry_safe(entry_price, best_ask, tick):
+    if best_ask is None:
+        return True, ""
+    if entry_price >= best_ask:
+        return False, f"entry {entry_price} would cross best ask {best_ask}"
+    if best_ask - entry_price < tick * 0.5:
+        return False, f"entry {entry_price} is too close to best ask {best_ask}"
+    return True, ""
+
+
+def get_spread_limit(class_name):
+    if class_name == "Class C":
+        return 0.08
+    if class_name == "Class D":
+        return 0.12
+    return MAX_SPREAD_PCT
+
+
+def get_opportunity_score_floor(class_name):
+    if class_name == "Class C":
+        return MIN_OPPORTUNITY_SCORE_C
+    if class_name == "Class D":
+        return MIN_OPPORTUNITY_SCORE_D
+    return MIN_OPPORTUNITY_SCORE_D
 
 
 def calculate_density_score(symbol, bid_price, bid_volume, min_density_floor,
@@ -657,7 +700,8 @@ async def get_atr_5m(symbol, limit=15):
 
 async def check_market_delta_anomaly(symbol):
     try:
-        trades = await client.agg_trades(symbol=symbol, limit=80)
+        # Fetch up to 1000 trades to capture a full 60-second window
+        trades = await client.agg_trades(symbol=symbol, limit=1000)
         if not trades:
             return False, 0.0
         
@@ -682,7 +726,18 @@ async def check_market_delta_anomaly(symbol):
         if not past_sells:
             return False, vol_10s
         
-        avg_past_10s = sum(past_sells) / 5.0
+        # Calculate adaptive baseline average for a 10-second window based on the actual history length available
+        oldest_time = int(trades[0]['T'])
+        if oldest_time > window_10s - 2000:
+            # Baseline window is less than 2 seconds, not enough history
+            return False, vol_10s
+            
+        if oldest_time > window_60s:
+            past_duration_ms = window_10s - oldest_time
+            avg_past_10s = sum(past_sells) * (10000.0 / past_duration_ms)
+        else:
+            avg_past_10s = sum(past_sells) / 5.0
+            
         if vol_10s > avg_past_10s * 3.5 and vol_10s > 0:
             print(f"[Delta Filter] Аномальные рыночные продажи по {symbol}: {vol_10s:.2f} > {avg_past_10s * 3.5:.2f} (норма: {avg_past_10s:.2f})")
             return True, vol_10s
@@ -693,7 +748,9 @@ async def check_market_delta_anomaly(symbol):
 
 
 def get_tp_sl_prices(entry_price, sym_info, atr=None):
-    atr = None # Reverted to v8.9 setup (fixed TP/SL, ignore ATR dynamic calculation)
+    # Dynamic ATR exits are deactivated to ensure a stable mathematical expectation;
+    # we enforce fixed TP/SL targets (Class C: 0.70%/0.35%, Class D: 0.90%/0.45%) instead.
+    atr = None
     symbol = sym_info.symbol
     profile = get_liquidity_class(symbol)
     if profile is None:
@@ -911,7 +968,10 @@ async def delayed_exit(symbol, pos_obj):
 
 # функция для обработки плотности
 async def new_density(symbol, bid_price, bid_volume, ask_volume, num, sent_ns=None, event_time=None, best_bid=None, best_ask=None,
-                      lifetime_sec=0.0, refill_count=0, refill_ratio=0.0, absorption_ratio=0.0, buy_vol_5s=0.0, sell_vol_5s=0.0):
+                      lifetime_sec=0.0, refill_count=0, refill_ratio=0.0, absorption_ratio=0.0,
+                      buy_vol_5s=0.0, sell_vol_5s=0.0, opportunity_score=0.0, book_imbalance=0.0,
+                      microprice_edge_pct=0.0, spread_pct_ob=0.0, distance_pct=0.0,
+                      density_ratio=0.0, wall_to_ask_ratio=0.0, delta_ratio=1.0):
     global positions
     global volumes_24h
     global last_prices
@@ -942,7 +1002,15 @@ async def new_density(symbol, bid_price, bid_volume, ask_volume, num, sent_ns=No
                 "refill_ratio": refill_ratio,
                 "absorption_ratio": absorption_ratio,
                 "buy_vol_5s": buy_vol_5s,
-                "sell_vol_5s": sell_vol_5s
+                "sell_vol_5s": sell_vol_5s,
+                "opportunity_score": opportunity_score,
+                "book_imbalance": book_imbalance,
+                "microprice_edge_pct": microprice_edge_pct,
+                "spread_pct": spread_pct_ob,
+                "distance_pct": distance_pct,
+                "density_ratio": density_ratio,
+                "wall_to_ask_ratio": wall_to_ask_ratio,
+                "delta_ratio": delta_ratio
             }
         else:
             symbols_densities.pop(symbol, None)
@@ -1100,6 +1168,8 @@ async def new_density(symbol, bid_price, bid_volume, ask_volume, num, sent_ns=No
         if num < 1 or num > conf.min_density_num:
             if num < 1:
                 print(f"[Фильтр стакана] Пропускаем {symbol}: плотность на лучшем bid (level 0), высокий риск taker-проскальзывания")
+            else:
+                print(f"[Фильтр стакана] Пропускаем {symbol}: плотность слишком глубоко (level {num} > {conf.min_density_num})")
             return
 
         # Получаем 24-часовой объем торгов
@@ -1112,32 +1182,10 @@ async def new_density(symbol, bid_price, bid_volume, ask_volume, num, sent_ns=No
             return
         vol_24h = volumes_24h.get(symbol, 0.0)
         
-        # Классификация монеты по ADV и расчет динамического лимита плотности
-        if vol_24h == 0.0:
-            # Если объем еще не загрузился, используем min_volume из конфига с запасом
-            min_density_floor = max(conf.min_volume, 15000.0)
-            class_name = "Unknown Class (fallback)"
-        elif vol_24h >= 1_000_000_000.0:  # Class A (>= $1B)
-            # Мажорные монеты с большим объемом HFT-спуфинга
-            print(f"[Фильтр ликвидности] Пропускаем {symbol}: Class A (24h vol: ${round(vol_24h, 2)}) - мажорная монета")
+        min_density_floor, class_name = get_min_density_floor(symbol, bid_price)
+        if min_density_floor is None:
+            print(f"[Фильтр ликвидности] Пропускаем {symbol}: {class_name} не подходит для density-bounce")
             return
-        elif vol_24h >= 100_000_000.0:  # Class B ($100M - $1B)
-            min_density_floor = 250_000.0
-            class_name = "Class B"
-        elif vol_24h >= 10_000_000.0:   # Class C ($10M - $100M)
-            min_density_floor = 30_000.0
-            class_name = "Class C"
-        else:                           # Class D (< $10M)
-            min_density_floor = 15_000.0
-            class_name = "Class D"
-
-        # Корректировка порога для дорогих монет (> $100):
-        # каждые $100 цены увеличивают требование к объему плиты.
-        # Пример: BCH @ $250 → ×2.5; LTC @ $50 → без изменений.
-        # Максимальный кап: $2M (избегаем исключения всего рынка).
-        if bid_price > 100.0:
-            price_factor = bid_price / 100.0
-            min_density_floor = min(min_density_floor * price_factor, 2_000_000.0)
 
         bid_val_usd = bid_price * bid_volume
         if bid_val_usd < min_density_floor:
@@ -1176,8 +1224,9 @@ async def new_density(symbol, bid_price, bid_volume, ask_volume, num, sent_ns=No
         # 2.5.6. ФИЛЬТР СПРЕДА (Защита от проскальзывания при широком спреде)
         if best_bid is not None and best_ask is not None:
             spread_pct = (best_ask - best_bid) / best_bid * 100
-            if spread_pct > MAX_SPREAD_PCT:
-                print(f"[Фильтр спреда] Пропускаем {symbol}: спред слишком широкий ({spread_pct:.3f}% > 0.05%)")
+            max_spread = get_spread_limit(class_name)
+            if spread_pct > max_spread:
+                print(f"[Фильтр спреда] Пропускаем {symbol}: спред слишком широкий ({spread_pct:.3f}% > {max_spread:.2f}%)")
                 return
         # если символ дал WR < 20% за последние 10 сделок -> пауза 30 мин
         if symbol in symbol_recent_trades:
@@ -1191,13 +1240,28 @@ async def new_density(symbol, bid_price, bid_volume, ask_volume, num, sent_ns=No
                     if elapsed_min < 30.0:
                         print(f"[WR Фильтр] Пропускаем {symbol}: WR за последние 10 сделок = {wr:.1f}% (< 20%), пауза {30.0 - elapsed_min:.1f} мин.")
                         return
+        # Фильтр максимальной дистанции до плотности (не более 0.6%)
+        current_price = last_prices.get(symbol, bid_price)
+        if current_price > bid_price * 1.006:
+            # Пропускаем без логирования во избежание спама для слишком глубоких плит
+            return
+        if distance_pct > MAX_ENTRY_DISTANCE_PCT:
+            print(f"[Alpha filter] Skip {symbol}: density too deep ({distance_pct:.3f}% > {MAX_ENTRY_DISTANCE_PCT:.2f}%)")
+            return
+        min_ob_score = get_opportunity_score_floor(class_name)
+        if opportunity_score < min_ob_score:
+            print(f"[Alpha filter] Skip {symbol}: opportunity_score {opportunity_score:.2f} < {min_ob_score:.2f} "
+                  f"(imb={book_imbalance:.2f}, micro={microprice_edge_pct:.4f}%, dist={distance_pct:.3f}%, delta={delta_ratio:.2f})")
+            return
+
         # если позиция по этой паре уже открыта, то пропускаем
         if symbol in positions:
             print(f"{symbol} {bid_price} уже открыта")
             return
-        # если уже открыто слишком много позиций, то пропускаем
-        if len(positions) >= conf.max_positions:
-            print(f"{symbol} {bid_price} уже открыто слишком много позиций")
+        # если уже открыто слишком много позиций, то пропускаем (считаем только реальные Position)
+        active_positions_count = sum(1 for p in positions.values() if isinstance(p, Position))
+        if active_positions_count >= conf.max_positions:
+            print(f"{symbol} {bid_price} уже открыто слишком много позиций (активных: {active_positions_count} >= {conf.max_positions})")
             return
         # проверка объема за 24 часа
         if symbol in volumes_24h:
@@ -1215,10 +1279,19 @@ async def new_density(symbol, bid_price, bid_volume, ask_volume, num, sent_ns=No
             print(f"[Entry filter] Skip {symbol}: symbol info is not loaded.")
             return
         expected_entry = round(bid_price + 10 ** -sym_info.tick_size, sym_info.tick_size)
+        maker_ok, maker_reason = is_maker_entry_safe(expected_entry, best_ask, 10 ** -sym_info.tick_size)
+        if not maker_ok:
+            print(f"[Maker guard] Skip {symbol}: {maker_reason}")
+            return
         expected_take, expected_stop = get_tp_sl_prices(expected_entry, sym_info)
         rr_ok, rr = is_reward_risk_ok(expected_entry, expected_take, expected_stop)
         if not rr_ok:
             print(f"[RR filter] Skip {symbol}: reward/risk {rr:.2f} < {MIN_REWARD_RISK_RATIO:.2f} (entry={expected_entry}, TP={expected_take}, SL={expected_stop})")
+            return
+        net_ok, net_rr, net_reward_pct, net_risk_pct = estimate_net_reward_risk(expected_entry, expected_take, expected_stop)
+        if not net_ok:
+            print(f"[Net RR filter] Skip {symbol}: net reward/risk {net_rr:.2f} < {MIN_NET_REWARD_RISK_RATIO:.2f} "
+                  f"(net +{net_reward_pct:.3f}% / -{net_risk_pct:.3f}%)")
             return
         pending_entry_confirmations[symbol] = {
             "density_price": bid_price,
@@ -1234,6 +1307,17 @@ async def new_density(symbol, bid_price, bid_volume, ask_volume, num, sent_ns=No
             "take_price": expected_take,
             "stop_price": expected_stop,
             "rr": rr,
+            "net_rr": net_rr,
+            "net_reward_pct": net_reward_pct,
+            "net_risk_pct": net_risk_pct,
+            "opportunity_score": opportunity_score,
+            "book_imbalance": book_imbalance,
+            "microprice_edge_pct": microprice_edge_pct,
+            "spread_pct": spread_pct_ob,
+            "distance_pct": distance_pct,
+            "density_ratio": density_ratio,
+            "wall_to_ask_ratio": wall_to_ask_ratio,
+            "delta_ratio": delta_ratio,
         }
         positions[symbol] = True
         # запускаем задачу открытия позиции
@@ -1294,14 +1378,29 @@ async def open_position_delayed(symbol, bid_price):
     live_best_ask = get_density_value(density_info, "best_ask", candidate.get("best_ask"))
     if live_best_bid and live_best_ask:
         spread_pct = (live_best_ask - live_best_bid) / live_best_bid * 100
-        if spread_pct > MAX_SPREAD_PCT:
-            reject(f"spread widened to {spread_pct:.3f}%")
+        class_name = candidate.get("class_name", "Class C")
+        max_spread = get_spread_limit(class_name)
+        if spread_pct > max_spread:
+            reject(f"spread widened to {spread_pct:.3f}% (max: {max_spread:.2f}%)")
             return
+    else:
+        class_name = candidate.get("class_name", "Class C")
 
-    # 2. ПРОВЕРКА БЛИЗОСТИ ЦЕНЫ (Защита от спуфинга: цена должна быть близко к плотности, в пределах 0.25%)
+    live_distance_pct = get_density_value(density_info, "distance_pct", candidate.get("distance_pct", 0.0))
+    if live_distance_pct > MAX_ENTRY_DISTANCE_PCT:
+        reject(f"density too deep after wait: {live_distance_pct:.3f}% > {MAX_ENTRY_DISTANCE_PCT:.2f}%")
+        return
+
+    live_opportunity_score = get_density_value(density_info, "opportunity_score", candidate.get("opportunity_score", 0.0))
+    min_ob_score = get_opportunity_score_floor(class_name)
+    if live_opportunity_score < min_ob_score:
+        reject(f"opportunity score decayed: {live_opportunity_score:.2f} < {min_ob_score:.2f}")
+        return
+
+    # 2. ПРОВЕРКА БЛИЗОСТИ ЦЕНЫ (Защита от спуфинга: цена должна быть близко к плотности, в пределах 0.50%)
     current_price = last_prices.get(symbol, live_best_bid or live_density_price)
-    if current_price > live_density_price * 1.0025:
-        reject(f"price is too far from density: {current_price} > {live_density_price * 1.0025:.6f} (potential spoofing)")
+    if current_price > live_density_price * 1.0050:
+        reject(f"price is too far from density: {current_price} > {live_density_price * 1.0050:.6f} (potential spoofing)")
         return
 
     # 3. ФИЛЬТР АНОМАЛЬНОГО УСКОРЕНИЯ ПРОДАЖ (Delta Z-Score)
@@ -1336,10 +1435,19 @@ async def open_position_delayed(symbol, bid_price):
         return
 
     entry_price = round(live_density_price + tick, sym_info.tick_size)
+    maker_ok, maker_reason = is_maker_entry_safe(entry_price, live_best_ask, tick)
+    if not maker_ok:
+        reject(f"maker guard failed: {maker_reason}")
+        return
     take_price, stop_price = get_tp_sl_prices(entry_price, sym_info, atr)
     rr_ok, rr = is_reward_risk_ok(entry_price, take_price, stop_price)
     if not rr_ok:
         reject(f"reward/risk {rr:.2f} < {MIN_REWARD_RISK_RATIO:.2f}")
+        return
+    net_ok, net_rr, net_reward_pct, net_risk_pct = estimate_net_reward_risk(entry_price, take_price, stop_price)
+    if not net_ok:
+        reject(f"net reward/risk {net_rr:.2f} < {MIN_NET_REWARD_RISK_RATIO:.2f} "
+               f"(net +{net_reward_pct:.3f}% / -{net_risk_pct:.3f}%)")
         return
 
     # 5. РАСЧЕТ И ПРОВЕРКА DENSITY SCORE (v9)
@@ -1355,12 +1463,17 @@ async def open_position_delayed(symbol, bid_price):
         lifetime_sec, refill_count, refill_ratio, absorption_ratio, buy_vol_5s, sell_vol_5s
     )
 
-    score_threshold = getattr(conf, "score_threshold", 12)
+    # Dynamic score threshold based on liquidity class: C=6 (active), D=10 (protective floor for thin coins)
+    score_threshold = 6 if class_name == "Class C" else 10 if class_name == "Class D" else getattr(conf, "score_threshold", 12)
     if score < score_threshold:
-        reject(f"low density score: {score} < {score_threshold} (Breakdown: {breakdown})")
+        reject(f"low density score: {score} < {score_threshold} (Breakdown: {breakdown}) (Class: {class_name})")
         return
 
-    print(f"[Score Confirm] {symbol}: confirmed score={score} (Size={breakdown['size']}, Life={breakdown['lifetime']}, Refill={breakdown['refill']}, Abs={breakdown['absorption']}, Delta={breakdown['delta']})", flush=True)
+    alpha_score = score + live_opportunity_score
+    print(f"[Score Confirm] {symbol}: confirmed score={score}, ob_score={live_opportunity_score:.2f}, "
+          f"alpha={alpha_score:.2f}, netRR={net_rr:.2f} "
+          f"(Size={breakdown['size']}, Life={breakdown['lifetime']}, Refill={breakdown['refill']}, "
+          f"Abs={breakdown['absorption']}, Delta={breakdown['delta']})", flush=True)
 
     candidate.update({
         "density_price": live_density_price,
@@ -1370,9 +1483,19 @@ async def open_position_delayed(symbol, bid_price):
         "take_price": take_price,
         "stop_price": stop_price,
         "rr": rr,
+        "net_rr": net_rr,
+        "net_reward_pct": net_reward_pct,
+        "net_risk_pct": net_risk_pct,
         "atr": atr,
+        "opportunity_score": live_opportunity_score,
+        "alpha_score": alpha_score,
+        "distance_pct": live_distance_pct,
+        "book_imbalance": get_density_value(density_info, "book_imbalance", candidate.get("book_imbalance", 0.0)),
+        "microprice_edge_pct": get_density_value(density_info, "microprice_edge_pct", candidate.get("microprice_edge_pct", 0.0)),
+        "delta_ratio": get_density_value(density_info, "delta_ratio", candidate.get("delta_ratio", 1.0)),
     })
-    print(f"[Entry Confirm] {symbol}: density confirmed after {ENTRY_CONFIRMATION_DELAY:.0f}s, RR={rr:.2f}. Entering near {live_density_price}.", flush=True)
+    print(f"[Entry Confirm] {symbol}: density confirmed after {ENTRY_CONFIRMATION_DELAY:.0f}s, "
+          f"RR={rr:.2f}, netRR={net_rr:.2f}. Entering near {live_density_price}.", flush=True)
     await open_position(symbol, live_density_price, atr)
     return
 
@@ -1382,6 +1505,14 @@ async def open_position(symbol, bid_price, atr=None):
     global positions
     print(f"Открытие позиции по {symbol} цена {bid_price}")
     try:
+        # Double check position limit before placing order
+        active_positions_count = sum(1 for p in positions.values() if isinstance(p, Position))
+        if active_positions_count >= conf.max_positions:
+            print(f"[Entry] {symbol}: cancel opening. Too many active positions already: {active_positions_count} >= {conf.max_positions}")
+            positions.pop(symbol, None)
+            clear_pending_entry(symbol)
+            return
+
         # получаем информацию о паре
         sym_info = all_symbols.get(symbol)
         if not sym_info:
@@ -1398,10 +1529,25 @@ async def open_position(symbol, bid_price, atr=None):
             return
         # расчитываем цену входа (нам нужно выставить цену лимитки большую на 1 шаг цены)
         entry_price = round(bid_price + 10 ** -sym_info.tick_size, sym_info.tick_size)
+        live_density_info = symbols_densities.get(symbol, {})
+        live_best_ask = get_density_value(live_density_info, "best_ask", pending_snapshot.get("best_ask"))
+        maker_ok, maker_reason = is_maker_entry_safe(entry_price, live_best_ask, 10 ** -sym_info.tick_size)
+        if not maker_ok:
+            print(f"[Maker guard] Skip {symbol} at order placement: {maker_reason}")
+            positions.pop(symbol, None)
+            clear_pending_entry(symbol)
+            return
         take_price, stop_price = get_tp_sl_prices(entry_price, sym_info, atr)
         rr_ok, rr = is_reward_risk_ok(entry_price, take_price, stop_price)
         if not rr_ok:
             print(f"[RR filter] Skip {symbol}: reward/risk {rr:.2f} < {MIN_REWARD_RISK_RATIO:.2f} at order placement.")
+            positions.pop(symbol, None)
+            clear_pending_entry(symbol)
+            return
+        net_ok, net_rr, net_reward_pct, net_risk_pct = estimate_net_reward_risk(entry_price, take_price, stop_price)
+        if not net_ok:
+            print(f"[Net RR filter] Skip {symbol}: net reward/risk {net_rr:.2f} < {MIN_NET_REWARD_RISK_RATIO:.2f} at order placement "
+                  f"(net +{net_reward_pct:.3f}% / -{net_risk_pct:.3f}%).")
             positions.pop(symbol, None)
             clear_pending_entry(symbol)
             return
