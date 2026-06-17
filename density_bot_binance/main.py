@@ -58,6 +58,10 @@ class Position:
         self.tp_price = None
         self.stop_price = None
         self.be_activated = False
+        self.entry_model = "legacy_pre_touch"
+        self.disable_breakeven = False
+        self.created_time = time.time()
+        self.entry_timeout_seconds = None
         # получаем базовый актив торговой пары (например BTC для BTCUSDT)
         for sym in all_symbols.values():
             if sym.symbol == symbol:
@@ -101,6 +105,7 @@ userdata_ws = None
 # словарь для хранения исходов последних сделок по каждому символу (v8.3+)
 # формат: {symbol: [(close_time_ms, is_win), ...]}
 symbol_recent_trades = {}
+symbol_full_stop_times = {}
 pending_entry_confirmations = {}
 
 
@@ -111,13 +116,33 @@ MIN_REWARD_RISK_RATIO = 1.5
 MAX_SPREAD_PCT = 0.05
 MAX_DROP_5M_PCT = -0.4
 MAX_DROP_15M_PCT = -0.7
-MIN_CONFIRM_RETAINED_RATIO = 0.7
+MIN_CONFIRM_RETAINED_RATIO = 0.8
 MAKER_FEE_RATE = 0.0002
 TAKER_FEE_RATE = 0.0005
 MIN_NET_REWARD_RISK_RATIO = 1.25
 MIN_OPPORTUNITY_SCORE_C = 5.5
 MIN_OPPORTUNITY_SCORE_D = 7.0
 MAX_ENTRY_DISTANCE_PCT = 0.50
+MIN_ENTRY_DENSITY_LIFETIME_SECONDS = 10.0
+MIN_DENSITY_SCORE_C = 6
+MIN_DENSITY_SCORE_D = 7
+MIN_ENTRY_BOOK_IMBALANCE = -0.10
+MIN_ENTRY_MICROPRICE_EDGE_PCT = -0.006
+MIN_ENTRY_DELTA_RATIO = 0.75
+FULL_STOP_COOLDOWN_MINUTES = 30.0
+FULL_STOP_MIN_LOSS_USDT = 0.015
+FULL_STOP_MIN_LOSS_PCT = 0.20
+STRATEGY_RELEASE = "v10.0-touch-reclaim-research"
+STRATEGY_VALIDATED_FOR_LIVE = False
+TOUCH_RECLAIM_ARM_TIMEOUT_SECONDS = 30.0
+TOUCH_RECLAIM_TIMEOUT_SECONDS = 10.0
+TOUCH_RECLAIM_MIN_DELAY_SECONDS = 0.25
+TOUCH_RECLAIM_RETAINED_RATIO = 0.60
+TOUCH_DISTANCE_PCT = 0.03
+RECLAIM_DISTANCE_PCT = 0.05
+RESEARCH_TAKE_PROFIT_PCT = 0.30
+RESEARCH_STOP_LOSS_PCT = 0.30
+RESEARCH_ENTRY_TIMEOUT_SECONDS = 5.0
 
 # Глобальные тренд-фильтры по BTC и ETH
 BTC_MAX_DROP_5M_PCT = -0.15
@@ -150,6 +175,7 @@ def instant_exits_enabled():
 # функция для инициализации кэша истории сделок (v8.3+)
 async def init_trade_history_cache():
     global symbol_recent_trades
+    global symbol_full_stop_times
     print("[Бот] Инициализация кэша истории сделок...")
     try:
         async with session() as s:
@@ -168,6 +194,8 @@ async def init_trade_history_cache():
                 symbol_recent_trades[t.symbol].append((t.close_time, is_win))
                 if len(symbol_recent_trades[t.symbol]) > 10:
                     symbol_recent_trades[t.symbol].pop(0)
+                if is_full_stop(t.status, t.profit, t.order_size):
+                    symbol_full_stop_times[t.symbol] = t.close_time
         print(f"[Бот] Кэш истории сделок успешно загружен. Найдено монет с историей: {len(symbol_recent_trades)}")
     except Exception as e:
         print(f"[Бот] Ошибка при инициализации кэша истории сделок: {e}")
@@ -189,6 +217,10 @@ async def main():
     conf = await db.load_config()
     print(f"[Бот] Конфигурация загружена. Режим торговли: {'Включен' if conf.trade_mode else 'Выключен'}. Режим симуляции (Dry Run): {'Да' if conf.dry_run else 'Нет'}.")
     # создаем клиент
+    print(
+        f"[Release] {STRATEGY_RELEASE}; "
+        f"live entries={'enabled' if STRATEGY_VALIDATED_FOR_LIVE else 'blocked'}."
+    )
     client = binance.Futures(conf.api_key, conf.api_secret, asynced=True,
                           testnet=config.getboolean('BOT', 'TESTNET'))
     # загружаем все символы
@@ -515,6 +547,54 @@ def get_opportunity_score_floor(class_name):
     return MIN_OPPORTUNITY_SCORE_D
 
 
+def get_density_score_floor(class_name):
+    if class_name == "Class C":
+        return MIN_DENSITY_SCORE_C
+    if class_name == "Class D":
+        return MIN_DENSITY_SCORE_D
+    return getattr(conf, "score_threshold", 12)
+
+
+def get_microstructure_rejection(book_imbalance, microprice_edge_pct,
+                                 buy_vol_5s, sell_vol_5s, delta_ratio):
+    if book_imbalance < MIN_ENTRY_BOOK_IMBALANCE:
+        return (
+            f"bearish book imbalance {book_imbalance:.2f} "
+            f"< {MIN_ENTRY_BOOK_IMBALANCE:.2f}"
+        )
+    if microprice_edge_pct < MIN_ENTRY_MICROPRICE_EDGE_PCT:
+        return (
+            f"bearish microprice edge {microprice_edge_pct:.4f}% "
+            f"< {MIN_ENTRY_MICROPRICE_EDGE_PCT:.4f}%"
+        )
+    if sell_vol_5s > buy_vol_5s and delta_ratio < MIN_ENTRY_DELTA_RATIO:
+        return (
+            f"sell flow dominates: delta {delta_ratio:.2f} "
+            f"< {MIN_ENTRY_DELTA_RATIO:.2f}"
+        )
+    return None
+
+
+def is_full_stop(status, profit, order_size):
+    if status != 'CLOSED_STOP' or profit is None:
+        return False
+    loss_threshold = max(
+        FULL_STOP_MIN_LOSS_USDT,
+        abs(order_size or 0.0) * FULL_STOP_MIN_LOSS_PCT / 100.0,
+    )
+    return profit <= -loss_threshold
+
+
+def get_full_stop_cooldown_minutes(symbol, now_ms=None):
+    last_full_stop = symbol_full_stop_times.get(symbol)
+    if not last_full_stop:
+        return 0.0
+    if now_ms is None:
+        now_ms = utils.get_ts()
+    elapsed_minutes = max(0.0, (now_ms - last_full_stop) / 60000.0)
+    return max(0.0, FULL_STOP_COOLDOWN_MINUTES - elapsed_minutes)
+
+
 def calculate_density_score(symbol, bid_price, bid_volume, min_density_floor,
                             lifetime_sec, refill_count, refill_ratio, absorption_ratio,
                             buy_vol_5s, sell_vol_5s):
@@ -550,7 +630,9 @@ def calculate_density_score(symbol, bid_price, bid_volume, min_density_floor,
         refill_score = 6
 
     # 4. Absorption Score
-    if absorption_ratio < 0.5:
+    if absorption_ratio <= 0.0:
+        absorption_score = 0
+    elif absorption_ratio < 0.5:
         absorption_score = 1
     elif absorption_ratio < 1.0:
         absorption_score = 2
@@ -586,6 +668,8 @@ async def check_and_apply_breakeven(symbol, current_price):
     global positions
     pos = positions.get(symbol)
     if not pos or not isinstance(pos, Position) or not pos.status:
+        return
+    if getattr(pos, "disable_breakeven", False):
         return
         
     # Check if BE is enabled and not yet activated for this trade
@@ -678,6 +762,32 @@ def get_density_value(density_info, key, default=None):
     if isinstance(density_info, dict):
         return density_info.get(key, default)
     return default
+
+
+def get_touch_reclaim_prices(entry_price, sym_info):
+    tick = 10 ** -sym_info.tick_size
+    take_price = max(
+        round(
+            entry_price * (1 + RESEARCH_TAKE_PROFIT_PCT / 100),
+            sym_info.tick_size,
+        ),
+        round(entry_price + tick, sym_info.tick_size),
+    )
+    stop_price = min(
+        round(
+            entry_price * (1 - RESEARCH_STOP_LOSS_PCT / 100),
+            sym_info.tick_size,
+        ),
+        round(entry_price - tick, sym_info.tick_size),
+    )
+    return take_price, stop_price
+
+
+def apply_entry_snapshot(pos, snapshot):
+    pos.entry_model = snapshot.get("entry_model", "legacy_pre_touch")
+    pos.disable_breakeven = bool(snapshot.get("disable_breakeven", False))
+    pos.created_time = time.time()
+    pos.entry_timeout_seconds = snapshot.get("entry_timeout_seconds")
 
 
 async def get_atr_5m(symbol, limit=15):
@@ -1198,6 +1308,14 @@ async def new_density(symbol, bid_price, bid_volume, ask_volume, num, sent_ns=No
         if symbol in conf.blacklist:
             print(f"{symbol} в черном списке")
             return
+
+        cooldown_minutes = get_full_stop_cooldown_minutes(symbol)
+        if cooldown_minutes > 0:
+            print(
+                f"[Full-stop cooldown] Skip {symbol}: "
+                f"{cooldown_minutes:.1f} minutes remain after a full stop."
+            )
+            return
             
         # Глобальный фильтр тренда BTC/ETH
         btc_price = last_prices.get('BTCUSDT')
@@ -1252,6 +1370,13 @@ async def new_density(symbol, bid_price, bid_volume, ask_volume, num, sent_ns=No
         if opportunity_score < min_ob_score:
             print(f"[Alpha filter] Skip {symbol}: opportunity_score {opportunity_score:.2f} < {min_ob_score:.2f} "
                   f"(imb={book_imbalance:.2f}, micro={microprice_edge_pct:.4f}%, dist={distance_pct:.3f}%, delta={delta_ratio:.2f})")
+            return
+        microstructure_rejection = get_microstructure_rejection(
+            book_imbalance, microprice_edge_pct,
+            buy_vol_5s, sell_vol_5s, delta_ratio,
+        )
+        if microstructure_rejection:
+            print(f"[Alpha veto] Skip {symbol}: {microstructure_rejection}")
             return
 
         # если позиция по этой паре уже открыта, то пропускаем
@@ -1367,8 +1492,12 @@ async def open_position_delayed(symbol, bid_price):
     live_value_usd = live_density_price * live_bid_volume
     
     # 1. КОНТРОЛЬ ОСТАТОЧНОГО ОБЪЕМА (Снижение объема не более чем на 20%)
-    if live_bid_volume < candidate["bid_volume"] * 0.8:
-        reject(f"density volume dropped {live_bid_volume:.6f} < {candidate['bid_volume'] * 0.8:.6f} (eaten/canceled)")
+    min_retained_volume = candidate["bid_volume"] * MIN_CONFIRM_RETAINED_RATIO
+    if live_bid_volume < min_retained_volume:
+        reject(
+            f"density volume dropped {live_bid_volume:.6f} "
+            f"< {min_retained_volume:.6f} (eaten/canceled)"
+        )
         return
     if live_value_usd < candidate["min_density_floor"]:
         reject(f"density value ${live_value_usd:.2f} below floor ${candidate['min_density_floor']:.2f}")
@@ -1457,14 +1586,38 @@ async def open_position_delayed(symbol, bid_price):
     absorption_ratio = density_info.get("absorption_ratio", 0.0)
     buy_vol_5s = density_info.get("buy_vol_5s", 0.0)
     sell_vol_5s = density_info.get("sell_vol_5s", 0.0)
+    live_book_imbalance = get_density_value(
+        density_info, "book_imbalance", candidate.get("book_imbalance", 0.0)
+    )
+    live_microprice_edge_pct = get_density_value(
+        density_info, "microprice_edge_pct", candidate.get("microprice_edge_pct", 0.0)
+    )
+    live_delta_ratio = get_density_value(
+        density_info, "delta_ratio", candidate.get("delta_ratio", 1.0)
+    )
+
+    if lifetime_sec < MIN_ENTRY_DENSITY_LIFETIME_SECONDS:
+        reject(
+            f"density lifetime {lifetime_sec:.1f}s "
+            f"< {MIN_ENTRY_DENSITY_LIFETIME_SECONDS:.1f}s"
+        )
+        return
+
+    microstructure_rejection = get_microstructure_rejection(
+        live_book_imbalance, live_microprice_edge_pct,
+        buy_vol_5s, sell_vol_5s, live_delta_ratio,
+    )
+    if microstructure_rejection:
+        reject(microstructure_rejection)
+        return
 
     score, breakdown = calculate_density_score(
         symbol, live_density_price, live_bid_volume, candidate["min_density_floor"],
         lifetime_sec, refill_count, refill_ratio, absorption_ratio, buy_vol_5s, sell_vol_5s
     )
 
-    # Dynamic score threshold based on liquidity class: C=6 (active), D=10 (protective floor for thin coins)
-    score_threshold = 6 if class_name == "Class C" else 10 if class_name == "Class D" else getattr(conf, "score_threshold", 12)
+    # Class C needs more than size alone; Class D keeps the existing protective floor.
+    score_threshold = get_density_score_floor(class_name)
     if score < score_threshold:
         reject(f"low density score: {score} < {score_threshold} (Breakdown: {breakdown}) (Class: {class_name})")
         return
@@ -1490,17 +1643,137 @@ async def open_position_delayed(symbol, bid_price):
         "opportunity_score": live_opportunity_score,
         "alpha_score": alpha_score,
         "distance_pct": live_distance_pct,
-        "book_imbalance": get_density_value(density_info, "book_imbalance", candidate.get("book_imbalance", 0.0)),
-        "microprice_edge_pct": get_density_value(density_info, "microprice_edge_pct", candidate.get("microprice_edge_pct", 0.0)),
-        "delta_ratio": get_density_value(density_info, "delta_ratio", candidate.get("delta_ratio", 1.0)),
+        "book_imbalance": live_book_imbalance,
+        "microprice_edge_pct": live_microprice_edge_pct,
+        "delta_ratio": live_delta_ratio,
     })
     print(f"[Entry Confirm] {symbol}: density confirmed after {ENTRY_CONFIRMATION_DELAY:.0f}s, "
-          f"RR={rr:.2f}, netRR={net_rr:.2f}. Entering near {live_density_price}.", flush=True)
-    await open_position(symbol, live_density_price, atr)
+          f"RR={rr:.2f}, netRR={net_rr:.2f}. Arming touch/reclaim at {live_density_price}.", flush=True)
+    await wait_for_touch_reclaim_entry(symbol, candidate, atr)
     return
 
 
 # функция для открытия позиции
+async def wait_for_touch_reclaim_entry(symbol, candidate, atr=None):
+    sym_info = all_symbols.get(symbol)
+    if not sym_info:
+        positions.pop(symbol, None)
+        clear_pending_entry(symbol)
+        return
+
+    tick = 10 ** -sym_info.tick_size
+    wall_price = candidate["density_price"]
+    initial_volume = candidate["bid_volume"]
+    arm_started = time.monotonic()
+    touched_at = None
+
+    def reject(reason):
+        print(f"[Touch/Reclaim] {symbol}: {reason}. Entry cancelled.", flush=True)
+        positions.pop(symbol, None)
+        clear_pending_entry(symbol)
+
+    print(
+        f"[Touch/Reclaim] {symbol}: armed at wall {wall_price}; "
+        "waiting for a real test before placing an order.",
+        flush=True,
+    )
+
+    while True:
+        if positions.get(symbol) is not True:
+            if positions.get(symbol) == "CANCEL_PENDING":
+                positions.pop(symbol, None)
+            clear_pending_entry(symbol)
+            return
+
+        now = time.monotonic()
+        if now - arm_started > TOUCH_RECLAIM_ARM_TIMEOUT_SECONDS:
+            reject("wall was not tested before arm timeout")
+            return
+
+        density_info = symbols_densities.get(symbol)
+        live_wall_price, _ = get_density_price_ts(density_info)
+        if live_wall_price is None or abs(live_wall_price - wall_price) > tick / 2:
+            reject("original wall disappeared or moved")
+            return
+
+        live_volume = get_density_value(density_info, "volume", 0.0)
+        if live_volume < initial_volume * TOUCH_RECLAIM_RETAINED_RATIO:
+            reject(
+                f"wall retained only {live_volume / initial_volume:.1%} "
+                f"(< {TOUCH_RECLAIM_RETAINED_RATIO:.0%})"
+            )
+            return
+
+        best_bid = get_density_value(density_info, "best_bid")
+        best_ask = get_density_value(density_info, "best_ask")
+        if best_bid is None or best_ask is None:
+            await asyncio.sleep(0.05)
+            continue
+
+        if touched_at is None:
+            touch_price = wall_price * (1 + TOUCH_DISTANCE_PCT / 100)
+            if best_ask <= touch_price:
+                touched_at = now
+                candidate["touch_ts"] = utils.get_ts()
+                print(
+                    f"[Touch/Reclaim] {symbol}: wall tested; "
+                    f"best_ask={best_ask}, wall={wall_price}.",
+                    flush=True,
+                )
+            await asyncio.sleep(0.05)
+            continue
+
+        touch_age = now - touched_at
+        if touch_age > TOUCH_RECLAIM_TIMEOUT_SECONDS:
+            reject("price did not reclaim quickly enough after touch")
+            return
+
+        reclaim_price = wall_price * (1 + RECLAIM_DISTANCE_PCT / 100)
+        if (
+            touch_age >= TOUCH_RECLAIM_MIN_DELAY_SECONDS
+            and best_bid >= reclaim_price
+        ):
+            maker_price = min(best_bid, best_ask - tick)
+            maker_price = round(maker_price, sym_info.tick_size)
+            if maker_price <= wall_price:
+                reject("reclaim did not create a maker entry above the wall")
+                return
+            maker_ok, maker_reason = is_maker_entry_safe(
+                maker_price,
+                best_ask,
+                tick,
+            )
+            if not maker_ok:
+                reject(f"maker guard failed after reclaim: {maker_reason}")
+                return
+
+            take_price, stop_price = get_touch_reclaim_prices(
+                maker_price,
+                sym_info,
+            )
+            candidate.update({
+                "entry_model": "touch_reclaim_v10_research",
+                "entry_price": maker_price,
+                "take_price": take_price,
+                "stop_price": stop_price,
+                "disable_breakeven": True,
+                "entry_timeout_seconds": RESEARCH_ENTRY_TIMEOUT_SECONDS,
+                "touch_to_reclaim_ms": round(touch_age * 1000),
+                "reclaim_best_bid": best_bid,
+                "reclaim_best_ask": best_ask,
+            })
+            print(
+                f"[Touch/Reclaim] {symbol}: reclaim confirmed in "
+                f"{touch_age:.3f}s; maker={maker_price}, "
+                f"TP={take_price}, SL={stop_price}.",
+                flush=True,
+            )
+            await open_position(symbol, wall_price, atr)
+            return
+
+        await asyncio.sleep(0.05)
+
+
 async def open_position(symbol, bid_price, atr=None):
     global positions
     print(f"Открытие позиции по {symbol} цена {bid_price}")
@@ -1521,6 +1794,15 @@ async def open_position(symbol, bid_price, atr=None):
             clear_pending_entry(symbol)
             return
         pending_snapshot = pending_entry_confirmations.get(symbol, {})
+        if not conf.dry_run and not STRATEGY_VALIDATED_FOR_LIVE:
+            print(
+                f"[Release guard] Blocked real entry for {symbol}: "
+                f"{STRATEGY_RELEASE} has no positive out-of-sample validation.",
+                flush=True,
+            )
+            positions.pop(symbol, None)
+            clear_pending_entry(symbol)
+            return
         profile = get_liquidity_class(symbol)
         if profile is None or profile["blocked"]:
             print(f"[Entry filter] Skip {symbol}: liquidity profile is unavailable or blocked.")
@@ -1528,7 +1810,12 @@ async def open_position(symbol, bid_price, atr=None):
             clear_pending_entry(symbol)
             return
         # расчитываем цену входа (нам нужно выставить цену лимитки большую на 1 шаг цены)
-        entry_price = round(bid_price + 10 ** -sym_info.tick_size, sym_info.tick_size)
+        entry_price = pending_snapshot.get("entry_price")
+        if entry_price is None:
+            entry_price = round(
+                bid_price + 10 ** -sym_info.tick_size,
+                sym_info.tick_size,
+            )
         live_density_info = symbols_densities.get(symbol, {})
         live_best_ask = get_density_value(live_density_info, "best_ask", pending_snapshot.get("best_ask"))
         maker_ok, maker_reason = is_maker_entry_safe(entry_price, live_best_ask, 10 ** -sym_info.tick_size)
@@ -1537,20 +1824,38 @@ async def open_position(symbol, bid_price, atr=None):
             positions.pop(symbol, None)
             clear_pending_entry(symbol)
             return
-        take_price, stop_price = get_tp_sl_prices(entry_price, sym_info, atr)
+        is_touch_reclaim = (
+            pending_snapshot.get("entry_model")
+            == "touch_reclaim_v10_research"
+        )
+        if is_touch_reclaim:
+            take_price = pending_snapshot["take_price"]
+            stop_price = pending_snapshot["stop_price"]
+        else:
+            take_price, stop_price = get_tp_sl_prices(
+                entry_price,
+                sym_info,
+                atr,
+            )
         rr_ok, rr = is_reward_risk_ok(entry_price, take_price, stop_price)
-        if not rr_ok:
+        if not rr_ok and not is_touch_reclaim:
             print(f"[RR filter] Skip {symbol}: reward/risk {rr:.2f} < {MIN_REWARD_RISK_RATIO:.2f} at order placement.")
             positions.pop(symbol, None)
             clear_pending_entry(symbol)
             return
         net_ok, net_rr, net_reward_pct, net_risk_pct = estimate_net_reward_risk(entry_price, take_price, stop_price)
-        if not net_ok:
+        if not net_ok and not is_touch_reclaim:
             print(f"[Net RR filter] Skip {symbol}: net reward/risk {net_rr:.2f} < {MIN_NET_REWARD_RISK_RATIO:.2f} at order placement "
                   f"(net +{net_reward_pct:.3f}% / -{net_risk_pct:.3f}%).")
             positions.pop(symbol, None)
             clear_pending_entry(symbol)
             return
+        if is_touch_reclaim:
+            print(
+                f"[Research entry] {symbol}: direct TP model, "
+                f"net reward/risk={net_rr:.2f}; dry-run only.",
+                flush=True,
+            )
         density_volume = pending_snapshot.get("bid_volume", 0.0)
         # расчитываем объем входа на основе order_size
         quantity = utils.round_down(conf.order_size / entry_price, sym_info.step_size)
@@ -1571,6 +1876,7 @@ async def open_position(symbol, bid_price, atr=None):
                 return
                 
             pos = Position(symbol, quantity, entry_price, bid_price, density_volume, atr)
+            apply_entry_snapshot(pos, pending_snapshot)
             pos.order_id = order_id
             pos.tp_price = take_price
             pos.stop_price = stop_price
@@ -1603,6 +1909,7 @@ async def open_position(symbol, bid_price, atr=None):
                         if e.error_code == -2011:
                             print(f"Не удалось отменить ордер {order_id} по {symbol}: ордер уже исполнен (Error -2011). Сохраняем позицию для отслеживания.")
                             pos = Position(symbol, quantity, entry_price, bid_price, density_volume, atr)
+                            apply_entry_snapshot(pos, pending_snapshot)
                             pos.order_id = order_id
                             pos.tp_price = take_price
                             pos.stop_price = stop_price
@@ -1615,6 +1922,7 @@ async def open_position(symbol, bid_price, atr=None):
                     return
                 
                 pos = Position(symbol, quantity, entry_price, bid_price, density_volume, atr)
+                apply_entry_snapshot(pos, pending_snapshot)
                 pos.order_id = order_id
                 pos.tp_price = take_price
                 pos.stop_price = stop_price
@@ -1661,6 +1969,7 @@ async def msg_userdata(ws, msg):
                                 candidate.get("density_price", avg_price),
                                 candidate.get("bid_volume", 0.0),
                             )
+                            apply_entry_snapshot(pos, candidate)
                             pos.tp_price = candidate.get("take_price")
                             pos.stop_price = candidate.get("stop_price")
                             pos.qty = qty
@@ -1820,6 +2129,7 @@ async def set_stop_take(symbol, entry_price, quantity, atr=None):
 
 # функция для обработки закрытия позиции
 async def trade_closed(msg, pos):
+    global symbol_full_stop_times
     # Дожидаемся окончания отправки сообщения об открытии (если сделка закрылась очень быстро)
     if pos is not None and getattr(pos, 'tg_task', None) is not None:
         try:
@@ -1893,6 +2203,13 @@ async def trade_closed(msg, pos):
         # Обновляем кэш исходов сделок (v8.3+)
         close_time = trade.close_time or utils.get_ts()
         is_win = (trade.profit is not None and trade.profit > 0)
+        if is_full_stop(trade.status, trade.profit, trade.order_size):
+            symbol_full_stop_times[trade.symbol] = close_time
+            print(
+                f"[Full-stop cooldown] {trade.symbol}: new entries blocked for "
+                f"{FULL_STOP_COOLDOWN_MINUTES:.0f} minutes.",
+                flush=True,
+            )
         if trade.symbol not in symbol_recent_trades:
             symbol_recent_trades[trade.symbol] = []
         symbol_recent_trades[trade.symbol].append((close_time, is_win))
@@ -2018,7 +2335,25 @@ async def check_positions():
                         if not pos.status:
                             density = symbols_densities.get(pos.symbol)
                             density_price, density_ts = get_density_price_ts(density)
-                            if density_price is None or pos.density != density_price or utils.get_ts() - density_ts > conf.entry_timeout * 1000:
+                            entry_timeout_seconds = (
+                                pos.entry_timeout_seconds
+                                if getattr(pos, "entry_timeout_seconds", None)
+                                is not None
+                                else conf.entry_timeout
+                            )
+                            entry_expired = (
+                                time.time() - getattr(
+                                    pos,
+                                    "created_time",
+                                    time.time(),
+                                )
+                                > entry_timeout_seconds
+                            )
+                            if (
+                                density_price is None
+                                or pos.density != density_price
+                                or entry_expired
+                            ):
                                 print(f"Cancel stale entry limit for {pos.symbol} at {pos.entry_price}")
                                 clear_pending_entry(pos.symbol)
                                 asyncio.create_task(cancel_limit(pos.symbol, pos.order_id))
