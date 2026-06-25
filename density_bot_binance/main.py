@@ -107,32 +107,52 @@ userdata_ws = None
 symbol_recent_trades = {}
 symbol_full_stop_times = {}
 pending_entry_confirmations = {}
+pending_entry_lock = set()  # v11: prevent duplicate entries per symbol
+last_close_time = {}  # v11.3: cooldown after position close (symbol -> timestamp)
+MIN_REENTRY_COOLDOWN_SEC = 60  # v11.3: minimum seconds before re-entry after close
 
+# v11.2: Hardcoded blacklist - coins with proven negative edge
+HARDCODED_BLACKLIST = set([
+    'PENDLEUSDT', 'AAVEUSDT', 'UNIUSDT', 'LDOUSDT', 'ENAUSDT',
+    'FIDAUSDT', 'XLMUSDT', 'ASTERUSDT', 'TIAUSDT', 'BICOUSDT',
+    'ETHFIUSDT', 'DYDXUSDT', 'CHZUSDT', 'SPXUSDT', 'AERGOUSDT',
+    'IOUSDT', 'EIGENUSDT',
+])
 
-ENTRY_CONFIRMATION_DELAY = 5.0
+# v11.1: Trailing Stop
+TRAILING_STOP_TRIGGER_PCT = 0.25  # 50% of TP (Class C TP=0.50%) → trigger at +0.25%
+TRAILING_STOP_NEW_SL_PCT = 0.15   # Move SL to entry + 0.10% (locked profit)
+trailing_activated = set()  # symbols where trailing stop already moved SL
+
+# v11.1: Auto-blacklist
+AUTO_BLACKLIST_MIN_TRADES = 3
+AUTO_BLACKLIST_WR_THRESHOLD = 0.35
+AUTO_BLACKLIST_LOOKBACK = 10
+
+ENTRY_CONFIRMATION_DELAY = 3.0
 EXIT_DEBOUNCE_SECONDS = 2.0
 MIN_POSITION_HOLD_SECONDS = 3.0
-MIN_REWARD_RISK_RATIO = 1.5
+MIN_REWARD_RISK_RATIO = 1.0
 MAX_SPREAD_PCT = 0.05
-MAX_DROP_5M_PCT = -0.4
-MAX_DROP_15M_PCT = -0.7
+MAX_DROP_5M_PCT = -0.6
+MAX_DROP_15M_PCT = -1.0
 MIN_CONFIRM_RETAINED_RATIO = 0.8
 MAKER_FEE_RATE = 0.0002
 TAKER_FEE_RATE = 0.0005
-MIN_NET_REWARD_RISK_RATIO = 1.25
-MIN_OPPORTUNITY_SCORE_C = 5.5
-MIN_OPPORTUNITY_SCORE_D = 7.0
-MAX_ENTRY_DISTANCE_PCT = 0.50
-MIN_ENTRY_DENSITY_LIFETIME_SECONDS = 10.0
-MIN_DENSITY_SCORE_C = 6
-MIN_DENSITY_SCORE_D = 7
-MIN_ENTRY_BOOK_IMBALANCE = -0.10
+MIN_NET_REWARD_RISK_RATIO = 0.8
+MIN_OPPORTUNITY_SCORE_C = 4.0
+MIN_OPPORTUNITY_SCORE_D = 4.0
+MAX_ENTRY_DISTANCE_PCT = 1.2
+MIN_ENTRY_DENSITY_LIFETIME_SECONDS = 5.0
+MIN_DENSITY_SCORE_C = 4
+MIN_DENSITY_SCORE_D = 5
+MIN_ENTRY_BOOK_IMBALANCE = -0.20
 MIN_ENTRY_MICROPRICE_EDGE_PCT = -0.006
 MIN_ENTRY_DELTA_RATIO = 0.75
 FULL_STOP_COOLDOWN_MINUTES = 30.0
 FULL_STOP_MIN_LOSS_USDT = 0.015
 FULL_STOP_MIN_LOSS_PCT = 0.20
-STRATEGY_RELEASE = "v10.0-touch-reclaim-research"
+STRATEGY_RELEASE = "v11.2"
 STRATEGY_VALIDATED_FOR_LIVE = False
 TOUCH_RECLAIM_ARM_TIMEOUT_SECONDS = 30.0
 TOUCH_RECLAIM_TIMEOUT_SECONDS = 10.0
@@ -140,8 +160,8 @@ TOUCH_RECLAIM_MIN_DELAY_SECONDS = 0.25
 TOUCH_RECLAIM_RETAINED_RATIO = 0.60
 TOUCH_DISTANCE_PCT = 0.03
 RECLAIM_DISTANCE_PCT = 0.05
-RESEARCH_TAKE_PROFIT_PCT = 0.30
-RESEARCH_STOP_LOSS_PCT = 0.30
+RESEARCH_TAKE_PROFIT_PCT = 0.50
+RESEARCH_STOP_LOSS_PCT = 0.25
 RESEARCH_ENTRY_TIMEOUT_SECONDS = 5.0
 
 # Глобальные тренд-фильтры по BTC и ETH
@@ -341,15 +361,30 @@ async def connect_ws():
     for attempt in range(retries):
         try:
             print(f"[Бот] Получение 24-часовых объемов торгов через REST API (попытка {attempt+1}/{retries})...")
+            if attempt > 0:
+                await asyncio.sleep(3)
             tickers = await client.ticker_24hr_price_change()
+            if not isinstance(tickers, list):
+                print(f"[Бот] Неожиданный формат ответа (type={type(tickers).__name__}): {str(tickers)[:200]}")
+                continue
+            loaded = 0
             for t in tickers:
-                volumes_24h[t['symbol']] = float(t['quoteVolume'])
-            print(f"[Бот] Успешно загружено объемов для {len(volumes_24h)} пар.")
+                if not isinstance(t, dict) or 'quoteVolume' not in t or 'symbol' not in t:
+                    continue
+                try:
+                    volumes_24h[t['symbol']] = float(t['quoteVolume'])
+                    loaded += 1
+                except (ValueError, TypeError):
+                    pass
+            if loaded == 0:
+                print(f"[Бот] Не удалось извлечь объемы ни для одной пары из {len(tickers)} тикеров.")
+                continue
+            print(f"[Бот] Успешно загружено объемов для {loaded} пар.")
             break
         except Exception as e:
-            print(f"[Бот] Ошибка при получении объемов торгов на попытке {attempt+1}: {e}")
+            print(f"[Бот] Ошибка при получении объемов торгов на попытке {attempt+1}: {type(e).__name__}: {e}")
             if attempt < retries - 1:
-                await asyncio.sleep(2)
+                await asyncio.sleep(3)
             else:
                 print("[Бот] Предупреждение: Не удалось загрузить объемы торгов после нескольких попыток. Используются старые или пустые объемы.")
     
@@ -403,6 +438,8 @@ async def connect_ws():
             
         # Убираем монеты из черного списка
         if symbol_name in conf.blacklist:
+            continue
+        if symbol_name in HARDCODED_BLACKLIST:
             continue
             
         # Убираем китайские названия, BRC-20
@@ -480,8 +517,8 @@ def get_liquidity_class(symbol):
     if vol_24h >= 100_000_000.0:
         return {"name": "Class B", "tp_pct": 0.3, "sl_pct": 0.18, "blocked": True}
     if vol_24h >= 10_000_000.0:
-        return {"name": "Class C", "tp_pct": 0.70, "sl_pct": 0.35, "blocked": False}
-    return {"name": "Class D", "tp_pct": 0.90, "sl_pct": 0.45, "blocked": False}
+        return {"name": "Class C", "tp_pct": 0.45, "sl_pct": 0.30, "blocked": False}
+    return {"name": "Class D", "tp_pct": 0.50, "sl_pct": 0.35, "blocked": False}
 
 
 def get_min_density_floor(symbol, bid_price):
@@ -493,9 +530,9 @@ def get_min_density_floor(symbol, bid_price):
     if profile["name"] == "Class B":
         min_density_floor = 250_000.0
     elif profile["name"] == "Class C":
-        min_density_floor = 60_000.0
+        min_density_floor = 15_000.0
     else:
-        min_density_floor = 30_000.0
+        min_density_floor = 15_000.0
     if bid_price > 100.0:
         min_density_floor = min(min_density_floor * (bid_price / 100.0), 2_000_000.0)
     return min_density_floor, profile["name"]
@@ -680,7 +717,7 @@ async def check_and_apply_breakeven(symbol, current_price):
         
     entry_price = pos.entry_price
     # Check if the price reached the trigger (+be_trigger_pct%)
-    trigger_pct = getattr(conf, 'be_trigger_pct', 0.25)
+    trigger_pct = getattr(conf, 'be_trigger_pct', 0.15)
     trigger_price = entry_price * (1 + trigger_pct / 100)
     
     if current_price >= trigger_price:
@@ -744,6 +781,106 @@ async def check_and_apply_breakeven(symbol, current_price):
             asyncio.create_task(tg.bot.send_message(config.getint('TG', 'CHANNEL'), text))
         except Exception as e:
             print(f"[Breakeven TG Alert Error] {e}", flush=True)
+
+
+async def check_and_apply_trailing_stop(symbol, current_price):
+    global positions, trailing_activated
+    pos = positions.get(symbol)
+    if not pos or not isinstance(pos, Position) or not pos.status:
+        return
+    if symbol in trailing_activated:
+        return
+    if getattr(pos, "be_activated", False):
+        return
+
+    entry_price = pos.entry_price
+    tp_price = pos.tp_price
+    if tp_price is None or entry_price <= 0:
+        return
+
+    tp_distance_pct = (tp_price - entry_price) / entry_price * 100
+    trigger_pct = tp_distance_pct * 0.50
+    trigger_price = entry_price * (1 + trigger_pct / 100)
+
+    if current_price >= trigger_price:
+        sym_info = all_symbols.get(symbol)
+        if not sym_info:
+            return
+
+        tick_size = sym_info.tick_size
+        new_stop_price = round(entry_price * (1 + TRAILING_STOP_NEW_SL_PCT / 100), tick_size)
+
+        if pos.stop_price is not None and new_stop_price <= pos.stop_price:
+            return
+
+        print(f"[Trailing Stop] {symbol}: price {current_price} >= 50% TP trigger {trigger_price:.6f}. Moving SL: {pos.stop_price} -> {new_stop_price}", flush=True)
+
+        if not conf.dry_run:
+            try:
+                if getattr(pos, 'sl_order_id', None):
+                    await client.cancel_order(symbol=symbol, orderId=pos.sl_order_id)
+                sl_order = await client.new_order(
+                    symbol=symbol, side='SELL', type='STOP_MARKET',
+                    stopPrice=utils.round_price(new_stop_price, tick_size),
+                    closePosition='true'
+                )
+                pos.sl_order_id = sl_order.get('orderId')
+            except Exception as e:
+                print(f"[Trailing Stop ERROR] Failed to adjust SL on Binance for {symbol}: {e}", flush=True)
+                return
+
+        pos.stop_price = new_stop_price
+        trailing_activated.add(symbol)
+
+        try:
+            async with session() as s:
+                from sqlalchemy import select
+                db_trade = (await s.execute(
+                    select(db.Trades).where(db.Trades.symbol == symbol)
+                    .where(db.Trades.status == 'OPEN')
+                    .order_by(db.Trades.open_time.desc()).limit(1)
+                )).scalar_one_or_none()
+                if db_trade:
+                    db_trade.stop_price = new_stop_price
+                    await s.commit()
+        except Exception as e:
+            print(f"[Trailing Stop ERROR] Failed to update stop_price in DB: {e}", flush=True)
+
+        try:
+            prefix = "🤖 [DRY RUN] " if conf.dry_run else ""
+            text = (f"{prefix}Trailing Stop по #{symbol}: SL перемещён на <b>{new_stop_price}</b> "
+                    f"(locked +{TRAILING_STOP_NEW_SL_PCT}% profit, цена {current_price})")
+            asyncio.create_task(tg.bot.send_message(config.getint('TG', 'CHANNEL'), text))
+        except Exception as e:
+            print(f"[Trailing Stop TG Alert Error] {e}", flush=True)
+
+
+async def auto_blacklist_check(symbol):
+    recent = symbol_recent_trades.get(symbol, [])
+    if len(recent) < AUTO_BLACKLIST_MIN_TRADES:
+        return
+    lookback = recent[-AUTO_BLACKLIST_LOOKBACK:]
+    wins = sum(1 for _, is_win in lookback if is_win)
+    wr = wins / len(lookback)
+    if wr < AUTO_BLACKLIST_WR_THRESHOLD:
+        print(f"[Auto-Blacklist] {symbol}: WR={wr:.0%} ({wins}/{len(lookback)}) < {AUTO_BLACKLIST_WR_THRESHOLD:.0%}. Adding to blacklist.", flush=True)
+        try:
+            async with session() as s:
+                conf_obj = await db.load_config()
+                current_blacklist = list(conf_obj.blacklist) if conf_obj.blacklist else []
+                if symbol not in current_blacklist:
+                    current_blacklist.append(symbol)
+                    await db.config_update(blacklist=','.join(current_blacklist))
+                    print(f"[Auto-Blacklist] {symbol} added to DB blacklist. Total blacklisted: {len(current_blacklist)}", flush=True)
+                    try:
+                        prefix = "🤖 [DRY RUN] " if conf.dry_run else ""
+                        text = (f"{prefix}Auto-blacklist: #{symbol} заблокирован "
+                                f"(WR={wr:.0%} за последние {len(lookback)} сделок)")
+                        asyncio.create_task(tg.bot.send_message(config.getint('TG', 'CHANNEL'), text))
+                    except:
+                        pass
+        except Exception as e:
+            print(f"[Auto-Blacklist ERROR] Failed to blacklist {symbol}: {e}", flush=True)
 
 
 def clear_pending_entry(symbol):
@@ -859,7 +996,7 @@ async def check_market_delta_anomaly(symbol):
 
 def get_tp_sl_prices(entry_price, sym_info, atr=None):
     # Dynamic ATR exits are deactivated to ensure a stable mathematical expectation;
-    # we enforce fixed TP/SL targets (Class C: 0.70%/0.35%, Class D: 0.90%/0.45%) instead.
+    # we enforce fixed TP/SL targets (Class C: 0.45%/0.30%, Class D: 0.50%/0.35%) instead.
     atr = None
     symbol = sym_info.symbol
     profile = get_liquidity_class(symbol)
@@ -905,6 +1042,9 @@ def get_tp_sl_prices(entry_price, sym_info, atr=None):
             # Cap the distance, but keep at least 3 ticks of safety buffer
             min_stop_distance = max(10 ** -sym_info.tick_size * 3, max_stop_distance)
         stop_price = utils.round_down(entry_price - min_stop_distance, sym_info.tick_size)
+    # Safety: stop MUST be below entry, otherwise clamp to 1 tick below
+    if stop_price >= entry_price:
+        stop_price = utils.round_down(entry_price - 10 ** -sym_info.tick_size, sym_info.tick_size)
     return take_price, stop_price
 
 
@@ -1000,6 +1140,7 @@ async def msg_ticker(ws, msg):
                     # Проверяем, готова ли запись в БД во избежание race condition
                     if getattr(pos, 'db_ready', False):
                         await check_and_apply_breakeven(symbol, current_price)
+                        await check_and_apply_trailing_stop(symbol, current_price)
                         try:
                             sym_info = all_symbols[symbol]
                             take_price = pos.tp_price if pos.tp_price is not None else get_tp_sl_prices(pos.entry_price, sym_info)[0]
@@ -1085,6 +1226,7 @@ async def new_density(symbol, bid_price, bid_volume, ask_volume, num, sent_ns=No
     global positions
     global volumes_24h
     global last_prices
+    global last_close_time
     try:
         import time
         if best_bid is not None:
@@ -1346,6 +1488,10 @@ async def new_density(symbol, bid_price, bid_volume, ask_volume, num, sent_ns=No
             if spread_pct > max_spread:
                 print(f"[Фильтр спреда] Пропускаем {symbol}: спред слишком широкий ({spread_pct:.3f}% > {max_spread:.2f}%)")
                 return
+        # v11.2: hardcoded blacklist check
+        if symbol in HARDCODED_BLACKLIST:
+            print(f"[Blacklist] {symbol}: в hardcoded blacklist, пропускаем", flush=True)
+            return
         # если символ дал WR < 20% за последние 10 сделок -> пауза 30 мин
         if symbol in symbol_recent_trades:
             recent = symbol_recent_trades[symbol]
@@ -1353,8 +1499,8 @@ async def new_density(symbol, bid_price, bid_volume, ask_volume, num, sent_ns=No
                 wins = sum(1 for _, is_win in recent if is_win)
                 wr = (wins / len(recent)) * 100
                 if wr < 20.0:
-                    last_close_time = recent[-1][0]
-                    elapsed_min = (utils.get_ts() - last_close_time) / 60000.0
+                    wr_last_close_ts = recent[-1][0]
+                    elapsed_min = (utils.get_ts() - wr_last_close_ts) / 60000.0
                     if elapsed_min < 30.0:
                         print(f"[WR Фильтр] Пропускаем {symbol}: WR за последние 10 сделок = {wr:.1f}% (< 20%), пауза {30.0 - elapsed_min:.1f} мин.")
                         return
@@ -1403,6 +1549,17 @@ async def new_density(symbol, bid_price, bid_volume, ask_volume, num, sent_ns=No
         if not sym_info:
             print(f"[Entry filter] Skip {symbol}: symbol info is not loaded.")
             return
+        # v11: ATR volatility filter - skip if 5m ATR > 0.8% of price
+        atr_check = await get_atr_5m(symbol, limit=15)
+        if atr_check is not None and bid_price > 0:
+            atr_pct = (atr_check / bid_price) * 100
+            if atr_pct > 0.8:
+                print(f"[Volatility filter] Skip {symbol}: ATR {atr_pct:.3f}% > 0.8% (too volatile for tight TP/SL)")
+                return
+            if atr_pct < 0.05:
+                print(f"[Volatility filter] Skip {symbol}: ATR {atr_pct:.4f}% < 0.05% (too flat)")
+                return
+
         expected_entry = round(bid_price + 10 ** -sym_info.tick_size, sym_info.tick_size)
         maker_ok, maker_reason = is_maker_entry_safe(expected_entry, best_ask, 10 ** -sym_info.tick_size)
         if not maker_ok:
@@ -1418,6 +1575,16 @@ async def new_density(symbol, bid_price, bid_volume, ask_volume, num, sent_ns=No
             print(f"[Net RR filter] Skip {symbol}: net reward/risk {net_rr:.2f} < {MIN_NET_REWARD_RISK_RATIO:.2f} "
                   f"(net +{net_reward_pct:.3f}% / -{net_risk_pct:.3f}%)")
             return
+        # v11.3: post-close cooldown — prevent rapid re-entry
+        if symbol in last_close_time:
+            elapsed = time.time() - last_close_time[symbol]
+            if elapsed < MIN_REENTRY_COOLDOWN_SEC:
+                print(f"[Cooldown] {symbol}: {elapsed:.0f}s since last close < {MIN_REENTRY_COOLDOWN_SEC}s, skipping", flush=True)
+                return
+        if symbol in pending_entry_lock:
+            print(f"[Lock] {symbol}: entry already pending, skipping duplicate", flush=True)
+            return
+        pending_entry_lock.add(symbol)
         pending_entry_confirmations[symbol] = {
             "density_price": bid_price,
             "bid_volume": bid_volume,
@@ -1460,6 +1627,7 @@ async def open_position_delayed(symbol, bid_price):
         print(f"[Entry Confirm] {symbol}: {reason}. Entry cancelled.", flush=True)
         positions.pop(symbol, None)
         clear_pending_entry(symbol)
+        pending_entry_lock.discard(symbol)
 
     candidate = pending_entry_confirmations.get(symbol)
     current_state = positions.get(symbol)
@@ -1603,13 +1771,7 @@ async def open_position_delayed(symbol, bid_price):
         )
         return
 
-    microstructure_rejection = get_microstructure_rejection(
-        live_book_imbalance, live_microprice_edge_pct,
-        buy_vol_5s, sell_vol_5s, live_delta_ratio,
-    )
-    if microstructure_rejection:
-        reject(microstructure_rejection)
-        return
+    pass  # veto filters removed
 
     score, breakdown = calculate_density_score(
         symbol, live_density_price, live_bid_volume, candidate["min_density_floor"],
@@ -1649,7 +1811,13 @@ async def open_position_delayed(symbol, bid_price):
     })
     print(f"[Entry Confirm] {symbol}: density confirmed after {ENTRY_CONFIRMATION_DELAY:.0f}s, "
           f"RR={rr:.2f}, netRR={net_rr:.2f}. Arming touch/reclaim at {live_density_price}.", flush=True)
-    await wait_for_touch_reclaim_entry(symbol, candidate, atr)
+    # Final position limit check before committing
+    active_count = sum(1 for p in positions.values() if isinstance(p, Position))
+    if active_count >= conf.max_positions:
+        reject(f"too many active positions: {active_count} >= {conf.max_positions}")
+        return
+    await open_position(symbol, live_density_price, atr)
+    pending_entry_lock.discard(symbol)
     return
 
 
@@ -1784,6 +1952,13 @@ async def open_position(symbol, bid_price, atr=None):
             print(f"[Entry] {symbol}: cancel opening. Too many active positions already: {active_positions_count} >= {conf.max_positions}")
             positions.pop(symbol, None)
             clear_pending_entry(symbol)
+            return
+        # v11.3: safety — reject if position already exists for this symbol
+        if isinstance(positions.get(symbol), Position):
+            print(f"[Entry] {symbol}: position already exists, skipping duplicate entry", flush=True)
+            clear_pending_entry(symbol)
+            pending_entry_lock.discard(symbol)
+            return
             return
 
         # получаем информацию о паре
@@ -2049,6 +2224,7 @@ async def set_stop_take(symbol, entry_price, quantity, atr=None):
             await s.commit()
             trade_id = trade.id
             clear_pending_entry(symbol)
+            pending_entry_lock.discard(symbol)
     except Exception as e:
         print(f"Ошибка при записи сделки в БД по {symbol}: {e}")
 
@@ -2199,6 +2375,8 @@ async def trade_closed(msg, pos):
                 pass
         positions.pop(trade.symbol, None)
         clear_pending_entry(trade.symbol)
+        trailing_activated.discard(trade.symbol)
+        last_close_time[trade.symbol] = time.time()  # v11.3: cooldown after close
         
         # Обновляем кэш исходов сделок (v8.3+)
         close_time = trade.close_time or utils.get_ts()
@@ -2215,6 +2393,7 @@ async def trade_closed(msg, pos):
         symbol_recent_trades[trade.symbol].append((close_time, is_win))
         if len(symbol_recent_trades[trade.symbol]) > 10:
             symbol_recent_trades[trade.symbol].pop(0)
+        asyncio.create_task(auto_blacklist_check(trade.symbol))
         # формируем сообщение
         prefix = "🤖 [DRY RUN] " if conf.dry_run else ""
         text = (f"{prefix}Закрыл сделку на <b>{trade.quantity}</b> #{trade.symbol} по {close_type}\n"
@@ -2300,6 +2479,7 @@ async def check_positions():
                                         # 2. Позиция открыта, проверяем достижение TP или SL
                                         if getattr(pos, 'db_ready', False):
                                             await check_and_apply_breakeven(sym, current_price)
+                                            await check_and_apply_trailing_stop(sym, current_price)
                                             sym_info = all_symbols.get(sym)
                                             if not sym_info:
                                                 print(f"[ERROR] Symbol {sym} not found in all_symbols during check_positions!")
@@ -2413,7 +2593,11 @@ async def reconcile_state():
     try:
         open_trades = await db.get_all_trades()
         if conf.dry_run:
-            for trade in open_trades:
+            seen = set()
+            for trade in reversed(open_trades):
+                if trade.symbol in seen:
+                    continue
+                seen.add(trade.symbol)
                 pos = Position(trade.symbol, trade.quantity, trade.entry_price, trade.entry_price)
                 pos.status = True
                 pos.fill_time = time.time() - 10.0
@@ -2421,7 +2605,7 @@ async def reconcile_state():
                 pos.tp_price = trade.take_price
                 pos.stop_price = trade.stop_price
                 positions[trade.symbol] = pos
-                print(f"[Бот] [DRY RUN] Восстановлена виртуальная позиция в памяти: {trade.symbol} по цене {trade.entry_price}")
+                print(f"[Бот] [DRY RUN] Восстановлена позиция: {trade.symbol} entry={trade.entry_price} tp={trade.take_price} sl={trade.stop_price}")
             return
 
         # В реальном режиме сверяем с биржей
