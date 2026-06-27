@@ -111,12 +111,20 @@ pending_entry_lock = set()  # v11: prevent duplicate entries per symbol
 last_close_time = {}  # v11.3: cooldown after position close (symbol -> timestamp)
 MIN_REENTRY_COOLDOWN_SEC = 60  # v11.3: minimum seconds before re-entry after close
 
-# v11.2: Hardcoded blacklist - coins with proven negative edge
+# v12: Hardcoded blacklist - coins with proven negative edge across all versions
 HARDCODED_BLACKLIST = set([
+    # DeFi — systematically unprofitable (v10-v11.3)
     'PENDLEUSDT', 'AAVEUSDT', 'UNIUSDT', 'LDOUSDT', 'ENAUSDT',
-    'FIDAUSDT', 'XLMUSDT', 'ASTERUSDT', 'TIAUSDT', 'BICOUSDT',
-    'ETHFIUSDT', 'DYDXUSDT', 'CHZUSDT', 'SPXUSDT', 'AERGOUSDT',
+    'ETHFIUSDT', 'DYDXUSDT', 'CRVUSDT', 'FIDAUSDT',
+    # Infrastructure / low-liquidity — unprofitable
+    'XLMUSDT', 'TIAUSDT', 'ASTERUSDT', 'BICOUSDT', 'AERGOUSDT',
     'IOUSDT', 'EIGENUSDT',
+    # Index / junk
+    'CHZUSDT', 'SPXUSDT',
+    # v11.2/v11.3 losers (0W or WR<35% with 2+ trades)
+    'WIFUSDT', 'PUMPUSDT', 'TRUMPUSDT', 'OPENUSDT', 'GENIUSUSDT',
+    'CFGUSDT', 'BTWUSDT', 'DOGSUSDT', 'WALUSDT', 'KAITOUSDT',
+    'GALAUSDT', 'XMRUSDT',
 ])
 
 # v11.1: Trailing Stop
@@ -129,31 +137,63 @@ AUTO_BLACKLIST_MIN_TRADES = 3
 AUTO_BLACKLIST_WR_THRESHOLD = 0.35
 AUTO_BLACKLIST_LOOKBACK = 10
 
-ENTRY_CONFIRMATION_DELAY = 3.0
+ENTRY_CONFIRMATION_DELAY = 5.0
 EXIT_DEBOUNCE_SECONDS = 2.0
 MIN_POSITION_HOLD_SECONDS = 3.0
-MIN_REWARD_RISK_RATIO = 1.0
+MIN_REWARD_RISK_RATIO = 1.2
 MAX_SPREAD_PCT = 0.05
 MAX_DROP_5M_PCT = -0.6
 MAX_DROP_15M_PCT = -1.0
 MIN_CONFIRM_RETAINED_RATIO = 0.8
 MAKER_FEE_RATE = 0.0002
 TAKER_FEE_RATE = 0.0005
-MIN_NET_REWARD_RISK_RATIO = 0.8
-MIN_OPPORTUNITY_SCORE_C = 4.0
-MIN_OPPORTUNITY_SCORE_D = 4.0
+MIN_NET_REWARD_RISK_RATIO = 0.9
+MIN_OPPORTUNITY_SCORE_C = 5.0
+MIN_OPPORTUNITY_SCORE_D = 5.0
 MAX_ENTRY_DISTANCE_PCT = 1.2
 MIN_ENTRY_DENSITY_LIFETIME_SECONDS = 5.0
-MIN_DENSITY_SCORE_C = 4
-MIN_DENSITY_SCORE_D = 5
+MIN_DENSITY_SCORE_C = 6
+MIN_DENSITY_SCORE_D = 7
 MIN_ENTRY_BOOK_IMBALANCE = -0.20
-MIN_ENTRY_MICROPRICE_EDGE_PCT = -0.006
+MIN_ENTRY_MICROPRICE_EDGE_PCT = -0.008
 MIN_ENTRY_DELTA_RATIO = 0.75
 FULL_STOP_COOLDOWN_MINUTES = 30.0
 FULL_STOP_MIN_LOSS_USDT = 0.015
 FULL_STOP_MIN_LOSS_PCT = 0.20
-STRATEGY_RELEASE = "v11.2"
+STRATEGY_RELEASE = "v12.0"
 STRATEGY_VALIDATED_FOR_LIVE = False
+
+# v12: Time-of-day filter
+# TEST MODE: disabled to collect data across all hours.
+# After 200+ trades, analyse by hour and enable filtering.
+TRADING_HOURS_ACTIVE = set(range(24))  # all hours active during data collection
+TRADING_HOURS_BLOCKED = set()  # none blocked during data collection
+TRADING_HOURS_CAUTION = set()
+
+# v12: ATR volatility bands by class (optimised for current TP/SL)
+ATR_FLOOR = {"Class C": 0.08, "Class D": 0.10}
+ATR_CEIL = {"Class C": 0.40, "Class D": 0.50}
+
+# v12: Instrument classification
+INSTRUMENT_WHITELIST = set([
+    'STG', 'ALICE', 'ZRO', 'SPK', 'INJ', 'STX', 'KAS', 'THETA',
+    'ICP', 'BIO', 'BASED', 'RAVE', 'ZORA', 'GWEI', 'ORCA', 'ID',
+    'BAN', 'PIXEL', 'IP', 'VVV', 'FARTCOIN', 'SAHARA', 'ONDO',
+    'TON', 'SUI', 'PENGU', 'HBAR', 'CP', 'AAVE',
+])
+INSTRUMENT_BLACKLIST_TYPES = {
+    'defi': set([
+        'PENDLE', 'AAVE', 'UNI', 'LDO', 'ENA', 'ETHFI', 'DYDX', 'CRV',
+        'FIDA', 'COMP', 'MKR', 'SNX', 'YFI', 'SUSHI', '1INCH', 'BAL',
+        'JOE', 'GMX', 'JUP', 'W', 'ME',
+    ]),
+    'low_liq': set([
+        'ASTER', 'BICO', 'ROBO', 'AERGO', 'GIGGLE', 'DEXE', 'BERA',
+    ]),
+    'meme_junk': set([
+        'DOGS', 'TOWNS', 'PUMP', 'GENIUS', 'CHIP',
+    ]),
+}
 TOUCH_RECLAIM_ARM_TIMEOUT_SECONDS = 30.0
 TOUCH_RECLAIM_TIMEOUT_SECONDS = 10.0
 TOUCH_RECLAIM_MIN_DELAY_SECONDS = 0.25
@@ -190,6 +230,67 @@ def instant_exits_enabled():
         return config.getboolean('BOT', 'ENABLE_INSTANT_EXITS', fallback=False)
     except Exception:
         return False
+
+
+# v12: Time-of-day filter — simple block/thin-liquidity approach
+def is_trading_hour_ok(symbol):
+    from datetime import datetime, timezone
+    hour = datetime.now(timezone.utc).hour
+    if hour in TRADING_HOURS_ACTIVE:
+        return True, "active"
+    return False, f"blocked_hour_{hour}"
+
+
+# v12: Instrument classification
+def classify_instrument(symbol):
+    coin = symbol.replace('USDT', '')
+    if coin in INSTRUMENT_WHITELIST:
+        return "whitelist"
+    for category, coins in INSTRUMENT_BLACKLIST_TYPES.items():
+        if coin in coins:
+            return f"blacklisted_{category}"
+    return "neutral"
+
+
+# v12: Multi-level WR filter
+def is_wr_ok(symbol):
+    recent = symbol_recent_trades.get(symbol, [])
+    if not recent:
+        return True, "no_history"
+
+    # 3+ consecutive stops → 20 min pause
+    if len(recent) >= 3:
+        last_3 = recent[-3:]
+        if all(not is_win for _, is_win in last_3):
+            elapsed_min = (utils.get_ts() - last_3[-1][0]) / 60000.0
+            if elapsed_min < 20.0:
+                return False, f"3+ consecutive stops, {20.0 - elapsed_min:.1f} min remain"
+
+    # WR < 30% last 5 → 30 min pause
+    if len(recent) >= 5:
+        last_5 = recent[-5:]
+        wins_5 = sum(1 for _, is_win in last_5 if is_win)
+        if wins_5 / 5 < 0.30:
+            elapsed_min = (utils.get_ts() - last_5[-1][0]) / 60000.0
+            if elapsed_min < 30.0:
+                return False, f"WR={wins_5/5:.0%} last 5, {30.0 - elapsed_min:.1f} min remain"
+
+    # WR < 40% last 10 → 15 min pause
+    if len(recent) >= 10:
+        last_10 = recent[-10:]
+        wins_10 = sum(1 for _, is_win in last_10 if is_win)
+        if wins_10 / 10 < 0.40:
+            elapsed_min = (utils.get_ts() - last_10[-1][0]) / 60000.0
+            if elapsed_min < 15.0:
+                return False, f"WR={wins_10/10:.0%} last 10, {15.0 - elapsed_min:.1f} min remain"
+
+    return True, "ok"
+
+
+# v12: Delayed lock release to prevent duplicates
+async def _release_lock_delayed(symbol, delay):
+    await asyncio.sleep(delay)
+    pending_entry_lock.discard(symbol)
 
 
 # функция для инициализации кэша истории сделок (v8.3+)
@@ -517,8 +618,8 @@ def get_liquidity_class(symbol):
     if vol_24h >= 100_000_000.0:
         return {"name": "Class B", "tp_pct": 0.3, "sl_pct": 0.18, "blocked": True}
     if vol_24h >= 10_000_000.0:
-        return {"name": "Class C", "tp_pct": 0.45, "sl_pct": 0.30, "blocked": False}
-    return {"name": "Class D", "tp_pct": 0.50, "sl_pct": 0.35, "blocked": False}
+        return {"name": "Class C", "tp_pct": 0.50, "sl_pct": 0.30, "blocked": False}
+    return {"name": "Class D", "tp_pct": 0.55, "sl_pct": 0.35, "blocked": False}
 
 
 def get_min_density_floor(symbol, bid_price):
@@ -666,11 +767,11 @@ def calculate_density_score(symbol, bid_price, bid_volume, min_density_floor,
     else:
         refill_score = 6
 
-    # 4. Absorption Score
+    # 4. Absorption Score (v12: require real absorption)
     if absorption_ratio <= 0.0:
         absorption_score = 0
-    elif absorption_ratio < 0.5:
-        absorption_score = 1
+    elif absorption_ratio < 0.3:
+        absorption_score = 0
     elif absorption_ratio < 1.0:
         absorption_score = 2
     elif absorption_ratio < 2.0:
@@ -1474,6 +1575,18 @@ async def new_density(symbol, bid_price, bid_volume, ask_volume, num, sent_ns=No
                 print(f"[ETH фильтр] Пропускаем {symbol}: ETH падает (5m: {eth_5m:+.2f}%, 15m: {eth_15m:+.2f}%)")
                 return
 
+        # v12: TIME-OF-DAY FILTER
+        hour_ok, hour_reason = is_trading_hour_ok(symbol)
+        if not hour_ok:
+            print(f"[Time filter] Skip {symbol}: {hour_reason}", flush=True)
+            return
+
+        # v12: INSTRUMENT CLASSIFICATION FILTER
+        instrument_type = classify_instrument(symbol)
+        if instrument_type.startswith("blacklisted_"):
+            print(f"[Instrument filter] Skip {symbol}: {instrument_type}", flush=True)
+            return
+
         # 2.5.5. ЛОКАЛЬНЫЙ ТРЕНДОВЫЙ ФИЛЬТР (Защита от входов против тренда)
         current_price = last_prices.get(symbol, bid_price)
         change_5m, change_15m = get_price_trend(symbol, current_price)
@@ -1492,18 +1605,11 @@ async def new_density(symbol, bid_price, bid_volume, ask_volume, num, sent_ns=No
         if symbol in HARDCODED_BLACKLIST:
             print(f"[Blacklist] {symbol}: в hardcoded blacklist, пропускаем", flush=True)
             return
-        # если символ дал WR < 20% за последние 10 сделок -> пауза 30 мин
-        if symbol in symbol_recent_trades:
-            recent = symbol_recent_trades[symbol]
-            if len(recent) >= 10:
-                wins = sum(1 for _, is_win in recent if is_win)
-                wr = (wins / len(recent)) * 100
-                if wr < 20.0:
-                    wr_last_close_ts = recent[-1][0]
-                    elapsed_min = (utils.get_ts() - wr_last_close_ts) / 60000.0
-                    if elapsed_min < 30.0:
-                        print(f"[WR Фильтр] Пропускаем {symbol}: WR за последние 10 сделок = {wr:.1f}% (< 20%), пауза {30.0 - elapsed_min:.1f} мин.")
-                        return
+        # v12: Multi-level WR filter
+        wr_ok, wr_reason = is_wr_ok(symbol)
+        if not wr_ok:
+            print(f"[WR filter] Skip {symbol}: {wr_reason}", flush=True)
+            return
         # Фильтр максимальной дистанции до плотности (не более 0.6%)
         current_price = last_prices.get(symbol, bid_price)
         if current_price > bid_price * 1.006:
@@ -1549,15 +1655,17 @@ async def new_density(symbol, bid_price, bid_volume, ask_volume, num, sent_ns=No
         if not sym_info:
             print(f"[Entry filter] Skip {symbol}: symbol info is not loaded.")
             return
-        # v11: ATR volatility filter - skip if 5m ATR > 0.8% of price
+        # v12: ATR volatility filter — class-specific bands
         atr_check = await get_atr_5m(symbol, limit=15)
         if atr_check is not None and bid_price > 0:
             atr_pct = (atr_check / bid_price) * 100
-            if atr_pct > 0.8:
-                print(f"[Volatility filter] Skip {symbol}: ATR {atr_pct:.3f}% > 0.8% (too volatile for tight TP/SL)")
+            atr_floor = ATR_FLOOR.get(class_name, 0.08)
+            atr_ceil = ATR_CEIL.get(class_name, 0.50)
+            if atr_pct > atr_ceil:
+                print(f"[Volatility filter] Skip {symbol}: ATR {atr_pct:.3f}% > {atr_ceil}% (too volatile)")
                 return
-            if atr_pct < 0.05:
-                print(f"[Volatility filter] Skip {symbol}: ATR {atr_pct:.4f}% < 0.05% (too flat)")
+            if atr_pct < atr_floor:
+                print(f"[Volatility filter] Skip {symbol}: ATR {atr_pct:.4f}% < {atr_floor}% (too flat)")
                 return
 
         expected_entry = round(bid_price + 10 ** -sym_info.tick_size, sym_info.tick_size)
@@ -1619,7 +1727,7 @@ async def new_density(symbol, bid_price, bid_volume, ask_volume, num, sent_ns=No
         print(f"Ошибка в функции new_density: {traceback.format_exc()}")
 
 
-# Entry Confirmation: ждём 3 секунды и убеждаемся, что плотность ещё жива
+# Entry Confirmation: ждём 5 секунд и убеждаемся, что плотность ещё жива
 async def open_position_delayed(symbol, bid_price):
     await asyncio.sleep(ENTRY_CONFIRMATION_DELAY)
 
@@ -1627,7 +1735,7 @@ async def open_position_delayed(symbol, bid_price):
         print(f"[Entry Confirm] {symbol}: {reason}. Entry cancelled.", flush=True)
         positions.pop(symbol, None)
         clear_pending_entry(symbol)
-        pending_entry_lock.discard(symbol)
+        asyncio.create_task(_release_lock_delayed(symbol, 10.0))
 
     candidate = pending_entry_confirmations.get(symbol)
     current_state = positions.get(symbol)
@@ -1789,6 +1897,16 @@ async def open_position_delayed(symbol, bid_price):
           f"alpha={alpha_score:.2f}, netRR={net_rr:.2f} "
           f"(Size={breakdown['size']}, Life={breakdown['lifetime']}, Refill={breakdown['refill']}, "
           f"Abs={breakdown['absorption']}, Delta={breakdown['delta']})", flush=True)
+
+    # v12: Neutral instruments require refill + higher score
+    inst_type = classify_instrument(symbol)
+    if inst_type == "neutral":
+        if refill_count < 1:
+            reject(f"neutral instrument requires refill >= 1 (got {refill_count})")
+            return
+        if alpha_score < 12.0:
+            reject(f"neutral instrument requires alpha_score >= 12.0 (got {alpha_score:.2f})")
+            return
 
     candidate.update({
         "density_price": live_density_price,
