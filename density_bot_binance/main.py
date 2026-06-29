@@ -111,31 +111,35 @@ pending_entry_lock = set()  # v11: prevent duplicate entries per symbol
 last_close_time = {}  # v11.3: cooldown after position close (symbol -> timestamp)
 MIN_REENTRY_COOLDOWN_SEC = 60  # v11.3: minimum seconds before re-entry after close
 
-# v12: Hardcoded blacklist - coins with proven negative edge across all versions
+# v13: Hardcoded blacklist — expanded with v12.0 losers
 HARDCODED_BLACKLIST = set([
-    # DeFi — systematically unprofitable (v10-v11.3)
+    # DeFi — systematically unprofitable
     'PENDLEUSDT', 'AAVEUSDT', 'UNIUSDT', 'LDOUSDT', 'ENAUSDT',
-    'ETHFIUSDT', 'DYDXUSDT', 'CRVUSDT', 'FIDAUSDT',
+    'ETHFIUSDT', 'DYDXUSDT', 'CRVUSDT', 'FIDAUSDT', 'SNXUSDT',
     # Infrastructure / low-liquidity — unprofitable
     'XLMUSDT', 'TIAUSDT', 'ASTERUSDT', 'BICOUSDT', 'AERGOUSDT',
-    'IOUSDT', 'EIGENUSDT',
+    'IOUSDT', 'EIGENUSDT', 'IPUSDT', 'IDUSDT',
     # Index / junk
     'CHZUSDT', 'SPXUSDT',
-    # v11.2/v11.3 losers (0W or WR<35% with 2+ trades)
+    # v11.2/v11.3/v12 losers (0W or WR<25% with 2+ trades)
     'WIFUSDT', 'PUMPUSDT', 'TRUMPUSDT', 'OPENUSDT', 'GENIUSUSDT',
     'CFGUSDT', 'BTWUSDT', 'DOGSUSDT', 'WALUSDT', 'KAITOUSDT',
-    'GALAUSDT', 'XMRUSDT',
+    'GALAUSDT', 'XMRUSDT', 'SAHARAUSDT', 'ONDOUSDT', 'XMRUSDT',
+    'BIOUSDT', 'CHIPUSDT', 'TOWNSUSDT', 'ROBOUSDT', 'GIGGLEUSDT',
 ])
 
-# v11.1: Trailing Stop
-TRAILING_STOP_TRIGGER_PCT = 0.25  # 50% of TP (Class C TP=0.50%) → trigger at +0.25%
-TRAILING_STOP_NEW_SL_PCT = 0.15   # Move SL to entry + 0.10% (locked profit)
-trailing_activated = set()  # symbols where trailing stop already moved SL
+# v13: Trailing Stop — staged exit
+TRAILING_STOP_TRIGGER_PCT = 0.20   # trigger at +0.20% from entry
+TRAILING_STOP_NEW_SL_PCT = 0.10    # first stage: lock +0.10%
+TRAILING_STOP_STAGE2_PCT = 0.35    # second stage: trigger at +0.35%
+TRAILING_STOP_STAGE2_SL_PCT = 0.20 # second stage: lock +0.20%
+trailing_activated = set()
+trailing_stage2 = set()
 
-# v11.1: Auto-blacklist
+# v13: Auto-blacklist
 AUTO_BLACKLIST_MIN_TRADES = 3
-AUTO_BLACKLIST_WR_THRESHOLD = 0.35
-AUTO_BLACKLIST_LOOKBACK = 10
+AUTO_BLACKLIST_WR_THRESHOLD = 0.25
+AUTO_BLACKLIST_LOOKBACK = 8
 
 ENTRY_CONFIRMATION_DELAY = 5.0
 EXIT_DEBOUNCE_SECONDS = 2.0
@@ -148,38 +152,43 @@ MIN_CONFIRM_RETAINED_RATIO = 0.8
 MAKER_FEE_RATE = 0.0002
 TAKER_FEE_RATE = 0.0005
 MIN_NET_REWARD_RISK_RATIO = 0.9
-MIN_OPPORTUNITY_SCORE_C = 5.0
-MIN_OPPORTUNITY_SCORE_D = 5.0
-MAX_ENTRY_DISTANCE_PCT = 1.2
-MIN_ENTRY_DENSITY_LIFETIME_SECONDS = 5.0
-MIN_DENSITY_SCORE_C = 6
-MIN_DENSITY_SCORE_D = 7
+
+# v13: Entry thresholds — absorption-based
+MIN_OPPORTUNITY_SCORE_C = 6.0     # v12 was 5.0
+MIN_OPPORTUNITY_SCORE_D = 6.0     # v12 was 5.0
+MAX_ENTRY_DISTANCE_PCT = 0.15     # v12 was 1.2 — TIGHT: must be very close to density
+MIN_ENTRY_DENSITY_LIFETIME_SECONDS = 15.0  # v12 was 5.0
+MIN_DENSITY_SCORE_C = 8           # v12 was 6 — new 13-point scale
+MIN_DENSITY_SCORE_D = 8           # v12 was 7
+MIN_ABSORPTION_RATIO = 0.25       # v13 NEW: sell volume absorbed ≥ 25% of wall
+MIN_REFILL_COUNT = 1              # v13 NEW: density must have been refilled at least once
+MIN_BOUNCE_BUY_VOLUME_RATIO = 0.0 # v13 NEW: at least some buy volume after absorption
 MIN_ENTRY_BOOK_IMBALANCE = -0.20
 MIN_ENTRY_MICROPRICE_EDGE_PCT = -0.008
 MIN_ENTRY_DELTA_RATIO = 0.75
 FULL_STOP_COOLDOWN_MINUTES = 30.0
 FULL_STOP_MIN_LOSS_USDT = 0.015
 FULL_STOP_MIN_LOSS_PCT = 0.20
-STRATEGY_RELEASE = "v12.0"
+STRATEGY_RELEASE = "v13.0-absorption-bounce"
 STRATEGY_VALIDATED_FOR_LIVE = False
 
-# v12: Time-of-day filter
-# TEST MODE: disabled to collect data across all hours.
-# After 200+ trades, analyse by hour and enable filtering.
-TRADING_HOURS_ACTIVE = set(range(24))  # all hours active during data collection
-TRADING_HOURS_BLOCKED = set()  # none blocked during data collection
-TRADING_HOURS_CAUTION = set()
+# v13: Time-of-day filter — enabled based on 190-trade analysis
+# Active hours: WR > 40% in v12.0 data
+# Blocked hours: WR = 0% (01, 02, 17, 22 UTC)
+# Caution hours: WR < 25% (03, 04, 06, 09, 21 UTC)
+TRADING_HOURS_ACTIVE = {5, 11, 13, 14, 15, 16, 18, 20}
+TRADING_HOURS_BLOCKED = {1, 2, 17, 22}
+TRADING_HOURS_CAUTION = {3, 4, 6, 9, 21}
 
-# v12: ATR volatility bands by class (optimised for current TP/SL)
+# v13: ATR volatility bands by class
 ATR_FLOOR = {"Class C": 0.08, "Class D": 0.10}
-ATR_CEIL = {"Class C": 0.40, "Class D": 0.50}
+ATR_CEIL = {"Class C": 0.35, "Class D": 0.45}
 
-# v12: Instrument classification
+# v13: Instrument classification — tighter whitelist
 INSTRUMENT_WHITELIST = set([
     'STG', 'ALICE', 'ZRO', 'SPK', 'INJ', 'STX', 'KAS', 'THETA',
-    'ICP', 'BIO', 'BASED', 'RAVE', 'ZORA', 'GWEI', 'ORCA', 'ID',
-    'BAN', 'PIXEL', 'IP', 'VVV', 'FARTCOIN', 'SAHARA', 'ONDO',
-    'TON', 'SUI', 'PENGU', 'HBAR', 'CP', 'AAVE',
+    'ICP', 'BIO', 'BASED', 'RAVE', 'ZORA', 'GWEI', 'BAN',
+    'PIXEL', 'SUI', 'PENGU', 'HBAR',
 ])
 INSTRUMENT_BLACKLIST_TYPES = {
     'defi': set([
@@ -189,9 +198,10 @@ INSTRUMENT_BLACKLIST_TYPES = {
     ]),
     'low_liq': set([
         'ASTER', 'BICO', 'ROBO', 'AERGO', 'GIGGLE', 'DEXE', 'BERA',
+        'CHIP', 'TOWNS',
     ]),
     'meme_junk': set([
-        'DOGS', 'TOWNS', 'PUMP', 'GENIUS', 'CHIP',
+        'DOGS', 'PUMP', 'GENIUS',
     ]),
 }
 TOUCH_RECLAIM_ARM_TIMEOUT_SECONDS = 30.0
@@ -210,8 +220,8 @@ BTC_MAX_DROP_15M_PCT = -0.3
 ETH_MAX_DROP_5M_PCT = -0.2
 ETH_MAX_DROP_15M_PCT = -0.4
 
-# Ограничение на время удержания сделки (5 минут)
-MAX_HOLD_TIME_SECONDS = 300
+# v13: Ограничение на время удержания сделки (10 минут)
+MAX_HOLD_TIME_SECONDS = 600
 
 # Порог разъедания плотности (выход, если осталось менее 15% объема)
 DENSITY_EATEN_THRESHOLD_PCT = 0.15
@@ -232,13 +242,20 @@ def instant_exits_enabled():
         return False
 
 
-# v12: Time-of-day filter — simple block/thin-liquidity approach
+# v13: Time-of-day filter
 def is_trading_hour_ok(symbol):
     from datetime import datetime, timezone
     hour = datetime.now(timezone.utc).hour
-    if hour in TRADING_HOURS_ACTIVE:
-        return True, "active"
-    return False, f"blocked_hour_{hour}"
+    if hour in TRADING_HOURS_BLOCKED:
+        return False, f"blocked_hour_{hour}"
+    if hour in TRADING_HOURS_CAUTION:
+        # Caution: only allow if WR for this symbol is decent
+        recent = symbol_recent_trades.get(symbol, [])
+        if len(recent) >= 3:
+            last_3_wins = sum(1 for _, is_win in recent[-3:] if is_win)
+            if last_3_wins == 0:
+                return False, f"caution_hour_{hour}_no_recent_wins"
+    return True, "active"
 
 
 # v12: Instrument classification
@@ -618,8 +635,8 @@ def get_liquidity_class(symbol):
     if vol_24h >= 100_000_000.0:
         return {"name": "Class B", "tp_pct": 0.3, "sl_pct": 0.18, "blocked": True}
     if vol_24h >= 10_000_000.0:
-        return {"name": "Class C", "tp_pct": 0.50, "sl_pct": 0.30, "blocked": False}
-    return {"name": "Class D", "tp_pct": 0.55, "sl_pct": 0.35, "blocked": False}
+        return {"name": "Class C", "tp_pct": 0.45, "sl_pct": 0.25, "blocked": False}
+    return {"name": "Class D", "tp_pct": 0.50, "sl_pct": 0.30, "blocked": False}
 
 
 def get_min_density_floor(symbol, bid_price):
@@ -885,54 +902,98 @@ async def check_and_apply_breakeven(symbol, current_price):
 
 
 async def check_and_apply_trailing_stop(symbol, current_price):
-    global positions, trailing_activated
+    """v13: Staged trailing stop.
+    Stage 1: price >= +0.20% → move SL to entry + 0.10% (lock small profit)
+    Stage 2: price >= +0.35% → move SL to entry + 0.20% (lock more profit)
+    """
+    global positions, trailing_activated, trailing_stage2
     pos = positions.get(symbol)
     if not pos or not isinstance(pos, Position) or not pos.status:
-        return
-    if symbol in trailing_activated:
         return
     if getattr(pos, "be_activated", False):
         return
 
     entry_price = pos.entry_price
-    tp_price = pos.tp_price
-    if tp_price is None or entry_price <= 0:
+    if entry_price <= 0:
         return
 
-    tp_distance_pct = (tp_price - entry_price) / entry_price * 100
-    trigger_pct = tp_distance_pct * 0.50
-    trigger_price = entry_price * (1 + trigger_pct / 100)
+    # Stage 2 check (must happen before stage 1 check)
+    if symbol in trailing_activated and symbol not in trailing_stage2:
+        trigger2_price = entry_price * (1 + TRAILING_STOP_STAGE2_PCT / 100)
+        if current_price >= trigger2_price:
+            sym_info = all_symbols.get(symbol)
+            if not sym_info:
+                return
+            tick_size = sym_info.tick_size
+            new_stop = round(entry_price * (1 + TRAILING_STOP_STAGE2_SL_PCT / 100), tick_size)
+            if pos.stop_price is not None and new_stop <= pos.stop_price:
+                return
+            print(f"[Trailing Stage2] {symbol}: price {current_price} >= {TRAILING_STOP_STAGE2_PCT}% trigger. SL: {pos.stop_price} -> {new_stop}", flush=True)
+            if not conf.dry_run:
+                try:
+                    if getattr(pos, 'sl_order_id', None):
+                        await client.cancel_order(symbol=symbol, orderId=pos.sl_order_id)
+                    sl_order = await client.new_order(
+                        symbol=symbol, side='SELL', type='STOP_MARKET',
+                        stopPrice=utils.round_price(new_stop, tick_size),
+                        closePosition='true'
+                    )
+                    pos.sl_order_id = sl_order.get('orderId')
+                except Exception as e:
+                    print(f"[Trailing Stage2 ERROR] {symbol}: {e}", flush=True)
+                    return
+            pos.stop_price = new_stop
+            trailing_stage2.add(symbol)
+            try:
+                async with session() as s:
+                    from sqlalchemy import select
+                    db_trade = (await s.execute(
+                        select(db.Trades).where(db.Trades.symbol == symbol)
+                        .where(db.Trades.status == 'OPEN')
+                        .order_by(db.Trades.open_time.desc()).limit(1)
+                    )).scalar_one_or_none()
+                    if db_trade:
+                        db_trade.stop_price = new_stop
+                        await s.commit()
+            except Exception as e:
+                print(f"[Trailing Stage2 DB ERROR] {symbol}: {e}", flush=True)
+            try:
+                prefix = "🤖 [DRY RUN] " if conf.dry_run else ""
+                text = (f"{prefix}Trailing Stage2 #{symbol}: SL → <b>{new_stop}</b> "
+                        f"(locked +{TRAILING_STOP_STAGE2_SL_PCT}%, price {current_price})")
+                asyncio.create_task(tg.bot.send_message(config.getint('TG', 'CHANNEL'), text))
+            except Exception:
+                pass
+        return  # Don't apply stage 1 if already activated
 
-    if current_price >= trigger_price:
+    # Stage 1 check
+    if symbol in trailing_activated:
+        return
+    trigger1_price = entry_price * (1 + TRAILING_STOP_TRIGGER_PCT / 100)
+    if current_price >= trigger1_price:
         sym_info = all_symbols.get(symbol)
         if not sym_info:
             return
-
         tick_size = sym_info.tick_size
-        new_stop_price = round(entry_price * (1 + TRAILING_STOP_NEW_SL_PCT / 100), tick_size)
-
-        if pos.stop_price is not None and new_stop_price <= pos.stop_price:
+        new_stop = round(entry_price * (1 + TRAILING_STOP_NEW_SL_PCT / 100), tick_size)
+        if pos.stop_price is not None and new_stop <= pos.stop_price:
             return
-
-        print(f"[Trailing Stop] {symbol}: price {current_price} >= 50% TP trigger {trigger_price:.6f}. Moving SL: {pos.stop_price} -> {new_stop_price}", flush=True)
-
+        print(f"[Trailing Stage1] {symbol}: price {current_price} >= {TRAILING_STOP_TRIGGER_PCT}% trigger. SL: {pos.stop_price} -> {new_stop}", flush=True)
         if not conf.dry_run:
             try:
                 if getattr(pos, 'sl_order_id', None):
                     await client.cancel_order(symbol=symbol, orderId=pos.sl_order_id)
                 sl_order = await client.new_order(
                     symbol=symbol, side='SELL', type='STOP_MARKET',
-                    stopPrice=utils.round_price(new_stop_price, tick_size),
+                    stopPrice=utils.round_price(new_stop, tick_size),
                     closePosition='true'
                 )
                 pos.sl_order_id = sl_order.get('orderId')
             except Exception as e:
-                print(f"[Trailing Stop ERROR] Failed to adjust SL on Binance for {symbol}: {e}", flush=True)
+                print(f"[Trailing Stage1 ERROR] {symbol}: {e}", flush=True)
                 return
-
-        pos.stop_price = new_stop_price
+        pos.stop_price = new_stop
         trailing_activated.add(symbol)
-
         try:
             async with session() as s:
                 from sqlalchemy import select
@@ -942,18 +1003,17 @@ async def check_and_apply_trailing_stop(symbol, current_price):
                     .order_by(db.Trades.open_time.desc()).limit(1)
                 )).scalar_one_or_none()
                 if db_trade:
-                    db_trade.stop_price = new_stop_price
+                    db_trade.stop_price = new_stop
                     await s.commit()
         except Exception as e:
-            print(f"[Trailing Stop ERROR] Failed to update stop_price in DB: {e}", flush=True)
-
+            print(f"[Trailing Stage1 DB ERROR] {symbol}: {e}", flush=True)
         try:
             prefix = "🤖 [DRY RUN] " if conf.dry_run else ""
-            text = (f"{prefix}Trailing Stop по #{symbol}: SL перемещён на <b>{new_stop_price}</b> "
-                    f"(locked +{TRAILING_STOP_NEW_SL_PCT}% profit, цена {current_price})")
+            text = (f"{prefix}Trailing Stage1 #{symbol}: SL → <b>{new_stop}</b> "
+                    f"(locked +{TRAILING_STOP_NEW_SL_PCT}%, price {current_price})")
             asyncio.create_task(tg.bot.send_message(config.getint('TG', 'CHANNEL'), text))
-        except Exception as e:
-            print(f"[Trailing Stop TG Alert Error] {e}", flush=True)
+        except Exception:
+            pass
 
 
 async def auto_blacklist_check(symbol):
@@ -1096,54 +1156,49 @@ async def check_market_delta_anomaly(symbol):
 
 
 def get_tp_sl_prices(entry_price, sym_info, atr=None):
-    # Dynamic ATR exits are deactivated to ensure a stable mathematical expectation;
-    # we enforce fixed TP/SL targets (Class C: 0.45%/0.30%, Class D: 0.50%/0.35%) instead.
-    atr = None
+    """v13: ATR-based TP/SL with class-based fallback.
+    TP = 1.5x ATR (capped at 0.70%)
+    SL = 0.8x ATR (capped at 0.40%)
+    R:R target = 1.875
+    """
     symbol = sym_info.symbol
     profile = get_liquidity_class(symbol)
     if profile is None:
-        tp_pct = 0.9
-        sl_pct = 0.3
+        tp_pct = 0.50
+        sl_pct = 0.30
     else:
         tp_pct = profile["tp_pct"]
         sl_pct = profile["sl_pct"]
-        
+
     if atr is not None and atr > 0:
-        # Волатильный расчет TP/SL на основе ATR-14
-        sl_distance = 1.2 * atr
-        tp_distance = 3.0 * atr
-        
-        # Минимальный пол (Floors) - не ближе, чем стандартный sl_pct / tp_pct
-        min_stop_distance = entry_price * (sl_pct / 100)
-        min_take_distance = entry_price * (tp_pct / 100)
-        
-        if sl_distance < min_stop_distance:
-            sl_distance = min_stop_distance
-        if tp_distance < min_take_distance:
-            tp_distance = min_take_distance
-            
-        # Защитное ограничение (Caps) - не дальше, чем 1.5x от стандартного sl_pct / tp_pct
-        max_stop_distance = entry_price * (sl_pct * 1.5 / 100)
-        max_take_distance = entry_price * (tp_pct * 1.5 / 100)
-        
-        if sl_distance > max_stop_distance:
-            sl_distance = max_stop_distance
-        if tp_distance > max_take_distance:
-            tp_distance = max_take_distance
-            
+        # v13: ATR-based with tighter R:R
+        tp_distance = 1.5 * atr
+        sl_distance = 0.8 * atr
+
+        # Floors: never tighter than class-based minimums
+        min_tp = entry_price * (tp_pct / 100)
+        min_sl = entry_price * (sl_pct / 100)
+        tp_distance = max(tp_distance, min_tp)
+        sl_distance = max(sl_distance, min_sl)
+
+        # Caps: never wider than class-based maximums
+        max_tp = entry_price * (tp_pct * 1.4 / 100)
+        max_sl = entry_price * (sl_pct * 1.3 / 100)
+        tp_distance = min(tp_distance, max_tp)
+        sl_distance = min(sl_distance, max_sl)
+
         take_price = utils.round_up(entry_price + tp_distance, sym_info.tick_size)
         stop_price = utils.round_down(entry_price - sl_distance, sym_info.tick_size)
     else:
-        # Стандартный расчет
+        # Fallback: class-based fixed TP/SL
         take_price = utils.round_up(entry_price * (1 + tp_pct / 100), sym_info.tick_size)
         min_stop_distance = max(10 ** -sym_info.tick_size * conf.stop_loss_ticks, entry_price * (sl_pct / 100))
-        # Adaptive cap: stop loss distance should not exceed 1.1 * sl_pct
         max_stop_distance = entry_price * (sl_pct * 1.1 / 100)
         if min_stop_distance > max_stop_distance:
-            # Cap the distance, but keep at least 3 ticks of safety buffer
             min_stop_distance = max(10 ** -sym_info.tick_size * 3, max_stop_distance)
         stop_price = utils.round_down(entry_price - min_stop_distance, sym_info.tick_size)
-    # Safety: stop MUST be below entry, otherwise clamp to 1 tick below
+
+    # Safety: stop MUST be below entry
     if stop_price >= entry_price:
         stop_price = utils.round_down(entry_price - 10 ** -sym_info.tick_size, sym_info.tick_size)
     return take_price, stop_price
@@ -1323,7 +1378,8 @@ async def new_density(symbol, bid_price, bid_volume, ask_volume, num, sent_ns=No
                       lifetime_sec=0.0, refill_count=0, refill_ratio=0.0, absorption_ratio=0.0,
                       buy_vol_5s=0.0, sell_vol_5s=0.0, opportunity_score=0.0, book_imbalance=0.0,
                       microprice_edge_pct=0.0, spread_pct_ob=0.0, distance_pct=0.0,
-                      density_ratio=0.0, wall_to_ask_ratio=0.0, delta_ratio=1.0):
+                      density_ratio=0.0, wall_to_ask_ratio=0.0, delta_ratio=1.0,
+                      bounce_buy_volume=0.0, bounce_confirmed=False):
     global positions
     global volumes_24h
     global last_prices
@@ -1363,7 +1419,9 @@ async def new_density(symbol, bid_price, bid_volume, ask_volume, num, sent_ns=No
                 "distance_pct": distance_pct,
                 "density_ratio": density_ratio,
                 "wall_to_ask_ratio": wall_to_ask_ratio,
-                "delta_ratio": delta_ratio
+                "delta_ratio": delta_ratio,
+                "bounce_buy_volume": bounce_buy_volume,
+                "bounce_confirmed": bounce_confirmed,
             }
         else:
             symbols_densities.pop(symbol, None)
@@ -1545,6 +1603,23 @@ async def new_density(symbol, bid_price, bid_volume, ask_volume, num, sent_ns=No
             print(f"[Фильтр ликвидности] Пропускаем {symbol}: {class_name} (объем плотности ${round(bid_val_usd, 2)} ниже порога ${round(min_density_floor, 0)})")
             return
 
+        # ── v13: ABSORPTION FILTER (core new requirement) ──
+        # Density must have absorbed sell pressure before we enter
+        if absorption_ratio < MIN_ABSORPTION_RATIO:
+            print(f"[Absorption] Skip {symbol}: ratio {absorption_ratio:.2f} < {MIN_ABSORPTION_RATIO} (need sell pressure absorbed by wall)")
+            return
+
+        # ── v13: REFILL FILTER ──
+        # Density must have been refilled (proves real interest, not spoof)
+        if refill_count < MIN_REFILL_COUNT:
+            print(f"[Refill] Skip {symbol}: refills {refill_count} < {MIN_REFILL_COUNT} (wall not proven)")
+            return
+
+        # ── v13: LIFETIME FILTER (tightened) ──
+        if lifetime_sec < MIN_ENTRY_DENSITY_LIFETIME_SECONDS:
+            print(f"[Lifetime] Skip {symbol}: {lifetime_sec:.1f}s < {MIN_ENTRY_DENSITY_LIFETIME_SECONDS}s")
+            return
+
         if balance < conf.order_size * config.getfloat('BOT', 'MIN_NOTIONAL'):
             print(f"{symbol}: {balance} < {conf.order_size} недостаточно средств")
             return
@@ -1718,6 +1793,11 @@ async def new_density(symbol, bid_price, bid_volume, ask_volume, num, sent_ns=No
             "density_ratio": density_ratio,
             "wall_to_ask_ratio": wall_to_ask_ratio,
             "delta_ratio": delta_ratio,
+            "absorption_ratio": absorption_ratio,
+            "refill_count": refill_count,
+            "lifetime_sec": lifetime_sec,
+            "bounce_buy_volume": bounce_buy_volume,
+            "bounce_confirmed": bounce_confirmed,
         }
         positions[symbol] = True
         # запускаем задачу открытия позиции
@@ -1802,7 +1882,19 @@ async def open_position_delayed(symbol, bid_price):
         reject(f"opportunity score decayed: {live_opportunity_score:.2f} < {min_ob_score:.2f}")
         return
 
-    # 2. ПРОВЕРКА БЛИЗОСТИ ЦЕНЫ (Защита от спуфинга: цена должна быть близко к плотности, в пределах 0.50%)
+    # ── v13: ABSORPTION CONFIRMATION ──
+    live_absorption = get_density_value(density_info, "absorption_ratio", candidate.get("absorption_ratio", 0.0))
+    if live_absorption < MIN_ABSORPTION_RATIO:
+        reject(f"absorption decayed: {live_absorption:.2f} < {MIN_ABSORPTION_RATIO}")
+        return
+
+    # ── v13: LIFETIME CONFIRMATION ──
+    live_lifetime = get_density_value(density_info, "lifetime_sec", candidate.get("lifetime_sec", 0.0))
+    if live_lifetime < MIN_ENTRY_DENSITY_LIFETIME_SECONDS:
+        reject(f"lifetime too short after wait: {live_lifetime:.1f}s < {MIN_ENTRY_DENSITY_LIFETIME_SECONDS}s")
+        return
+
+    # 2. ПРОВЕРКА БЛИЗОСТИ ЦЕНЫ (Защита от спуфинга: цена должна быть близко к плотности)
     current_price = last_prices.get(symbol, live_best_bid or live_density_price)
     if current_price > live_density_price * 1.0050:
         reject(f"price is too far from density: {current_price} > {live_density_price * 1.0050:.6f} (potential spoofing)")
@@ -2494,6 +2586,7 @@ async def trade_closed(msg, pos):
         positions.pop(trade.symbol, None)
         clear_pending_entry(trade.symbol)
         trailing_activated.discard(trade.symbol)
+        trailing_stage2.discard(trade.symbol)
         last_close_time[trade.symbol] = time.time()  # v11.3: cooldown after close
         
         # Обновляем кэш исходов сделок (v8.3+)
