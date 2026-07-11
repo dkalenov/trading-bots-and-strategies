@@ -66,6 +66,7 @@ class Position:
         for sym in all_symbols.values():
             if sym.symbol == symbol:
                 self.coin = sym.base_asset
+                break
         else:
             self.coin = ''
 
@@ -188,7 +189,7 @@ ATR_CEIL = {"Class C": 0.35, "Class D": 0.45}
 INSTRUMENT_WHITELIST = set([
     'STG', 'ALICE', 'ZRO', 'SPK', 'INJ', 'STX', 'KAS', 'THETA',
     'ICP', 'BIO', 'BASED', 'RAVE', 'ZORA', 'GWEI', 'BAN',
-    'PIXEL', 'SUI', 'PENGU', 'HBAR',
+    'PIXEL', 'SUI',
 ])
 INSTRUMENT_BLACKLIST_TYPES = {
     'defi': set([
@@ -1201,6 +1202,9 @@ def get_tp_sl_prices(entry_price, sym_info, atr=None):
     # Safety: stop MUST be below entry
     if stop_price >= entry_price:
         stop_price = utils.round_down(entry_price - 10 ** -sym_info.tick_size, sym_info.tick_size)
+    # Safety: take MUST be above entry
+    if take_price <= entry_price:
+        take_price = utils.round_up(entry_price + 10 ** -sym_info.tick_size, sym_info.tick_size)
     return take_price, stop_price
 
 
@@ -1364,13 +1368,6 @@ async def delayed_exit(symbol, pos_obj):
         print(f"WebSocket density for {symbol} still unsafe after {EXIT_DEBOUNCE_SECONDS:.1f}s ({reason}). Closing with limit order first.", flush=True)
         pos_obj.pending_exit_task = None
         pos_obj.pending_exit_reason = ''
-        await close_position(symbol, limit_first=True)
-    return
-    await asyncio.sleep(2.0)
-    # Сверяем, что в памяти все еще эта же позиция, ее статус активен и задание не отменено
-    if positions.get(symbol) is pos_obj and pos_obj.status and pos_obj.pending_exit_task == asyncio.current_task():
-        print(f"WebSocket плотность по {symbol} не вернулась за 2 секунды. Выходим по лимитке.", flush=True)
-        pos_obj.pending_exit_task = None
         await close_position(symbol, limit_first=True)
 
 # функция для обработки плотности
@@ -2424,10 +2421,17 @@ async def set_stop_take(symbol, entry_price, quantity, atr=None):
     # 1. ЗАПИСЫВАЕМ СДЕЛКУ В БД СРАЗУ, ЧТОБЫ ИЗБЕЖАТЬ ГОНКИ СОСТОЯНИЙ
     trade_id = None
     try:
+        # Получаем данные плотности из symbols_densities для сохранения в БД
+        density_data = symbols_densities.get(symbol, {})
+        abs_ratio = density_data.get('absorption_ratio', 0.0)
+        ref_count = density_data.get('refill_count', 0)
+        lt_sec = density_data.get('lifetime_sec', 0.0)
+
         async with session() as s:
             # записываем сделку
             trade = db.Trades(symbol=symbol, order_size=entry_price * quantity, status='OPEN', open_time=utils.get_ts(),
-                              entry_price=entry_price, quantity=quantity, take_price=take_price, stop_price=stop_price)
+                              entry_price=entry_price, quantity=quantity, take_price=take_price, stop_price=stop_price,
+                              absorption_ratio=abs_ratio, refill_count=ref_count, lifetime_sec=lt_sec)
             # добавляем сделку
             s.add(trade)
             # сохраняем изменения в БД
