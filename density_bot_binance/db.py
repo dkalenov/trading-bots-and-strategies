@@ -1,5 +1,5 @@
 from sqlalchemy import Column, Integer, BigInteger, String, Float, Boolean, select, delete, update
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import declarative_base
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 
 
@@ -30,6 +30,9 @@ class Trades(Base):
     stop_price = Column(Float)
     profit = Column(Float)
     tg_message_id = Column(Integer)
+    absorption_ratio = Column(Float, default=0.0)
+    refill_count = Column(Integer, default=0)
+    lifetime_sec = Column(Float, default=0.0)
 
 
 # класс для хранения конфигации

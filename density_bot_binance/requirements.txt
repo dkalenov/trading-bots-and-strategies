@@ -1,0 +1,8 @@
+SQLAlchemy~=2.0.35
+aiogram~=3.13.1
+requests~=2.32.3
+aiohttp~=3.10.5
+ujson~=5.10.0
+websocket~=0.2.1
+websocket-client~=1.8.0
+asyncpg~=0.29.0

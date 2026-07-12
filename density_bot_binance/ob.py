@@ -21,6 +21,11 @@ trades_window = {}      # symbol -> deque of (t_time, price, qty, is_buyer_maker
 active_densities = {}   # symbol -> dict of active density stats
 history_densities = {}  # symbol -> dict of inactive density stats (flicker protection)
 
+# v13: Absorption tracking
+# Track sell waves hitting the density to prove it's real support
+ABSORPTION_WAVE_TIMEOUT = 8.0   # seconds of silence to end a sell wave
+BOUNCE_CONFIRM_WINDOW = 5.0     # seconds to confirm bounce after absorption
+
 
 def run(_symbols, _depth, _ask_volume, _main_queue, testnet, _max_density_level=7):
     global symbols
@@ -110,49 +115,87 @@ def _book_metrics(bids, asks):
     }
 
 
-def _score_bid_candidate(num, bid_price, bid_val_usd, dynamic_min_volume, metrics, buy_vol_5s, sell_vol_5s, delta_ratio):
-    density_ratio = bid_val_usd / max(dynamic_min_volume, 1.0)
-    wall_to_ask_ratio = bid_val_usd / max(metrics["top_ask_value"], 1.0)
+def _score_bid_candidate_v13(num, bid_price, bid_val_usd, dynamic_min_volume, metrics,
+                              buy_vol_5s, sell_vol_5s, delta_ratio,
+                              absorption_ratio, refill_count, lifetime_sec):
+    """v13 scoring: focused on proven absorption and density quality."""
     distance_pct = max((metrics["best_bid"] - bid_price) / metrics["best_bid"] * 100.0, 0.0)
 
     score = 0.0
-    score += min(4.0, density_ratio * 1.6)
-    score += min(3.0, wall_to_ask_ratio * 2.0)
 
-    if 0.01 <= distance_pct <= 0.35:
-        score += 2.0
-    elif distance_pct <= 0.60:
-        score += 0.75
+    # 1. Absorption Quality (0-5 points) - THE key signal
+    #    How much sell volume was absorbed by this density
+    absorption_score = min(5.0, absorption_ratio * 5.0)
+    score += absorption_score
+
+    # 2. Refill Conviction (0-4 points)
+    #    Density being refilled proves real interest, not spoof
+    if refill_count >= 3:
+        refill_score = 4.0
+    elif refill_count >= 2:
+        refill_score = 3.0
+    elif refill_count >= 1:
+        refill_score = 1.5
     else:
-        score -= 3.0
+        refill_score = 0.0
+    score += refill_score
 
+    # 3. Lifetime (0-3 points)
+    #    Longer = less likely spoofing
+    if lifetime_sec >= 30.0:
+        lifetime_score = 3.0
+    elif lifetime_sec >= 20.0:
+        lifetime_score = 2.5
+    elif lifetime_sec >= 15.0:
+        lifetime_score = 2.0
+    elif lifetime_sec >= 10.0:
+        lifetime_score = 1.0
+    else:
+        lifetime_score = 0.0
+    score += lifetime_score
+
+    # 4. Distance from best bid (0-2 points)
+    #    Closer = more likely to be tested
+    if distance_pct <= 0.10:
+        score += 2.0
+    elif distance_pct <= 0.20:
+        score += 1.0
+    elif distance_pct <= 0.40:
+        score += 0.5
+    # else: no points
+
+    # 5. Book Imbalance bonus/penalty (-1 to +2)
     if metrics["imbalance"] >= 0.15:
         score += 2.0
-    elif metrics["imbalance"] >= 0.03:
-        score += 0.75
-    elif metrics["imbalance"] <= -0.15:
-        score -= 2.0
-
-    if metrics["microprice_edge_pct"] >= 0.006:
-        score += 1.5
-    elif metrics["microprice_edge_pct"] <= -0.006:
-        score -= 1.5
-
-    if delta_ratio >= 1.2:
-        score += 1.5
-    elif delta_ratio <= 0.55 and sell_vol_5s > buy_vol_5s:
-        score -= 2.0
-
-    if metrics["spread_pct"] <= 0.05:
+    elif metrics["imbalance"] >= 0.05:
         score += 1.0
-    elif metrics["spread_pct"] >= 0.12:
+    elif metrics["imbalance"] <= -0.15:
         score -= 1.0
 
-    score -= min(num, 10) * 0.15
+    # 6. Microprice edge (-1 to +1)
+    if metrics["microprice_edge_pct"] >= 0.006:
+        score += 1.0
+    elif metrics["microprice_edge_pct"] <= -0.006:
+        score -= 1.0
+
+    # 7. Trade flow delta (-1 to +1)
+    if delta_ratio >= 1.3:
+        score += 1.0
+    elif delta_ratio <= 0.5 and sell_vol_5s > buy_vol_5s:
+        score -= 1.0
+
+    # 8. Spread penalty
+    if metrics["spread_pct"] >= 0.10:
+        score -= 1.0
+
+    # 9. Level penalty (deeper = worse)
+    score -= min(num, 5) * 0.3
+
     return {
         "opportunity_score": round(score, 3),
-        "density_ratio": density_ratio,
-        "wall_to_ask_ratio": wall_to_ask_ratio,
+        "absorption_ratio": round(absorption_ratio, 4),
+        "refill_count": refill_count,
+        "lifetime_sec": round(lifetime_sec, 1),
         "distance_pct": distance_pct,
     }
 
@@ -168,13 +211,18 @@ def _park_active_density(symbol, current_time):
         "refill_volume": active_d["refill_volume"],
         "initial_volume": active_d["initial_volume"],
         "absorbed_sell_volume": active_d["absorbed_sell_volume"],
+        "bounce_buy_volume": active_d.get("bounce_buy_volume", 0.0),
+        "bounce_confirmed": active_d.get("bounce_confirmed", False),
+        "sell_wave_volume": active_d.get("sell_wave_volume", 0.0),
+        "sell_wave_active": active_d.get("sell_wave_active", False),
         "inactive_ts": current_time,
     }
 
 
 def _emit_density(symbol, price, volume, ask_vol, num, event_time, metrics,
                   lifetime_sec, refill_count, refill_ratio, absorption_ratio,
-                  buy_vol_5s, sell_vol_5s, opportunity):
+                  buy_vol_5s, sell_vol_5s, opportunity,
+                  bounce_buy_volume=0.0, bounce_confirmed=False):
     main_queue.put((
         symbol,
         price,
@@ -196,9 +244,11 @@ def _emit_density(symbol, price, volume, ask_vol, num, event_time, metrics,
         metrics.get("microprice_edge_pct", 0.0),
         metrics.get("spread_pct", 0.0),
         opportunity.get("distance_pct", 0.0),
-        opportunity.get("density_ratio", 0.0),
-        opportunity.get("wall_to_ask_ratio", 0.0),
-        opportunity.get("delta_ratio", 1.0),
+        opportunity.get("absorption_ratio", 0.0),
+        opportunity.get("refill_count", 0),
+        opportunity.get("lifetime_sec", 0.0),
+        bounce_buy_volume,
+        bounce_confirmed,
     ))
 
 
@@ -222,10 +272,11 @@ async def on_message(ws, msg):
     data = msg["data"]
     symbol = stream.split("@")[0].upper()
 
+    # ── AGGTRADE: track sell absorption and bounce confirmation ──
     if "aggtrade" in stream.lower():
         p = float(data["p"])
         q = float(data["q"])
-        is_buyer_maker = bool(data["m"])  # True = sell market order, False = buy market order
+        is_buyer_maker = bool(data["m"])  # True = sell market order
         t_time = float(data["T"]) / 1000.0
 
         if symbol not in trades_window:
@@ -238,9 +289,43 @@ async def on_message(ws, msg):
         active_d = active_densities.get(symbol)
         if active_d is not None:
             density_price = active_d["price"]
-            if density_price * 0.9995 <= p <= density_price * 1.0005:
+
+            # ── v13: Track sell waves hitting the density ──
+            if density_price * 0.9997 <= p <= density_price * 1.0003:
                 if is_buyer_maker:
+                    # Sell hitting the density = absorption event
                     active_d["absorbed_sell_volume"] += q
+                    active_d["sell_wave_volume"] += q
+                    active_d["sell_wave_active"] = True
+                    active_d["sell_wave_last_ts"] = current_time
+                else:
+                    # Buy bouncing off density = confirmation
+                    active_d["bounce_buy_volume"] += q
+                    if active_d["sell_wave_volume"] > 0:
+                        active_d["bounce_confirmed"] = True
+
+            # ── v13: End sell wave if timeout ──
+            if active_d.get("sell_wave_active") and active_d.get("sell_wave_last_ts"):
+                wave_age = current_time - active_d["sell_wave_last_ts"]
+                if wave_age > ABSORPTION_WAVE_TIMEOUT:
+                    if active_d["sell_wave_volume"] > 0:
+                        ratio = active_d["sell_wave_volume"] / max(active_d["initial_volume"], 1.0)
+                        if ratio >= 0.3:
+                            print(f"[Absorption] {symbol} @ {density_price}: sell wave ended, "
+                                  f"absorbed {active_d['sell_wave_volume']:.2f} ({ratio:.1%} of wall), "
+                                  f"bounce={'YES' if active_d.get('bounce_confirmed') else 'NO'}",
+                                  flush=True)
+                    active_d["sell_wave_volume"] = 0.0
+                    active_d["sell_wave_active"] = False
+
+            # ── v13: Price approaching density (within 0.05%) ──
+            proximity_pct = abs(p - density_price) / density_price * 100
+            if proximity_pct <= 0.05 and not active_d.get("sell_wave_active"):
+                # Price is very close to density - mark potential absorption start
+                if is_buyer_maker:
+                    active_d["sell_wave_volume"] += q
+                    active_d["sell_wave_active"] = True
+                    active_d["sell_wave_last_ts"] = current_time
         return
 
     if "depth" not in stream.lower():
@@ -290,11 +375,22 @@ async def on_message(ws, msg):
         if bid_val_usd < dynamic_min_volume:
             continue
 
-        opportunity = _score_bid_candidate(
+        # Get absorption stats from active density tracking
+        active_d = active_densities.get(symbol)
+        if active_d and active_d.get("price") == bid_price:
+            absorption_ratio = active_d["absorbed_sell_volume"] / active_d["initial_volume"] if active_d["initial_volume"] > 0 else 0.0
+            refill_count = active_d["refill_count"]
+            lifetime_sec = current_time - active_d["first_seen_ts"]
+        else:
+            absorption_ratio = 0.0
+            refill_count = 0
+            lifetime_sec = 0.0
+
+        opportunity = _score_bid_candidate_v13(
             num, bid_price, bid_val_usd, dynamic_min_volume, metrics,
-            buy_vol_5s, sell_vol_5s, delta_ratio
+            buy_vol_5s, sell_vol_5s, delta_ratio,
+            absorption_ratio, refill_count, lifetime_sec
         )
-        opportunity["delta_ratio"] = delta_ratio
         candidates.append({
             "num": num,
             "price": bid_price,
@@ -334,6 +430,10 @@ async def on_message(ws, msg):
                     "initial_volume": hist["initial_volume"],
                     "last_volume": bid_volume,
                     "absorbed_sell_volume": hist["absorbed_sell_volume"],
+                    "bounce_buy_volume": hist.get("bounce_buy_volume", 0.0),
+                    "bounce_confirmed": hist.get("bounce_confirmed", False),
+                    "sell_wave_volume": 0.0,
+                    "sell_wave_active": False,
                     "last_seen_ts": current_time,
                 }
                 print(f"[Flicker Recovery] {symbol} @ {bid_price} - restored lifetime clock ({round(current_time - hist['first_seen_ts'], 1)}s)", flush=True)
@@ -346,6 +446,10 @@ async def on_message(ws, msg):
                     "initial_volume": bid_volume,
                     "last_volume": bid_volume,
                     "absorbed_sell_volume": 0.0,
+                    "bounce_buy_volume": 0.0,
+                    "bounce_confirmed": False,
+                    "sell_wave_volume": 0.0,
+                    "sell_wave_active": False,
                     "last_seen_ts": current_time,
                 }
             history_densities.pop(symbol, None)
@@ -355,6 +459,8 @@ async def on_message(ws, msg):
         refill_count = active_d["refill_count"]
         refill_ratio = active_d["refill_volume"] / active_d["initial_volume"] if active_d["initial_volume"] > 0 else 0.0
         absorption_ratio = active_d["absorbed_sell_volume"] / active_d["initial_volume"] if active_d["initial_volume"] > 0 else 0.0
+        bounce_buy_volume = active_d.get("bounce_buy_volume", 0.0)
+        bounce_confirmed = active_d.get("bounce_confirmed", False)
 
         if symbol in last_density and last_density[symbol] is not None and last_density[symbol][1] == bid_price_str:
             last_price_float, last_price_str, peak_vol = last_density[symbol]
@@ -364,15 +470,16 @@ async def on_message(ws, msg):
                 _emit_density(
                     symbol, bid_price, bid_volume, ask_vol, best["num"], data.get("E"), metrics,
                     lifetime_sec, refill_count, refill_ratio, absorption_ratio,
-                    buy_vol_5s, sell_vol_5s, best["opportunity"]
+                    buy_vol_5s, sell_vol_5s, best["opportunity"],
+                    bounce_buy_volume, bounce_confirmed
                 )
             return
 
         print(
-            f"Обнаружена alpha-плотность {symbol} цена {bid_price_str.rstrip('0')}, "
-            f"объем ${round(best['value_usd'], 2)}, score={best['opportunity']['opportunity_score']}, "
-            f"level={best['num']}, dist={best['opportunity']['distance_pct']:.3f}%, "
-            f"imb={metrics['imbalance']:.2f}, micro={metrics['microprice_edge_pct']:.4f}%",
+            f"[v13] Density {symbol} @ {bid_price_str.rstrip('0')}, "
+            f"${round(best['value_usd'], 2)}, score={best['opportunity']['opportunity_score']:.1f}, "
+            f"abs={absorption_ratio:.2f}, refills={refill_count}, "
+            f"lifetime={lifetime_sec:.0f}s, bounce={'YES' if bounce_confirmed else 'NO'}",
             flush=True
         )
         last_density[symbol] = (bid_price, bid_price_str, bid_volume)
@@ -380,7 +487,8 @@ async def on_message(ws, msg):
         _emit_density(
             symbol, bid_price, bid_volume, ask_vol, best["num"], data.get("E"), metrics,
             lifetime_sec, refill_count, refill_ratio, absorption_ratio,
-            buy_vol_5s, sell_vol_5s, best["opportunity"]
+            buy_vol_5s, sell_vol_5s, best["opportunity"],
+            bounce_buy_volume, bounce_confirmed
         )
         return
 
@@ -409,25 +517,30 @@ async def on_message(ws, msg):
                     refill_count = active_d["refill_count"]
                     refill_ratio = active_d["refill_volume"] / active_d["initial_volume"] if active_d["initial_volume"] > 0 else 0.0
                     absorption_ratio = active_d["absorbed_sell_volume"] / active_d["initial_volume"] if active_d["initial_volume"] > 0 else 0.0
+                    bounce_buy_volume = active_d.get("bounce_buy_volume", 0.0)
+                    bounce_confirmed = active_d.get("bounce_confirmed", False)
                 else:
                     lifetime_sec = 0.0
                     refill_count = 0
                     refill_ratio = 0.0
                     absorption_ratio = 0.0
+                    bounce_buy_volume = 0.0
+                    bounce_confirmed = False
 
                 opportunity = {
                     "opportunity_score": 0.0,
                     "distance_pct": max((metrics["best_bid"] - last_price_float) / metrics["best_bid"] * 100.0, 0.0),
-                    "density_ratio": 0.0,
-                    "wall_to_ask_ratio": 0.0,
-                    "delta_ratio": delta_ratio,
+                    "absorption_ratio": absorption_ratio,
+                    "refill_count": refill_count,
+                    "lifetime_sec": lifetime_sec,
                 }
                 if current_time - last_density_emit.get(symbol, 0.0) >= DENSITY_HEARTBEAT_SECONDS:
                     last_density_emit[symbol] = current_time
                     _emit_density(
                         symbol, last_price_float, bid_volume, ask_vol, old_num, data.get("E"), metrics,
                         lifetime_sec, refill_count, refill_ratio, absorption_ratio,
-                        buy_vol_5s, sell_vol_5s, opportunity
+                        buy_vol_5s, sell_vol_5s, opportunity,
+                        bounce_buy_volume, bounce_confirmed
                     )
             break
 
@@ -442,5 +555,6 @@ async def on_message(ws, msg):
     _emit_density(
         symbol, None, 0.0, 0.0, -1, data.get("E"), metrics,
         0.0, 0, 0.0, 0.0, 0.0, 0.0,
-        {"opportunity_score": 0.0, "distance_pct": 0.0, "density_ratio": 0.0, "wall_to_ask_ratio": 0.0, "delta_ratio": 1.0}
+        {"opportunity_score": 0.0, "distance_pct": 0.0, "absorption_ratio": 0.0, "refill_count": 0, "lifetime_sec": 0.0},
+        0.0, False
     )
