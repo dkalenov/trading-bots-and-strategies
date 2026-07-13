@@ -1,6 +1,6 @@
 # Density Bot
 
-I first stumbled into HFT while reading Michael Lewis's "Flash Boys." The book describes how firms build server rooms right next to stock exchanges and lay dedicated fiber optic cables just to gain a few microseconds. It got me thinking — if the edge is purely about speed and infrastructure, what happens when you try the same strategy on regular hardware?
+I first stumbled into HFT while reading Michael Lewis's "Flash Boys." The book describes how firms build server rooms right next to stock exchanges and lay dedicated fiber optic cables just to gain a few microseconds. It got me thinking if the edge is purely about speed and infrastructure, what happens when you try the same strategy on regular hardware?
 
 I built this bot to find out. It monitors orderbooks on Binance Futures, detects large bid-wall densities that might act as support, and places limit buys near them. The take-profit is around 1% of price, the stop-loss is tighter, and both were also tested in tick-based variants. The core idea: big buy walls hold price up, so buying near them should work. In practice, it doesn't.
 
@@ -52,7 +52,7 @@ A co-located HFT server achieves network round-trips under **50 microseconds** �
 3. Constructs HTTP request + sends to Binance REST API (~95ms)
 4. Binance processes the order
 
-By step 3, an HFT firm has already completed steps 1-4 and exited their position.
+By step 3, an HFT firm has already completed steps 1-4 and exited its position.
 
 **What actually happened** — 98.4% of the densities this bot detected existed for less than 5 seconds. HFT firms place large orders to bait slower participants, then cancel them before anyone fills. This bot was the bait. The absorption ratio across all trades was 0 — none of the density was ever real.
 
