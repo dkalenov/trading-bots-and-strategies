@@ -19,15 +19,18 @@ Automated trading bots and quantitative strategies for cryptocurrency exchanges 
 
 ## About
 
-19 trading strategies and bots covering:
+Trading strategies and bots covering:
 
-- **Technical Analysis** — EMA, Bollinger Bands, SuperTrend, Williams Fractal, UTBot
-- **Machine Learning** — candlestick pattern recognition
-- **Statistical Arbitrage** — pairs trading (cointegration), mean reversion
-- **Grid Strategies** — grid trading, density bot
-- **Momentum** — spot and futures momentum
-- **Alerts & Triggers** — price alerts, trigger orders
-- **TradingView Signals** — indicator collection and backtesting
+- **Trend Following** — EMA Bot, SuperTrend Bot, UTBot Strategy, Sloping Bot, Sloping Bot 2.0
+- **Volatility / Bands** — Bollinger Futures
+- **Momentum** — Momentum Spot, Momentum Futures
+- **Breakout** — Breakout Spot, Williams Fractal
+- **Pattern Recognition** — Candle Patterns, ML Candle Patterns
+- **Statistical Arbitrage** — Cointegration, Mean Reversion
+- **Grid Trading** — Grid Trading
+- **Orderbook Analysis** — Density Bot
+- **Signals** — TradingView Screener, Trigger Orders
+- **Alerts** — Price Alerts
 
 ---
 
@@ -64,79 +67,7 @@ Automated trading bots and quantitative strategies for cryptocurrency exchanges 
 
 ---
 
-## Project Structure
 
-```
-trading-bots-and-strategies/
-├── EMA_bot_bybit/                  EMA crossover, Bybit
-├── ML_candle_patterns_bot/         ML candlestick patterns
-├── UTBot_Strategy/                 UTBot indicator
-├── boll_bybit_futures/             Bollinger Bands, Bybit
-├── breakout_spot_binance/          Volume breakout, Binance
-├── candle_pattern_strategy/        Candlestick patterns
-├── cointegration/                  Pairs trading
-├── density_bot_binance/            Orderbook density, Binance
-├── grid_trading_binance_futures/   Grid trading, Binance
-├── mean_reversion_strategy/        Mean reversion, Bybit
-├── momentum_binance_spot/          Momentum, Binance Spot
-├── momentum_futures_bot/           Momentum, Binance Futures
-├── price_alerts_binance/           Stub
-├── sloping_bot_2.0/                Sloping v2, Binance
-├── sloping_bot_binance/            Sloping v1, Binance
-├── supertrend_bot_binance/         SuperTrend + ADX, Binance
-├── tradingview_screener/           TradingView signals, Binance
-├── trigger_orders_bot/             S/R triggers, Binance
-└── williams_fractal_strategy/      Williams Fractal
-```
-
-### Root-level files
-
-| File | Description |
-|------|-------------|
-| `main.py` | Density Bot — main process (Binance Futures) |
-| `ob.py` | Orderbook processor — WebSocket L2 depth + aggTrades |
-| `backtest_by_month.py` | Hyperopt-powered monthly backtest framework |
-| `func_cointegration_base_plus_improve.py` | Cointegration pair scanner (Engle-Granger) |
-| `Sloping_backtest.ipynb` | Sloping strategy backtest |
-| `backtest_results_1h_BTC.csv` | BTC 1h backtest results |
-| `klines_data_30m.csv`, `klines_data_4h.csv` | Historical kline data |
-
----
-
-## Tech Stack
-
-- **Language:** Python 3.8+
-- **Libraries:** pandas, numpy, ccxt, ta, scikit-learn, matplotlib, seaborn
-- **ML:** PyTorch, Scikit-learn (GradientBoosting)
-- **Exchanges:** Binance (ccxt), Bybit (API)
-- **Notifications:** Telegram Bot API
-- **Data:** Jupyter Notebook, CSV
-
----
-
-## Installation
-
-```bash
-git clone https://github.com/dkalenov/trading-bots-and-strategies.git
-cd trading-bots-and-strategies
-pip install -r requirements.txt
-```
-
-For individual strategies, see `requirements.txt` in the strategy folder.
-
----
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md).
-
----
-
-## License
-
-MIT License — see [LICENSE](LICENSE).
-
----
 
 ## Contacts
 
