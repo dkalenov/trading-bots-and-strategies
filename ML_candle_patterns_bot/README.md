@@ -18,6 +18,8 @@ GradientBoosting classifier trained on 13 technical patterns + indicators.
 3. Train GradientBoosting on pattern features
 4. Generate LONG/SHORT signals based on model predictions
 
+   
+
 ## Candlestick Patterns
 
 | # | Pattern | Type | Description |
