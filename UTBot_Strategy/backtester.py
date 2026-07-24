@@ -181,9 +181,10 @@ class Backtester:
         else:
             gross_pnl = (position['entry_price'] - exit_price) * quantity
 
-        # Funding cost: funding_rate per interval, paid every funding_interval_bars
+        # Funding cost: charged on borrowed amount (notional - margin)
         funding_periods = bars_held / self.funding_interval_bars
-        funding_cost = notional * self.funding_rate * funding_periods
+        borrowed = notional * (1 - 1 / self.max_leverage)
+        funding_cost = borrowed * self.funding_rate * funding_periods
 
         # Total costs
         total_commission = position['entry_commission'] + exit_commission
@@ -281,7 +282,7 @@ class Backtester:
                         exit_price = position['take_profit']
                         exit_reason = 'TAKE_PROFIT'
                     elif signal == Signal.SELL:
-                        exit_price = close * (1 - self.slippage_rate)
+                        exit_price = close
                         exit_reason = 'SIGNAL_SELL'
                 else:
                     if high >= position['stop_loss']:
@@ -291,7 +292,7 @@ class Backtester:
                         exit_price = position['take_profit']
                         exit_reason = 'TAKE_PROFIT'
                     elif signal == Signal.BUY:
-                        exit_price = close * (1 + self.slippage_rate)
+                        exit_price = close
                         exit_reason = 'SIGNAL_BUY'
 
                 if exit_price is not None:
@@ -369,14 +370,14 @@ class Backtester:
                     elif high >= position['take_profit']:
                         exit_price, exit_reason = position['take_profit'], 'TAKE_PROFIT'
                     elif signal == Signal.SELL:
-                        exit_price, exit_reason = close * (1 - self.slippage_rate), 'SIGNAL_SELL'
+                        exit_price, exit_reason = close, 'SIGNAL_SELL'
                 else:
                     if high >= position['stop_loss']:
                         exit_price, exit_reason = position['stop_loss'], 'STOP_LOSS'
                     elif low <= position['take_profit']:
                         exit_price, exit_reason = position['take_profit'], 'TAKE_PROFIT'
                     elif signal == Signal.BUY:
-                        exit_price, exit_reason = close * (1 + self.slippage_rate), 'SIGNAL_BUY'
+                        exit_price, exit_reason = close, 'SIGNAL_BUY'
 
                 if exit_price is not None:
                     trade = self._close_position(position, exit_price, timestamp, exit_reason, bars_held)
@@ -451,14 +452,14 @@ class Backtester:
                     elif high >= position['take_profit']:
                         exit_price, exit_reason = position['take_profit'], 'TAKE_PROFIT'
                     elif signal == Signal.SELL:
-                        exit_price, exit_reason = close * (1 - self.slippage_rate), 'SIGNAL_SELL'
+                        exit_price, exit_reason = close, 'SIGNAL_SELL'
                 else:
                     if high >= position['stop_loss']:
                         exit_price, exit_reason = position['stop_loss'], 'STOP_LOSS'
                     elif low <= position['take_profit']:
                         exit_price, exit_reason = position['take_profit'], 'TAKE_PROFIT'
                     elif signal == Signal.BUY:
-                        exit_price, exit_reason = close * (1 + self.slippage_rate), 'SIGNAL_BUY'
+                        exit_price, exit_reason = close, 'SIGNAL_BUY'
 
                 if exit_price is not None:
                     trade = self._close_position(position, exit_price, timestamp, exit_reason, bars_held)
@@ -534,10 +535,10 @@ class Backtester:
                     elif high >= position['take_profit']:
                         exit_price, exit_reason = position['take_profit'], 'TAKE_PROFIT'
                     elif signal == Signal.SELL:
-                        exit_price, exit_reason = close * (1 - self.slippage_rate), 'SIGNAL_SELL'
+                        exit_price, exit_reason = close, 'SIGNAL_SELL'
                     else:
                         trailing_stop_price = peak_price * (1 - params.trailing_stop_pct / 100)
-                        if close < trailing_stop_price and peak_price > position['entry_price']:
+                        if low < trailing_stop_price and peak_price > position['entry_price']:
                             exit_price, exit_reason = trailing_stop_price, 'TRAILING_STOP'
                 else:
                     if high >= position['stop_loss']:
@@ -545,10 +546,10 @@ class Backtester:
                     elif low <= position['take_profit']:
                         exit_price, exit_reason = position['take_profit'], 'TAKE_PROFIT'
                     elif signal == Signal.BUY:
-                        exit_price, exit_reason = close * (1 + self.slippage_rate), 'SIGNAL_BUY'
+                        exit_price, exit_reason = close, 'SIGNAL_BUY'
                     else:
                         trailing_stop_price = peak_price * (1 + params.trailing_stop_pct / 100)
-                        if close > trailing_stop_price and peak_price < position['entry_price']:
+                        if high > trailing_stop_price and peak_price < position['entry_price']:
                             exit_price, exit_reason = trailing_stop_price, 'TRAILING_STOP'
 
                 if exit_price is not None:
