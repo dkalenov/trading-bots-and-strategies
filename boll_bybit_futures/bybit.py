@@ -6,11 +6,14 @@ import time
 
 class BybitApi:
     BASE_LINK = 'https://api.bybit.com'
+    TESTNET_LINK = 'https://api-testnet.bybit.com'
 
-    def __init__(self, api_key=None, secret_key=None, futures=False):
+    def __init__(self, api_key=None, secret_key=None, futures=False, testnet=False):
         self.api_key = api_key
         self.secret_key = secret_key
         self.futures = futures
+        self.testnet = testnet
+        self.BASE_LINK = self.TESTNET_LINK if testnet else self.BASE_LINK
 
         if self.futures:
             self.category = 'linear'
