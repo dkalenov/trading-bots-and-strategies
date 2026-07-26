@@ -1,9 +1,11 @@
+import os
 import pandas as pd
 import requests
 from binance.client import Client
-from config import api, api_secret
 
 
+api = os.environ.get('BINANCE_API_KEY', '')
+api_secret = os.environ.get('BINANCE_API_SECRET', '')
 client = Client(api, api_secret, tld="com", testnet=True)
 
 class Bot:
@@ -25,7 +27,7 @@ class Bot:
         price = float(response.json()['price'])
         return price
 
-        def sell_limit(self, symbol, volume, price):
+    def sell_limit(self, symbol, volume, price):
         output = client.futures_create_order(
             symbol=symbol,
             side=Client.SIDE_SELL,
@@ -98,35 +100,30 @@ class Bot:
         current_price = self.get_mark_price(self.symbol)
         for i in range(n):
             buy_price = float(
-                round(((pct_change / 100) * current_price * adj_sell * self.proportion) + current_price, self.no_of_decimals))
+                round(((pct_change / 100) * current_price * adj_buy * self.proportion) + current_price, self.no_of_decimals))
             self.buy_limit(self.symbol, self.volume, buy_price)
             pct_change -= 1
             adj_buy += 0.2
 
     def cal_tp_level(self, symbol, tp):
-        try:
-            x = client.futures_position_information(symbol=symbol)
-            df = pd.DataFrame(x)
-            df = df.loc[df["positionAmt"] != "0.000"]
-            t_margin = (float(df["entryPrice"][0]) * abs(float(df["positionAmt"][0]))) / float(df["leverage"][0])
-            profit = float(t_margin * tp * 0.01)
-            price = round((profit / float(df["positionAmt"][0])) + float(df["entryPrice"][0]), self.no_of_decimals)
-            t_position_amt = 0
-            for index in df.index:
-                t_position_amt += abs(float(df["positionAmt"][index]))
-            return price, t_position_amt
-
-        except:
-            pass
+        x = client.futures_position_information(symbol=symbol)
+        df = pd.DataFrame(x)
+        df = df.loc[df["positionAmt"] != "0.000"]
+        if len(df) == 0:
+            return None, 0
+        t_margin = (float(df["entryPrice"].iloc[0]) * abs(float(df["positionAmt"].iloc[0]))) / float(df["leverage"].iloc[0])
+        profit = float(t_margin * tp * 0.01)
+        price = round((profit / float(df["positionAmt"].iloc[0])) + float(df["entryPrice"].iloc[0]), self.no_of_decimals)
+        t_position_amt = 0
+        for index in df.index:
+            t_position_amt += abs(float(df["positionAmt"].iloc[index]))
+        return price, t_position_amt
 
     def place_tp_order(self, symbol, price, t_position_amt, direction):
-        try:
-            if direction == "LONG":
-                self.sell_limit(symbol, t_position_amt, price)
-            if direction == "SHORT":
-                self.buy_limit(symbol, t_position_amt, price)
-        except:
-            self.place_tp_order(symbol, price, t_position_amt, direction)
+        if direction == "LONG":
+            self.sell_limit(symbol, t_position_amt, price)
+        if direction == "SHORT":
+            self.buy_limit(symbol, t_position_amt, price)
 
     def run(self):
         while True:
@@ -146,14 +143,18 @@ class Bot:
                     if direction == "SHORT":
                         print("close sell")
                         self.close_buy_orders(self.symbol)
-                except:
-                    pass
+                except Exception as e:
+                    print(f"Error closing orders: {e}")
                 price0, amount0 = self.cal_tp_level(self.symbol, self.tp)
+                if price0 is None:
+                    continue
                 self.place_tp_order(self.symbol, price0, amount0, direction)
                 is_ok = True
                 while is_ok:
                     try:
                         price1, amount1 = self.cal_tp_level(self.symbol, self.tp)
+                        if price1 is None:
+                            break
                         print(f"price: {price1} amount: {amount1}")
                         if price1 != price0 or amount1 != amount0:
                             if direction == "LONG":
@@ -163,8 +164,8 @@ class Bot:
                             self.place_tp_order(self.symbol, price1, amount1, direction)
                             price0 = price1
                             amount0 = amount1
-                    except:
-                        pass
+                    except Exception as e:
+                        print(f"Error updating TP: {e}")
 
                     y = client.futures_position_information(symbol=self.symbol)
                     df2 = pd.DataFrame(y)
@@ -173,5 +174,5 @@ class Bot:
                         try:
                             self.close_orders(self.symbol)
                             is_ok = False
-                        except:
-                            pass
+                        except Exception as e:
+                            print(f"Error closing final orders: {e}")
