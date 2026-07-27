@@ -1,159 +1,189 @@
-# Grid Trading Bot — Binance Futures
+# Grid Trading Bot — Binance USD-M Futures
 
-Automated grid trading bot that places limit orders at fixed price intervals for Binance Futures.
+A grid-trading bot and backtester for Binance USD-M Futures. This version is a
+full rewrite of the original project after a code audit found that the
+backtester and the live bot implemented two **different, disconnected
+strategies** (see "What changed" below) — the numbers in the old README did
+not describe what the live bot would actually have done.
 
-**DISCLAIMER:** This is for educational and research purposes only. Trading cryptocurrencies involves high risk of total loss. The author is not responsible for any financial losses. Do not use with real money without fully understanding the risks.
+## Strategy
 
-## How It Works
+1. While **flat**, the bot places `n_levels` buy limit orders below the
+   current price and `n_levels` sell limit orders above it, evenly spaced
+   `proportion`% apart.
+2. The first side to fill sets the **direction** (a buy fill → LONG, a sell
+   fill → SHORT). The untouched orders on the *opposite* side are cancelled
+   immediately — you don't want a stray grid order flipping your position.
+3. Same-direction grid orders are left resting, so the position can
+   **average in** further (up to `n_levels` fills total) if price keeps
+   moving against it.
+4. A single **take-profit** order for the whole averaged position is kept in
+   sync every poll. `tp_pct` is a **% ROI on the margin used**, not a raw
+   price-move % — it already accounts for leverage, the same way "ROI%"
+   works in the Binance app. With `leverage=1` the two are close in
+   practice.
+5. An optional **stop-loss** (`stop_loss_pct`, same ROI-based units) can
+   force-close the position early. It's `None` (disabled) by default,
+   matching the classic "grid bot has no stop-loss" behaviour — but see
+   **Risk** below for why you probably want to set one.
+6. Once the position is flat again (TP, stop-loss, or liquidation), a fresh
+   grid is drawn around the current price.
 
-Grid trading places a "grid" of limit orders around the current price:
-- **Buy orders** placed at fixed intervals BELOW current price
-- **Sell orders** placed at fixed intervals ABOVE current price
-- When a buy fills → a sell is placed at the take-profit level
-- When a sell fills → a buy is placed at the lower grid level
-- The bot profits from price oscillation within the grid range
+`grid_strategy.py` contains this logic as pure functions with no exchange
+client and no backtest-only bits — both `backtest.py` and `binance_bot.py`
+import from it, so they cannot silently diverge again.
 
-### Grid Trading vs Trend Following
-
-| Feature | Grid Trading | Trend Following |
-|---------|-------------|-----------------|
-| Best market | Sideways / ranging | Trending |
-| Entry trigger | Pre-set price levels | Indicator signal |
-| Profit source | Price oscillation | Directional moves |
-| Risk | Large drawdown in strong trend | Whipsaws in sideways |
-| Win rate | High (~60-80%) | Low (~25-40%) |
-| Avg win | Small (grid spacing) | Large (trend extension) |
-
-### When Grid Trading Works
-
-- **Ranging markets** — price oscillates between support and resistance
-- **High volatility** — more grid fills = more profit
-- **Mean-reverting assets** — price tends to return to mean
-
-### When Grid Trading Fails
-
-- **Strong trends** — all grid levels on one side fill, large drawdown
-- **Low volatility** — few fills, capital sits idle
-- **Breakouts** — grid gets trapped on wrong side
-
-## Files
+## Project structure
 
 | File | Purpose |
-|------|---------|
-| `main.py` | Entry point — creates bot instances for BTCUSDT and ETHUSDT |
-| `binance_bot.py` | Core logic: grid drawing, order management, TP calculation |
-| `backtest.py` | Grid backtester with historical Binance data |
-| `config.py` | API key/secret configuration (env vars) |
-| `requirements.txt` | Python dependencies |
+|---|---|
+| `grid_strategy.py` | Shared strategy math (grid levels, TP/SL price, liquidation estimate) — single source of truth |
+| `backtest.py` | Historical simulation against Binance Vision kline data |
+| `binance_bot.py` | Live execution on Binance USD-M Futures |
+| `main.py` | Entry point — configure symbols/parameters and start the bot(s) |
+| `config.py` | Reads `BINANCE_API_KEY` / `BINANCE_API_SECRET` from the environment |
+| `klines/` | Cached monthly kline data (auto-downloaded on first backtest run) |
 
-## Quick Start
+## Setup
 
 ```bash
-# Install
 pip install -r requirements.txt
 
-# Backtest
-python backtest.py --symbol BTCUSDT --interval 1h --n-levels 10 --tp 5
+export BINANCE_API_KEY="your-testnet-key"
+export BINANCE_API_SECRET="your-testnet-secret"
+```
 
-# Live bot (testnet)
-export BINANCE_API_KEY=your_testnet_key
-export BINANCE_API_SECRET=your_testnet_secret
+Get testnet keys at https://testnet.binancefuture.com. **Do not use mainnet
+keys until you've watched the bot run correctly on testnet for a while and
+understand the Risk section below.**
+
+## Running the backtest
+
+```bash
+python backtest.py --symbol BTCUSDT --interval 1h --start 2024-01 --end 2025-06 \
+    --n-levels 10 --proportion 1.5 --tp 3 --stop-loss 10 --leverage 1 --capital 10000
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--symbol` | `BTCUSDT` | Futures symbol |
+| `--interval` | `1h` | Kline interval |
+| `--start` / `--end` | `2024-01` / `2025-06` | `YYYY-MM` inclusive range |
+| `--n-levels` | `10` | Buy levels **and** sell levels |
+| `--proportion` | `1.5` | Grid spacing, % between adjacent levels |
+| `--volume` | `0.05` | Order size per level, in base asset |
+| `--tp` | `3.0` | Take-profit, % ROI on margin used |
+| `--stop-loss` | disabled | Stop-loss, % ROI loss on margin used |
+| `--leverage` | `1` | Account leverage (affects margin & TP/SL price distance) |
+| `--capital` | `10000` | Starting balance, USDT |
+| `--commission` | `0.04` | Taker commission, % of notional per fill |
+| `--slippage` | `0.05` | Slippage, % applied against you on every fill |
+
+Kline data is cached under `klines/` (already includes BTCUSDT 1h,
+Jan 2022 – Jun 2025 — validated gap-free, 30,648 candles, no duplicates).
+Other symbols/ranges are downloaded automatically from
+`data.binance.vision` on first use.
+
+## Running the live bot
+
+Edit the `SYMBOLS` list and `TESTNET` flag in `main.py`, then:
+
+```bash
 python main.py
 ```
 
-## Parameters
+Each symbol runs in its own thread, polling every `POLL_INTERVAL` seconds
+(default 5s) — the loop sleeps between iterations and backs off
+exponentially on errors, instead of hammering the REST API.
 
-### Grid Parameters
+## Honest backtest results (BTCUSDT, 1h, after the fix)
 
-| Param | Default | Description |
-|-------|---------|-------------|
-| `n` | 15 | Number of grid levels per side |
-| `proportion` | 1.5% | Grid spacing — distance between levels |
-| `volume` | 0.05 | Trade volume per grid level (in base asset) |
-| `tp` | 3% | Take profit percentage per grid cycle |
-| `no_of_decimals` | 1 | Price rounding precision |
+Same grid (`n_levels=10`, `proportion=1.5%`, `tp=3%` ROI, `leverage=1`),
+$10,000 starting capital, run separately per calendar period:
 
-### Backtest Parameters
+| Period | No stop-loss | With 10% stop-loss |
+|---|---|---|
+| 2022 (bear market) | **-47.90%**, max DD 62.1%, 94.4% win rate | **+1.65%**, max DD 27.5%, 88.5% win rate |
+| 2023 | **-122.23%**, max DD 133.4% (1 stuck cycle) | **-22.90%**, max DD 34.2%, 84.3% win rate |
+| 2024 | **-112.60%**, max DD 143.8% (1 stuck cycle) | **-1.71%**, max DD 42.0%, 85.1% win rate |
+| 2025 H1 (calmer market) | **+30.53%**, max DD 19.1%, 94.4% win rate | **+12.89%**, max DD 30.6%, 84.1% win rate |
+| Full 2022-01 → 2025-06, one continuous run | **-126.99%**, max DD 126.3%, 97.1% win rate (34/35 cycles won) | **-26.37%**, max DD 36.9%, 85.1% win rate |
 
-| Param | Default | Description |
-|-------|---------|-------------|
-| `--symbol` | BTCUSDT | Trading pair |
-| `--interval` | 1h | Candle interval |
-| `--start` | 2024-01 | Backtest start date |
-| `--end` | 2025-06 | Backtest end date |
-| `--n-levels` | 15 | Grid levels per side |
-| `--proportion` | 1.5 | Grid spacing % |
-| `--tp` | 3.0 | Take profit % |
-| `--capital` | $10,000 | Initial capital |
-| `--slippage` | 0.05% | Slippage per trade |
+These are real, reproducible numbers from the data in `klines/` — run
+`backtest.py` yourself with the commands above to verify them.
 
-## Architecture
+**Why the win rate and the total return disagree so sharply:** in the
+"no stop-loss" full-period run, 34 of 35 cycles closed at a small profit —
+and then a single SHORT position, opened in February 2024 at an average
+entry around $46,400, never found a take-profit because BTC rallied
+straight through to over $107,000 by June 2025. With no stop-loss and no
+liquidation at 1x leverage, that one position stayed open for the rest of
+the backtest and lost about $18,200 — more than the account's starting
+capital. A 97% win rate strategy with unbounded position duration and no
+exit plan for a sustained one-directional trend can still blow up the
+account. **This is exactly the risk the old, buggy backtest hid** — its
+take-profit logic wasn't actually tied to real entries, so it could close
+out "trades" at arbitrary grid levels regardless of real exposure, and
+never surfaced this failure mode at all.
 
-```
-REST API (price)  ──→  Grid Calculation
-                         ↓
-Limit Orders  ──→  Binance Futures API
-                         ↓
-Order Fill Detection  ──→  Opposite Side Cancel + TP Placement
-                         ↓
-Grid Redraw  ──→  New cycle
-```
+## Risk (read this before using real funds)
 
-- **Grid drawing**: N sell orders above, N buy orders below current price
-- **Order management**: When buy fills, cancel opposite sells and place TP
-- **Position tracking**: Uses Binance position information API
-- **Multi-symbol**: Runs BTCUSDT and ETHUSDT in parallel threads
+- **No stop-loss by default.** A static grid with no stop-loss has
+  theoretically unbounded loss on the side that gets "stuck" during a
+  sustained trend, as shown above. Consider setting `stop_loss_pct`.
+- **Liquidation is only roughly estimated** in the backtest
+  (`entry * (1 ± 1/leverage)`, ignoring Binance's maintenance-margin
+  tiers and fees) and is not actively managed in the live bot — the
+  optional stop-loss is your own protection layer; Binance's actual
+  liquidation engine is a separate, harsher backstop you do not want to
+  rely on.
+- **No funding-rate simulation.** Perpetual futures pay/receive funding
+  every 8 hours; over a multi-month held position this can be a
+  meaningful additional cost or benefit, and it's not modeled here.
+  With leverage=1, this is proportionally very small.
+- **Intra-candle fill order is a heuristic**, not certain knowledge: the
+  backtest infers whether price moved low-then-high or high-then-low
+  within a candle from whether the candle closed up or down. This
+  reduces, but does not eliminate, optimistic look-ahead bias from OHLC
+  data.
+- **No partial fills / order-book depth.** Every fill assumes the full
+  order size executes at the level price plus slippage.
+- **One-way position mode assumed.** The live bot reads
+  `futures_position_information` and sums `positionAmt` across whatever
+  rows come back; it hasn't been tested against a hedge-mode account
+  running separate LONG and SHORT positions simultaneously.
+- Nothing here is financial advice. Test on testnet, understand the
+  mechanics, and only risk money you can afford to lose.
 
-## Backtest Results
+## What changed from the original version (audit summary)
 
-BTCUSDT 1h, 15 levels, 1.5% spacing, 0.05 BTC/level, 3% TP, $10,000 capital:
+The earlier version of this project had `backtest.py` and `binance_bot.py`
+implementing two unrelated strategies, plus several live-trading bugs:
 
-| Period | Return | Max DD | Win Rate | Trades | Profit Factor |
-|--------|--------|--------|----------|--------|---------------|
-| 2022 (Bear) | -4.32% | 41.49% | 48.5% | 206 | 0.95 |
-| 2023 (Sideways) | +38.39% | 8.89% | 81.6% | 98 | 10.00 |
-| 2024-2025 (Bull) | +89.29% | 29.76% | 70.2% | 168 | 2.51 |
+- **`--tp` did nothing in the old backtester** — take-profit price came
+  from a static grid level, never from the actual entry price, so the
+  backtest wasn't testing the strategy the bot actually runs.
+- **The old live bot's grid formula and the old backtest's grid formula
+  were different functions** (a compounding per-level multiplier vs. a
+  flat `%`), and the two files used the `proportion` parameter in
+  incompatible units — the backtested grid was roughly 100x wider than
+  the grid the default live config would have drawn.
+- **`get_mark_price()` called the *spot* ticker endpoint** to price a
+  *futures* grid. On testnet these are two entirely separate exchanges
+  (`testnet.binance.vision` vs `testnet.binancefuture.com`).
+- Position size was compared with a hardcoded string (`!= "0.000"`),
+  which silently breaks for symbols whose API response uses a different
+  decimal precision.
+- `cal_tp_level` indexed a filtered DataFrame with `.iloc[index]` using
+  the *original* (non-reset) index labels — works by luck in one-way
+  mode with a single position row, raises `IndexError` in hedge mode.
+- The live polling loop had no rate limiting (`while True` with no
+  `sleep`), risking an IP ban from Binance.
+- `requirements.txt` was missing `numpy`, `python-dateutil`, and `pytz`,
+  which `backtest.py` actually imports.
 
-### Key Observations
-
-- **Sideways markets are ideal** — 81.6% win rate, 10x profit factor, minimal drawdown
-- **Bull markets work well** — 70% win rate, strong returns, but higher drawdown (29%)
-- **Bear markets are dangerous** — grid buys accumulate, forced closes at losses, 41% drawdown
-- **Forced closes** happen when price drops through all grid levels without recovering
-
-> Note: Grid trading backtests simulate fill events but cannot perfectly replicate
-> order book dynamics, partial fills, or real-time slippage. Results are directional estimates.
-
-## What is Implemented
-
-### binance_bot.py — Core Bot:
-
-- Grid drawing with configurable levels and spacing
-- Limit order placement (buy + sell)
-- Order cancellation (all, buy-only, sell-only)
-- Position direction detection (LONG/SHORT/FLAT)
-- Take-profit calculation and placement
-- Dynamic TP adjustment as position changes
-- Multi-symbol support via threading
-
-### backtest.py — Backtester:
-
-- Historical data download from Binance Vision (futures)
-- Grid simulation with fill detection
-- PnL tracking per grid cycle
-- Win rate and average PnL statistics
-
-## What is NOT Implemented
-
-- No stop-loss (relies on grid range)
-- No trailing stop
-- No dynamic grid adjustment based on volatility
-- No position size optimization
-- No Telegram notifications
-- No order book simulation (limit order fills only)
-
-## Contacts
-
-Telegram: @KDR_98
-LinkedIn: dmitrii-kalenov
-Email: drkalenov@gmail.com
+This rewrite fixes all of the above, adds an optional stop-loss and a
+simplified liquidation check to the backtester, gives orders proper
+`clientOrderId` tags so the live bot always knows which resting order is
+which, and pulls real price/quantity precision from
+`futures_exchange_info` instead of a hardcoded decimal count.

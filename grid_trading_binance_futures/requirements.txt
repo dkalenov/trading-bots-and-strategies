@@ -1,3 +1,6 @@
 pandas
+numpy
 requests
 python-binance
+python-dateutil
+pytz

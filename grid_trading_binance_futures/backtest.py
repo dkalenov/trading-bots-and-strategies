@@ -1,9 +1,24 @@
 """
 Grid Trading Bot — Backtester.
 
-Simulates grid trading on historical Binance Futures data.
-Places N buy orders below price and N sell orders above.
-Tracks complete grid cycles (buy → sell) for realistic win rate.
+Simulates the SAME strategy that binance_bot.py trades live:
+- N buy levels below price, N sell levels above price (see grid_strategy.py)
+- First side to fill sets the direction; the opposite side is cancelled
+- Same-direction grid orders stay live so the position can average in
+- One dynamic take-profit order for the whole averaged position
+  (tp_pct = % ROI on margin used, so it scales with leverage)
+- Optional stop-loss (stop_loss_pct) and a simplified liquidation check
+  when leverage > 1
+
+Modeling choices / known simplifications (see README "Limitations"):
+- Intra-candle fill order is inferred from candle direction (close>=open
+  => assume open->low->high->close, else open->high->low->close). This
+  reduces, but does not eliminate, OHLC look-ahead bias.
+- Liquidation price ignores maintenance-margin tiers and funding.
+- Fills assume full size executes at the level price plus slippage —
+  no partial fills / order-book depth simulation.
+- Only ONE grid "cycle" is open at a time (matches the live bot: it does
+  not run independent concurrent long+short grids).
 """
 
 import os
@@ -17,8 +32,20 @@ from datetime import datetime
 from dateutil.relativedelta import relativedelta
 from pytz import timezone
 
+from grid_strategy import (
+    GridConfig,
+    generate_grid_levels,
+    calculate_tp_price,
+    calculate_stop_price,
+    estimate_liquidation_price,
+    weighted_average_entry,
+)
+
 
 def download_klines(symbol, interval, start_date, end_date, klines_dir='klines'):
+    """Download+parse monthly kline zips from Binance Vision (USD-M futures),
+    using local cache in `klines_dir` if already present. Warns on any gap
+    in the resulting series."""
     start = datetime.strptime(start_date, '%Y-%m')
     end = datetime.strptime(end_date, '%Y-%m')
     months = []
@@ -42,8 +69,10 @@ def download_klines(symbol, interval, start_date, end_date, klines_dir='klines')
                     with open(file_path, 'wb') as f:
                         f.write(r.content)
                 else:
+                    print(f"  [warn] no data for {month} (HTTP {r.status_code}) — skipping")
                     continue
-            except Exception:
+            except Exception as e:
+                print(f"  [warn] failed to download {month}: {e} — skipping")
                 continue
 
         try:
@@ -52,19 +81,21 @@ def download_klines(symbol, interval, start_date, end_date, klines_dir='klines')
                 with zf.open(csv_name, 'r') as csv_file:
                     reader = csv.reader(io.TextIOWrapper(csv_file, 'utf-8'))
                     for row in reader:
-                        if row[0].isdigit():
-                            ts = int(row[0])
-                            if ts > 1e15:
-                                ts = ts / 1000
-                            klines['Date'].append(
-                                datetime.fromtimestamp(ts / 1000, tz=timezone('UTC'))
-                            )
-                            klines['Open'].append(float(row[1]))
-                            klines['High'].append(float(row[2]))
-                            klines['Low'].append(float(row[3]))
-                            klines['Close'].append(float(row[4]))
-                            klines['Volume'].append(float(row[5]))
-        except (zipfile.BadZipFile, KeyError):
+                        if not row or not row[0].isdigit():
+                            continue  # skip header row(s) / blank lines
+                        ts = int(row[0])
+                        if ts > 1e15:       # microsecond timestamps (newer Binance format)
+                            ts = ts / 1000  # -> milliseconds
+                        klines['Date'].append(
+                            datetime.fromtimestamp(ts / 1000, tz=timezone('UTC'))
+                        )
+                        klines['Open'].append(float(row[1]))
+                        klines['High'].append(float(row[2]))
+                        klines['Low'].append(float(row[3]))
+                        klines['Close'].append(float(row[4]))
+                        klines['Volume'].append(float(row[5]))
+        except (zipfile.BadZipFile, KeyError) as e:
+            print(f"  [warn] corrupt archive for {month}: {e} — skipping")
             continue
 
     if not klines['Date']:
@@ -72,199 +103,230 @@ def download_klines(symbol, interval, start_date, end_date, klines_dir='klines')
 
     df = pd.DataFrame(klines)
     df['Date'] = pd.to_datetime(df['Date'])
+    df = df.drop_duplicates(subset='Date').sort_values('Date')
     df.set_index('Date', inplace=True)
+
+    if len(df) > 1:
+        deltas = df.index.to_series().diff().dropna()
+        expected = deltas.mode()[0] if len(deltas) else None
+        gaps = deltas[deltas != expected]
+        if len(gaps) > 0:
+            print(f"  [warn] {len(gaps)} gap(s) detected in candle series (expected spacing: {expected})")
+
     return df
 
 
 class GridBacktester:
     """
-    Grid trading backtester.
-
-    Logic:
-    1. Place N buy orders below current price, N sell orders above
-    2. When a buy fills → add to open_entries (FIFO queue)
-    3. When you have entries → sell at TP level (oldest entry first)
-    4. When a sell fills → close oldest entry, realize PnL
-    5. After sell → place new buy at lower grid level
-    6. Track: complete cycles, open positions, drawdown
+    Grid trading backtester — mirrors the live bot's state machine:
+    FLAT -> (LONG or SHORT, averaging) -> TP / STOP / LIQUIDATION / end-of-data -> FLAT
     """
 
-    def __init__(self, initial_capital=10000, n_levels=10, proportion=0.03,
-                 volume=0.05, tp_pct=5.0, commission_rate=0.0004, slippage_rate=0.0005):
+    def __init__(self, cfg: GridConfig, initial_capital=10000.0,
+                 commission_rate=0.0004, slippage_rate=0.0005):
+        self.cfg = cfg
         self.initial_capital = initial_capital
-        self.n_levels = n_levels
-        self.proportion = proportion
-        self.volume = volume
-        self.tp_pct = tp_pct
         self.commission_rate = commission_rate
         self.slippage_rate = slippage_rate
+        self._reset_state()
 
-    def run(self, df):
-        capital = self.initial_capital
-        trades = []
-        open_entries = []  # FIFO queue of entry prices
-        pending_buys = []  # grid buy orders waiting to fill
-        pending_sells = []  # grid sell orders waiting to fill
-        equity_curve = [capital]
-        grid_center = None
-        grid_redraw_threshold = self.proportion  # redraw when price moves this %
+    def _reset_state(self):
+        self._balance = self.initial_capital
+        self._used_margin = 0.0
+        self._direction = 'FLAT'          # 'FLAT' | 'LONG' | 'SHORT'
+        self._position_amt = 0.0          # unsigned size
+        self._avg_entry = 0.0
+        self._tp_price = None
+        self._pending_buys = []
+        self._pending_sells = []
+        self._fills = []
+        self._cycles = []
+        self._cur_cycle_fills = []
+
+    def _close_position(self, price, reason, ts):
+        """Close the whole open position at `price`, realize PnL/commission,
+        record the fill + completed cycle, reset to FLAT, and clear any
+        resting grid orders so a fresh grid gets drawn on the next bar."""
+        qty = self._position_amt
+        notional = price * qty
+        commission = notional * self.commission_rate
+        if self._direction == 'LONG':
+            pnl = (price - self._avg_entry) * qty - commission
+        else:
+            pnl = (self._avg_entry - price) * qty - commission
+        self._balance += pnl
+
+        side = {'TP': 'TP_' + ('SELL' if self._direction == 'LONG' else 'BUY'),
+                'STOP_LOSS': 'SL_' + ('SELL' if self._direction == 'LONG' else 'BUY'),
+                'LIQUIDATION': 'LIQUIDATION',
+                'END_OF_DATA': 'END_OF_DATA_CLOSE'}[reason]
+        f = {'time': ts, 'side': side, 'price': price, 'qty': qty, 'pnl': pnl, 'commission': commission}
+        self._fills.append(f)
+        self._cur_cycle_fills.append(f)
+        self._cycles.append(self._close_cycle(self._cur_cycle_fills, reason))
+        self._cur_cycle_fills = []
+        self._direction, self._position_amt, self._avg_entry, self._tp_price = 'FLAT', 0.0, 0.0, None
+        self._used_margin = 0.0
+        self._pending_buys, self._pending_sells = [], []
+
+    def _try_fill_entries(self, pending, price_ok_fn, side_label, ts):
+        """Fill any resting grid entry orders in `pending` (a list belonging
+        to self._pending_buys / self._pending_sells) whose level satisfies
+        price_ok_fn(level), respecting free margin. Mutates in place."""
+        cfg = self.cfg
+        filled_levels = [p for p in pending if price_ok_fn(p)]
+        for level in filled_levels:
+            fill_price = level * (1 + self.slippage_rate) if side_label == 'BUY' else level * (1 - self.slippage_rate)
+            notional = fill_price * cfg.volume
+            margin_req = notional / cfg.leverage
+            commission = notional * self.commission_rate
+            if self._balance - self._used_margin < margin_req + commission:
+                continue  # not enough free margin — order stays pending
+            self._balance -= commission
+            self._avg_entry = weighted_average_entry(self._avg_entry, self._position_amt, fill_price, cfg.volume)
+            self._position_amt += cfg.volume
+            self._used_margin = self._avg_entry * self._position_amt / cfg.leverage
+            self._direction = 'LONG' if side_label == 'BUY' else 'SHORT'
+            signed_amt = self._position_amt if side_label == 'BUY' else -self._position_amt
+            self._tp_price = calculate_tp_price(self._avg_entry, signed_amt, cfg)
+            f = {'time': ts, 'side': side_label, 'price': fill_price, 'qty': cfg.volume,
+                 'pnl': 0.0, 'commission': commission}
+            self._fills.append(f)
+            self._cur_cycle_fills.append(f)
+            pending.remove(level)
+            # opposite-side grid entries are cancelled the moment a direction is established
+            if side_label == 'BUY':
+                self._pending_sells = []
+            else:
+                self._pending_buys = []
+
+    def run(self, df: pd.DataFrame) -> dict:
+        cfg = self.cfg
+        self._reset_state()
+        equity_curve = []
 
         for i in range(len(df)):
-            low = df['Low'].iloc[i]
-            high = df['High'].iloc[i]
-            close = df['Close'].iloc[i]
-            timestamp = df.index[i]
+            o = df['Open'].iloc[i]
+            h = df['High'].iloc[i]
+            l = df['Low'].iloc[i]
+            c = df['Close'].iloc[i]
+            ts = df.index[i]
 
-            # Initialize grid at start
-            if grid_center is None:
-                grid_center = close
-                pending_buys = self._generate_buys(grid_center)
-                pending_sells = self._generate_sells(grid_center)
+            # Redraw grid if flat with nothing resting — center on this bar's
+            # OPEN (the only price causally known before this bar's H/L happen)
+            if self._direction == 'FLAT' and not self._pending_buys and not self._pending_sells:
+                self._pending_buys, self._pending_sells = generate_grid_levels(o, cfg)
 
-            # Redraw grid if price moved far from center
-            if grid_center is not None and len(pending_buys) == 0 and len(pending_sells) == 0:
-                grid_center = close
-                pending_buys = self._generate_buys(grid_center)
-                pending_sells = self._generate_sells(grid_center)
+            signed_amt = self._position_amt if self._direction == 'LONG' else -self._position_amt
+            liq_price = estimate_liquidation_price(self._avg_entry, signed_amt, cfg.leverage) \
+                if self._direction != 'FLAT' else None
+            sl_price = calculate_stop_price(self._avg_entry, signed_amt, cfg) \
+                if self._direction != 'FLAT' else None
 
-            # Also redraw if price moved > threshold from grid center
-            if grid_center is not None:
-                pct_from_center = abs(close - grid_center) / grid_center * 100
-                if pct_from_center > grid_redraw_threshold * self.n_levels * 0.5:
-                    # Price escaped the grid — redraw around current price
-                    # But keep open entries
-                    grid_center = close
-                    pending_buys = self._generate_buys(grid_center)
-                    pending_sells = self._generate_sells(grid_center)
+            bullish = c >= o
+            event_order = ['low', 'high'] if bullish else ['high', 'low']
 
-            # ── Check BUY fills (price drops to buy level) ──
-            newly_filled = []
-            for buy_price in pending_buys[:]:
-                if low <= buy_price:
-                    fill_price = buy_price * (1 + self.slippage_rate)
-                    cost = fill_price * self.volume
-                    commission = cost * self.commission_rate
-                    if capital >= cost + commission:
-                        capital -= (cost + commission)
-                        open_entries.append(fill_price)
-                        trades.append({
-                            'time': timestamp, 'side': 'BUY', 'price': fill_price,
-                            'qty': self.volume, 'pnl': 0, 'commission': commission
-                        })
-                        newly_filled.append(buy_price)
-            for p in newly_filled:
-                pending_buys.remove(p)
+            for ev in event_order:
+                if ev == 'low':
+                    if self._direction == 'LONG':
+                        if sl_price is not None and l <= sl_price:
+                            self._close_position(sl_price, 'STOP_LOSS', ts)
+                        elif liq_price is not None and l <= liq_price:
+                            self._close_position(liq_price, 'LIQUIDATION', ts)
+                    if self._direction in ('FLAT', 'LONG'):
+                        self._try_fill_entries(self._pending_buys, lambda p: l <= p, 'BUY', ts)
+                    elif self._direction == 'SHORT':
+                        if self._tp_price is not None and l <= self._tp_price:
+                            self._close_position(self._tp_price * (1 + self.slippage_rate), 'TP', ts)
 
-            # ── Check SELL fills (price rises to TP level) ──
-            newly_sold = []
-            for sell_price in pending_sells[:]:
-                if high >= sell_price and open_entries:
-                    entry_price = open_entries.pop(0)  # FIFO
-                    fill_price = sell_price * (1 - self.slippage_rate)
-                    pnl = (fill_price - entry_price) * self.volume
-                    commission = fill_price * self.volume * self.commission_rate
-                    net_pnl = pnl - commission
-                    capital += fill_price * self.volume - commission
-                    trades.append({
-                        'time': timestamp, 'side': 'SELL', 'price': fill_price,
-                        'qty': self.volume, 'pnl': net_pnl, 'commission': commission,
-                        'entry_price': entry_price
-                    })
-                    newly_sold.append(sell_price)
-            for p in newly_sold:
-                pending_sells.remove(p)
+                else:  # 'high'
+                    if self._direction == 'SHORT':
+                        if sl_price is not None and h >= sl_price:
+                            self._close_position(sl_price, 'STOP_LOSS', ts)
+                        elif liq_price is not None and h >= liq_price:
+                            self._close_position(liq_price, 'LIQUIDATION', ts)
+                    if self._direction in ('FLAT', 'SHORT'):
+                        self._try_fill_entries(self._pending_sells, lambda p: h >= p, 'SELL', ts)
+                    elif self._direction == 'LONG':
+                        if self._tp_price is not None and h >= self._tp_price:
+                            self._close_position(self._tp_price * (1 - self.slippage_rate), 'TP', ts)
 
-            # ── Track equity ──
-            unrealized = sum((close - e) * self.volume for e in open_entries)
-            equity = capital + sum(e * self.volume for e in open_entries) + unrealized
-            equity_curve.append(equity)
+            if self._direction == 'LONG':
+                unrealized = (c - self._avg_entry) * self._position_amt
+            elif self._direction == 'SHORT':
+                unrealized = (self._avg_entry - c) * self._position_amt
+            else:
+                unrealized = 0.0
+            equity_curve.append((ts, self._balance + unrealized))
 
-        # ── Close remaining position at last price ──
-        last_price = df['Close'].iloc[-1]
-        if open_entries:
-            for entry_price in open_entries:
-                pnl = (last_price - entry_price) * self.volume
-                commission = last_price * self.volume * self.commission_rate
-                net_pnl = pnl - commission
-                capital += last_price * self.volume - commission
-                trades.append({
-                    'time': df.index[-1], 'side': 'FORCE_CLOSE', 'price': last_price,
-                    'qty': self.volume, 'pnl': net_pnl, 'commission': commission,
-                    'entry_price': entry_price
-                })
+        if self._direction != 'FLAT':
+            self._close_position(df['Close'].iloc[-1], 'END_OF_DATA', df.index[-1])
+            equity_curve.append((df.index[-1], self._balance))
 
-        return self._compute_stats(trades, equity_curve)
+        return self._compute_stats(equity_curve)
 
-    def _generate_buys(self, center_price):
-        """Generate N buy limit orders below current price."""
-        orders = []
-        for i in range(1, self.n_levels + 1):
-            pct = i * self.proportion
-            price = round(center_price * (1 - pct / 100), 2)
-            orders.append(price)
-        return orders
+    @staticmethod
+    def _close_cycle(cycle_fills, exit_reason):
+        entries = [f for f in cycle_fills if f['side'] in ('BUY', 'SELL')]
+        exit_fill = cycle_fills[-1]
+        side = 'LONG' if entries and entries[0]['side'] == 'BUY' else 'SHORT'
+        return {
+            'side': side,
+            'entries': len(entries),
+            'avg_entry': (sum(e['price'] * e['qty'] for e in entries) / sum(e['qty'] for e in entries))
+                         if entries else exit_fill['price'],
+            'exit_price': exit_fill['price'],
+            'exit_reason': exit_reason,
+            'pnl': exit_fill['pnl'],
+            'commission': sum(f['commission'] for f in cycle_fills),
+            'start_time': cycle_fills[0]['time'] if cycle_fills else None,
+            'end_time': exit_fill['time'],
+        }
 
-    def _generate_sells(self, center_price):
-        """Generate N sell limit orders above current price."""
-        orders = []
-        for i in range(1, self.n_levels + 1):
-            pct = i * self.proportion
-            price = round(center_price * (1 + pct / 100), 2)
-            orders.append(price)
-        return orders
+    def _compute_stats(self, equity_curve):
+        fills, cycles = self._fills, self._cycles
+        eq_values = [e for _, e in equity_curve] or [self.initial_capital]
+        final_equity = eq_values[-1]
+        total_return = (final_equity - self.initial_capital) / self.initial_capital * 100
 
-    def _compute_stats(self, trades, equity_curve):
-        sell_trades = [t for t in trades if t['side'] in ('SELL', 'FORCE_CLOSE')]
-        buy_trades = [t for t in trades if t['side'] == 'BUY']
-
-        total_return = (equity_curve[-1] - self.initial_capital) / self.initial_capital * 100
-
-        # Max drawdown
-        peak = equity_curve[0]
+        peak = eq_values[0]
         max_dd = 0.0
-        for eq in equity_curve:
-            if eq > peak:
-                peak = eq
+        for eq in eq_values:
+            peak = max(peak, eq)
             dd = (peak - eq) / peak * 100 if peak > 0 else 0
-            if dd > max_dd:
-                max_dd = dd
+            max_dd = max(max_dd, dd)
 
-        # Win rate: profitable exits / total exits
-        wins = [t for t in sell_trades if t['pnl'] > 0]
-        losses = [t for t in sell_trades if t['pnl'] <= 0]
-        win_rate = (len(wins) / len(sell_trades) * 100) if sell_trades else 0
-
-        # PnL per exit
-        exit_pnls = [t['pnl'] for t in sell_trades]
-        avg_pnl = np.mean(exit_pnls) if exit_pnls else 0
-        total_pnl = sum(exit_pnls)
-        total_commission = sum(t['commission'] for t in trades)
-
-        # Profit factor
-        gross_profit = sum(t['pnl'] for t in wins)
-        gross_loss = abs(sum(t['pnl'] for t in losses))
+        wins = [c for c in cycles if c['pnl'] > 0]
+        losses = [c for c in cycles if c['pnl'] <= 0]
+        win_rate = (len(wins) / len(cycles) * 100) if cycles else 0
+        gross_profit = sum(c['pnl'] for c in wins)
+        gross_loss = abs(sum(c['pnl'] for c in losses))
         profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
 
-        # Forced closes = positions stuck in loss
-        forced = [t for t in trades if t['side'] == 'FORCE_CLOSE']
+        def count_reason(r):
+            return len([c for c in cycles if c['exit_reason'] == r])
 
         return {
             'initial_capital': self.initial_capital,
-            'final_capital': round(equity_curve[-1], 2),
+            'final_capital': round(final_equity, 2),
             'total_return_pct': round(total_return, 2),
-            'total_trades': len(trades),
-            'buy_fills': len(buy_trades),
-            'sell_fills': len([t for t in trades if t['side'] == 'SELL']),
-            'forced_closes': len(forced),
+            'max_drawdown_pct': round(max_dd, 2),
+            'total_cycles': len(cycles),
+            'tp_closes': count_reason('TP'),
+            'stop_loss_closes': count_reason('STOP_LOSS'),
+            'liquidations': count_reason('LIQUIDATION'),
+            'forced_closes_at_end': count_reason('END_OF_DATA'),
+            'buy_fills': len([f for f in fills if f['side'] == 'BUY']),
+            'sell_fills': len([f for f in fills if f['side'] == 'SELL']),
             'wins': len(wins),
             'losses': len(losses),
             'win_rate': round(win_rate, 1),
-            'avg_pnl_per_exit': round(avg_pnl, 2),
-            'total_pnl': round(total_pnl, 2),
-            'total_commission': round(total_commission, 2),
-            'profit_factor': round(profit_factor, 2),
-            'max_drawdown_pct': round(max_dd, 2),
-            'trades': trades,
+            'avg_pnl_per_cycle': round(np.mean([c['pnl'] for c in cycles]), 2) if cycles else 0,
+            'total_pnl': round(sum(c['pnl'] for c in cycles), 2),
+            'total_commission': round(sum(f['commission'] for f in fills), 2),
+            'profit_factor': round(profit_factor, 2) if profit_factor != float('inf') else profit_factor,
+            'cycles': cycles,
+            'fills': fills,
         }
 
 
@@ -276,21 +338,27 @@ def main():
     parser.add_argument('--start', default='2024-01')
     parser.add_argument('--end', default='2025-06')
     parser.add_argument('--n-levels', type=int, default=10)
-    parser.add_argument('--proportion', type=float, default=3.0)
+    parser.add_argument('--proportion', type=float, default=1.5, help='Grid spacing in %%')
     parser.add_argument('--volume', type=float, default=0.05)
-    parser.add_argument('--tp', type=float, default=5.0)
+    parser.add_argument('--tp', type=float, default=3.0, help='Take-profit, %% ROI on margin used')
+    parser.add_argument('--stop-loss', type=float, default=None, help='Stop-loss, %% ROI loss on margin used (default: disabled)')
+    parser.add_argument('--leverage', type=int, default=1)
+    parser.add_argument('--decimals', type=int, default=1, help='Price rounding precision')
     parser.add_argument('--capital', type=float, default=10000)
+    parser.add_argument('--commission', type=float, default=0.04, help='Commission in %%')
     parser.add_argument('--slippage', type=float, default=0.05, help='Slippage in %%')
     args = parser.parse_args()
 
     print(f"\nGrid Trading Backtester — {args.symbol} {args.interval}")
     print(f"{'='*60}")
-    print(f"Period:    {args.start} — {args.end}")
-    print(f"Grid:      {args.n_levels} levels, {args.proportion}% spacing")
-    print(f"Volume:    {args.volume} per level")
-    print(f"TP:        {args.tp}%")
-    print(f"Slippage:  {args.slippage}%")
-    print(f"Capital:   ${args.capital:,.0f}")
+    print(f"Period:      {args.start} — {args.end}")
+    print(f"Grid:        {args.n_levels} levels/side, {args.proportion}% spacing")
+    print(f"Volume:      {args.volume} per level")
+    print(f"TP:          {args.tp}% ROI on margin")
+    print(f"Stop-loss:   {(str(args.stop_loss) + '% ROI on margin') if args.stop_loss else 'disabled'}")
+    print(f"Leverage:    {args.leverage}x")
+    print(f"Commission:  {args.commission}%   Slippage: {args.slippage}%")
+    print(f"Capital:     ${args.capital:,.0f}")
     print()
 
     df = download_klines(args.symbol, args.interval, args.start, args.end)
@@ -299,13 +367,14 @@ def main():
         return
     print(f"Loaded {len(df)} candles: {df.index[0]} — {df.index[-1]}")
 
+    cfg = GridConfig(
+        symbol=args.symbol, n_levels=args.n_levels, proportion=args.proportion,
+        volume=args.volume, tp_pct=args.tp, leverage=args.leverage,
+        price_decimals=args.decimals, stop_loss_pct=args.stop_loss,
+    )
     bt = GridBacktester(
-        initial_capital=args.capital,
-        n_levels=args.n_levels,
-        proportion=args.proportion,
-        volume=args.volume,
-        tp_pct=args.tp,
-        slippage_rate=args.slippage / 100,
+        cfg, initial_capital=args.capital,
+        commission_rate=args.commission / 100, slippage_rate=args.slippage / 100,
     )
     stats = bt.run(df)
 
@@ -319,12 +388,15 @@ def main():
     print(f"  ─────────────────────────────────────────")
     print(f"  Buy Fills:          {stats['buy_fills']}")
     print(f"  Sell Fills:         {stats['sell_fills']}")
-    print(f"  Forced Closes:      {stats['forced_closes']}")
-    print(f"  Wins:               {stats['wins']}")
-    print(f"  Losses:             {stats['losses']}")
+    print(f"  Completed Cycles:   {stats['total_cycles']}")
+    print(f"    - closed by TP:       {stats['tp_closes']}")
+    print(f"    - closed by stop-loss:{stats['stop_loss_closes']}")
+    print(f"    - liquidated:         {stats['liquidations']}")
+    print(f"    - forced at data end: {stats['forced_closes_at_end']}")
+    print(f"  Wins / Losses:      {stats['wins']} / {stats['losses']}")
     print(f"  Win Rate:           {stats['win_rate']:.1f}%")
-    print(f"  Profit Factor:      {stats['profit_factor']:.2f}")
-    print(f"  Avg PnL/exit:       ${stats['avg_pnl_per_exit']:.2f}")
+    print(f"  Profit Factor:      {stats['profit_factor']}")
+    print(f"  Avg PnL/cycle:      ${stats['avg_pnl_per_cycle']:.2f}")
     print(f"  Total PnL:          ${stats['total_pnl']:.2f}")
     print(f"  Total Commission:   ${stats['total_commission']:.2f}")
     print(f"{'='*60}")
