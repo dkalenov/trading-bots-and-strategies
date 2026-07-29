@@ -8,7 +8,8 @@ Simulates the SAME strategy that binance_bot.py trades live:
 - One dynamic take-profit order for the whole averaged position
   (tp_pct = % ROI on margin used, so it scales with leverage)
 - Optional stop-loss (stop_loss_pct) and a simplified liquidation check
-  when leverage > 1
+  (applies even at leverage=1 — a 1x SHORT can be liquidated if price
+  roughly doubles against it; see grid_strategy.estimate_liquidation_price)
 
 Modeling choices / known simplifications (see README "Limitations"):
 - Intra-candle fill order is inferred from candle direction (close>=open
@@ -277,7 +278,13 @@ class GridBacktester:
                          if entries else exit_fill['price'],
             'exit_price': exit_fill['price'],
             'exit_reason': exit_reason,
-            'pnl': exit_fill['pnl'],
+            # exit_fill['pnl'] only nets off the EXIT commission (that's all
+            # _close_position needs, since entry commissions were already
+            # subtracted from balance when each entry filled). For honest
+            # cycle-level reporting (total_pnl, win/loss, profit_factor) we
+            # need the FULL net result, so subtract entry commissions here
+            # too — this makes sum(cycle pnl) == final_capital - initial_capital.
+            'pnl': exit_fill['pnl'] - sum(e['commission'] for e in entries),
             'commission': sum(f['commission'] for f in cycle_fills),
             'start_time': cycle_fills[0]['time'] if cycle_fills else None,
             'end_time': exit_fill['time'],

@@ -77,6 +77,7 @@ python backtest.py --symbol BTCUSDT --interval 1h --start 2024-01 --end 2025-06 
 | `--tp` | `3.0` | Take-profit, % ROI on margin used |
 | `--stop-loss` | disabled | Stop-loss, % ROI loss on margin used |
 | `--leverage` | `1` | Account leverage (affects margin & TP/SL price distance) |
+| `--decimals` | `1` | Price rounding precision (decimal places) |
 | `--capital` | `10000` | Starting balance, USDT |
 | `--commission` | `0.04` | Taker commission, % of notional per fill |
 | `--slippage` | `0.05` | Slippage, % applied against you on every fill |
@@ -115,18 +116,20 @@ These are real, reproducible numbers from the data in `klines/` — run
 `backtest.py` yourself with the commands above to verify them.
 
 **Why the win rate and the total return disagree so sharply:** in the
-"no stop-loss" full-period run, 34 of 35 cycles closed at a small profit —
-and then a single SHORT position, opened in February 2024 at an average
-entry around $46,400, never found a take-profit because BTC rallied
-straight through toward $93,000 by mid-2024. With no stop-loss, that
-position kept averaging into the rally until it ran out of grid room and
-was **liquidated** — realizing close to a full loss of the capital
-allocated to it. A 97% win rate strategy with unbounded position duration
-and no exit plan for a sustained one-directional trend can still wipe out
-the account on a single stuck position. **This is exactly the risk the
-old, buggy backtest hid** — its take-profit logic wasn't actually tied to
-real entries, so it could close out "trades" at arbitrary grid levels
-regardless of real exposure, and never surfaced this failure mode at all.
+"no stop-loss" full-period run, 34 of 35 cycles closed at a small profit
+(summing to about +$5,524) — and then a single SHORT position, opened in
+February 2024 at an average entry around $46,400, never found a
+take-profit because BTC kept rallying. With no stop-loss, that position
+kept averaging into the rally until it ran out of grid room, and was
+ultimately **liquidated in November 2024** at roughly $92,800 — a
+realized loss of about **$13,939 on that one position alone, more than
+the account's entire $10,000 starting capital**. A 97% win rate strategy
+with unbounded position duration and no exit plan for a sustained
+one-directional trend can still wipe out the account on a single stuck
+position. **This is exactly the risk the old, buggy backtest hid** — its
+take-profit logic wasn't actually tied to real entries, so it could close
+out "trades" at arbitrary grid levels regardless of real exposure, and
+never surfaced this failure mode at all.
 
 ## Parameter sensitivity — a systematic sweep, not a cherry-picked result
 
@@ -141,19 +144,20 @@ window available, since it contains both the 2022 bear market and the
 - **25 / 90 combinations (27.8%) were profitable** over this period.
   Median return across all 90: **-33.15%**.
 - **Every single one of the 15 no-stop-loss combinations was liquidated**
-  (15/15) and lost money — average return -91.25%, best case still -75%.
-  Removing the stop-loss isn't a parameter choice that trades a bit of
-  return for a bit of safety here; on this data it was a near-certain
-  way to blow up the account, regardless of grid width or TP target.
+  (15/15) and lost money — average return -91.25%, ranging from -83.98%
+  (least bad) to -96.53% (worst). Grid width and TP target barely moved
+  this number: removing the stop-loss wasn't a parameter choice trading
+  a bit of return for a bit of safety here, it was a near-certain way to
+  blow up the account regardless of the other settings.
 - With *some* stop-loss set (any of 5%/10%/15%/20%/30%), 25/75 (33%)
-  were profitable, average return -13.1%, best case +117.6% (max
-  drawdown ~42%, `n_levels=20, proportion=1.0%, tp=5%, stop_loss=15%`).
-- The best and worst results share a pattern: wider grids
-  (`n_levels × proportion` ≥ 20–25% total width) with a moderate
-  stop-loss (10–20%) did best; tight grids with no stop-loss did worst.
-  Take this as a rough directional signal from one asset/period, not a
-  tuned recommendation — re-run the sweep on other symbols/periods
-  before trusting any single row of it.
+  were profitable, average return -13.1%, ranging from +117.6% (best) to
+  -75.9% (worst). The best results cluster around wider grids (≥20%
+  total width) combined with a 5% take-profit and a moderate 10-15%
+  stop-loss — the single best row was `n_levels=20, proportion=1.0%,
+  tp=5%, stop_loss=15%` (+117.61%, max drawdown 43.95%). Take this as a
+  rough directional signal from one asset/period, not a tuned
+  recommendation — re-run the sweep on other symbols/periods before
+  trusting any single row of it.
 
 Reproduce it yourself:
 ```bash
@@ -184,6 +188,12 @@ python parameter_sweep.py --start 2022-01 --end 2025-06 --out my_sweep.csv
   data.
 - **No partial fills / order-book depth.** Every fill assumes the full
   order size executes at the level price plus slippage.
+- **Order price/quantity rounding uses `pricePrecision`/`quantityPrecision`**
+  from `futures_exchange_info`, which Binance's own docs say not to treat
+  as authoritative tick size / step size. This matches the real
+  `PRICE_FILTER`/`LOT_SIZE` increments for the great majority of USDT-M
+  perpetuals, but isn't guaranteed for every symbol — for full robustness
+  read `s['filters']` and round to `tickSize`/`stepSize` directly instead.
 - **One-way position mode assumed.** The live bot reads
   `futures_position_information` and sums `positionAmt` across whatever
   rows come back; it hasn't been tested against a hedge-mode account
@@ -202,8 +212,11 @@ implementing two unrelated strategies, plus several live-trading bugs:
 - **The old live bot's grid formula and the old backtest's grid formula
   were different functions** (a compounding per-level multiplier vs. a
   flat `%`), and the two files used the `proportion` parameter in
-  incompatible units — the backtested grid was roughly 100x wider than
-  the grid the default live config would have drawn.
+  incompatible units. With the live code's default (`proportion=0.03`),
+  its grid levels sat only **0.036%–0.9%** from the current price;
+  backtesting with the old default (`proportion=3.0`) tested a grid
+  **3%–30%** wide — 17x to 83x wider depending on the level, not the
+  same strategy at all.
 - **`get_mark_price()` called the *spot* ticker endpoint** to price a
   *futures* grid. On testnet these are two entirely separate exchanges
   (`testnet.binance.vision` vs `testnet.binancefuture.com`).
@@ -224,14 +237,22 @@ simplified liquidation check to the backtester, gives orders proper
 which, and pulls real price/quantity precision from
 `futures_exchange_info` instead of a hardcoded decimal count.
 
-**Self-check note:** while producing the parameter sweep above, two more
+**Self-check note:** while producing the parameter sweep above, three more
 bugs were caught and fixed in *this* rewrite before publishing results —
 a sign error in `binance_bot.py` that mis-computed the stop-loss side for
-SHORT positions (it would have triggered immediately on entry), and a
+SHORT positions (it would have triggered immediately on entry), a
 liquidation-estimate bug that skipped the check entirely at
 `leverage=1`, which is wrong for shorts (even unleveraged, a short can be
-liquidated if price roughly doubles). Both were found by testing before
-any results were reported, not after — the first version of the sweep
-showed impossible returns below -100%, which is what surfaced the second
-bug. Mentioned here rather than silently fixed, in the same spirit as the
-rest of this document.
+liquidated if price roughly doubles), and an accounting bug where a
+cycle's reported `pnl` only netted off the *exit* commission, not the
+entry commissions already paid on each averaging fill — understating
+`total_pnl` by a small amount ($82.56 across the full-period run) even
+though the balance/equity tracking used for the headline return numbers
+was correct throughout. All three were caught by cross-checking derived
+numbers against each other (e.g. `sum(cycle pnl)` vs `final_capital -
+initial_capital`), not by inspection alone — the same kind of pass was
+repeated once more, at explicit request, before this document was
+finalized: every number in the tables above was independently
+re-derived from a fresh run and checked against the text, and the "What
+changed" bullets were re-diffed against the original source rather than
+recalled from memory.

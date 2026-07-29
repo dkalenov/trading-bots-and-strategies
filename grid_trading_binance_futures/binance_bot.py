@@ -62,7 +62,16 @@ class BinanceGridBot:
     # ---------------------------------------------------------------- setup
     def _apply_symbol_precision(self):
         """Pull the symbol's real price/quantity precision from exchange
-        info instead of trusting a hardcoded decimal count."""
+        info instead of trusting a hardcoded decimal count.
+
+        NOTE: Binance's own docs for GET /fapi/v1/exchangeInfo say not to
+        treat `pricePrecision`/`quantityPrecision` as authoritative tick
+        size / step size ("please do not use it as tickSize"). For the
+        vast majority of USDT-margined perpetuals rounding to these
+        precisions matches the real PRICE_FILTER/LOT_SIZE tick size, but
+        it is not guaranteed for every symbol. For full robustness, read
+        the `PRICE_FILTER.tickSize` / `LOT_SIZE.stepSize` entries from
+        `s['filters']` instead and round to those increments directly."""
         try:
             info = self.client.futures_exchange_info()
             for s in info['symbols']:
