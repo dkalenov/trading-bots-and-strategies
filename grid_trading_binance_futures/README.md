@@ -42,6 +42,8 @@ import from it, so they cannot silently diverge again.
 | `binance_bot.py` | Live execution on Binance USD-M Futures |
 | `main.py` | Entry point — configure symbols/parameters and start the bot(s) |
 | `config.py` | Reads `BINANCE_API_KEY` / `BINANCE_API_SECRET` from the environment |
+| `parameter_sweep.py` | Reproducible scan over TP/SL/grid-width combinations (see "Parameter sensitivity") |
+| `sweep_full_2022_2025.csv` | Full, unfiltered results of that scan — all 90 rows, wins and losses alike |
 | `klines/` | Cached monthly kline data (auto-downloaded on first backtest run) |
 
 ## Setup
@@ -104,10 +106,10 @@ $10,000 starting capital, run separately per calendar period:
 | Period | No stop-loss | With 10% stop-loss |
 |---|---|---|
 | 2022 (bear market) | **-47.90%**, max DD 62.1%, 94.4% win rate | **+1.65%**, max DD 27.5%, 88.5% win rate |
-| 2023 | **-122.23%**, max DD 133.4% (1 stuck cycle) | **-22.90%**, max DD 34.2%, 84.3% win rate |
-| 2024 | **-112.60%**, max DD 143.8% (1 stuck cycle) | **-1.71%**, max DD 42.0%, 85.1% win rate |
+| 2023 | **-89.57%**, max DD 89.6% (1 liquidation, 0% win rate) | **-22.90%**, max DD 34.2%, 84.3% win rate |
+| 2024 | **-97.91%**, max DD 98.1% (1 liquidation among 9 cycles) | **-1.71%**, max DD 42.0%, 85.1% win rate |
 | 2025 H1 (calmer market) | **+30.53%**, max DD 19.1%, 94.4% win rate | **+12.89%**, max DD 30.6%, 84.1% win rate |
-| Full 2022-01 → 2025-06, one continuous run | **-126.99%**, max DD 126.3%, 97.1% win rate (34/35 cycles won) | **-26.37%**, max DD 36.9%, 85.1% win rate |
+| Full 2022-01 → 2025-06, one continuous run | **-84.15%**, max DD 89.8%, 97.1% win rate (34/35 cycles won, 1 liquidated) | **-26.37%**, max DD 36.9%, 85.1% win rate |
 
 These are real, reproducible numbers from the data in `klines/` — run
 `backtest.py` yourself with the commands above to verify them.
@@ -116,31 +118,65 @@ These are real, reproducible numbers from the data in `klines/` — run
 "no stop-loss" full-period run, 34 of 35 cycles closed at a small profit —
 and then a single SHORT position, opened in February 2024 at an average
 entry around $46,400, never found a take-profit because BTC rallied
-straight through to over $107,000 by June 2025. With no stop-loss and no
-liquidation at 1x leverage, that one position stayed open for the rest of
-the backtest and lost about $18,200 — more than the account's starting
-capital. A 97% win rate strategy with unbounded position duration and no
-exit plan for a sustained one-directional trend can still blow up the
-account. **This is exactly the risk the old, buggy backtest hid** — its
-take-profit logic wasn't actually tied to real entries, so it could close
-out "trades" at arbitrary grid levels regardless of real exposure, and
-never surfaced this failure mode at all.
+straight through toward $93,000 by mid-2024. With no stop-loss, that
+position kept averaging into the rally until it ran out of grid room and
+was **liquidated** — realizing close to a full loss of the capital
+allocated to it. A 97% win rate strategy with unbounded position duration
+and no exit plan for a sustained one-directional trend can still wipe out
+the account on a single stuck position. **This is exactly the risk the
+old, buggy backtest hid** — its take-profit logic wasn't actually tied to
+real entries, so it could close out "trades" at arbitrary grid levels
+regardless of real exposure, and never surfaced this failure mode at all.
+
+## Parameter sensitivity — a systematic sweep, not a cherry-picked result
+
+To answer the obvious follow-up question ("can different TP/SL/grid
+settings make this profitable?") honestly, `parameter_sweep.py` runs
+**every** combination of 5 grid widths × 3 take-profit levels × 6
+stop-loss settings (90 combinations total, `leverage=1`) on the exact
+same full 2022-01 → 2025-06 BTCUSDT data — the hardest, least convenient
+window available, since it contains both the 2022 bear market and the
+2024–2025 rally. Full results: [`sweep_full_2022_2025.csv`](sweep_full_2022_2025.csv).
+
+- **25 / 90 combinations (27.8%) were profitable** over this period.
+  Median return across all 90: **-33.15%**.
+- **Every single one of the 15 no-stop-loss combinations was liquidated**
+  (15/15) and lost money — average return -91.25%, best case still -75%.
+  Removing the stop-loss isn't a parameter choice that trades a bit of
+  return for a bit of safety here; on this data it was a near-certain
+  way to blow up the account, regardless of grid width or TP target.
+- With *some* stop-loss set (any of 5%/10%/15%/20%/30%), 25/75 (33%)
+  were profitable, average return -13.1%, best case +117.6% (max
+  drawdown ~42%, `n_levels=20, proportion=1.0%, tp=5%, stop_loss=15%`).
+- The best and worst results share a pattern: wider grids
+  (`n_levels × proportion` ≥ 20–25% total width) with a moderate
+  stop-loss (10–20%) did best; tight grids with no stop-loss did worst.
+  Take this as a rough directional signal from one asset/period, not a
+  tuned recommendation — re-run the sweep on other symbols/periods
+  before trusting any single row of it.
+
+Reproduce it yourself:
+```bash
+python parameter_sweep.py --start 2022-01 --end 2025-06 --out my_sweep.csv
+```
 
 ## Risk (read this before using real funds)
 
-- **No stop-loss by default.** A static grid with no stop-loss has
-  theoretically unbounded loss on the side that gets "stuck" during a
-  sustained trend, as shown above. Consider setting `stop_loss_pct`.
+- **No stop-loss by default.** As the sweep above shows directly: on
+  this data, a static grid with no stop-loss got liquidated in 100% of
+  tested configurations during the 2022→2025 window. Set
+  `stop_loss_pct`.
 - **Liquidation is only roughly estimated** in the backtest
   (`entry * (1 ± 1/leverage)`, ignoring Binance's maintenance-margin
-  tiers and fees) and is not actively managed in the live bot — the
-  optional stop-loss is your own protection layer; Binance's actual
-  liquidation engine is a separate, harsher backstop you do not want to
-  rely on.
+  tiers and fees), and applies even at `leverage=1` — a 1x SHORT can
+  still be liquidated if price roughly doubles against it, which is
+  exactly what happened in every no-stop-loss run above. This is not
+  actively managed in the live bot; the optional stop-loss is your own
+  protection layer, and Binance's actual liquidation engine is a
+  separate, harsher backstop you do not want to rely on.
 - **No funding-rate simulation.** Perpetual futures pay/receive funding
   every 8 hours; over a multi-month held position this can be a
   meaningful additional cost or benefit, and it's not modeled here.
-  With leverage=1, this is proportionally very small.
 - **Intra-candle fill order is a heuristic**, not certain knowledge: the
   backtest infers whether price moved low-then-high or high-then-low
   within a candle from whether the candle closed up or down. This
@@ -187,3 +223,15 @@ simplified liquidation check to the backtester, gives orders proper
 `clientOrderId` tags so the live bot always knows which resting order is
 which, and pulls real price/quantity precision from
 `futures_exchange_info` instead of a hardcoded decimal count.
+
+**Self-check note:** while producing the parameter sweep above, two more
+bugs were caught and fixed in *this* rewrite before publishing results —
+a sign error in `binance_bot.py` that mis-computed the stop-loss side for
+SHORT positions (it would have triggered immediately on entry), and a
+liquidation-estimate bug that skipped the check entirely at
+`leverage=1`, which is wrong for shorts (even unleveraged, a short can be
+liquidated if price roughly doubles). Both were found by testing before
+any results were reported, not after — the first version of the sweep
+showed impossible returns below -100%, which is what surfaced the second
+bug. Mentioned here rather than silently fixed, in the same spirit as the
+rest of this document.

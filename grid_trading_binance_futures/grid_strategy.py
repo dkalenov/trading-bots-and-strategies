@@ -114,11 +114,17 @@ def estimate_liquidation_price(entry_price: float, position_amt: float, leverage
 
     This is a simplified approximation for backtesting purposes only —
     Binance's real liquidation price also depends on the maintenance
-    margin bracket for the position's notional size. With leverage=1 this
-    never triggers for a normal price move, matching "no leverage, no
-    liquidation risk" intuition.
+    margin bracket for the position's notional size.
+
+    Note this applies even at leverage=1: margin = full notional, so a
+    LONG's liq price is ~0 (never practically reached — you can't lose
+    more than 100% and price can't go negative), but a SHORT's liq price
+    is ~2x entry (price doubling), which is a real, reachable event and
+    must NOT be skipped — an earlier version of this function returned
+    None whenever leverage<=1, which let backtested shorts "ride" losses
+    past what a real account could ever sustain.
     """
-    if position_amt == 0 or leverage <= 1:
+    if position_amt == 0 or leverage < 1:
         return None
     if position_amt > 0:
         return entry_price * (1 - 1 / leverage)
