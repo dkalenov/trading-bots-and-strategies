@@ -29,6 +29,24 @@ def interval_to_bars_per_year(interval: str) -> int:
     return mapping.get(interval, 8760)
 
 
+def _build_backtester(config: Config) -> Backtester:
+    """Single place that turns config (+ env var overrides) into a
+    Backtester. Previously main.py had three separate Backtester(...)
+    call sites, each hardcoding commission/slippage/funding/leverage and
+    silently ignoring config.ini and the --leverage/--commission CLI
+    flags entirely — this is the fix."""
+    return Backtester(
+        initial_capital=config.initial_capital,
+        risk_pct=config.risk_pct,
+        max_leverage=config.leverage,
+        commission_rate=config.commission,
+        slippage_rate=config.slippage,
+        funding_rate=config.funding_rate,
+        funding_interval_bars=config.funding_interval_bars,
+        bars_per_year=interval_to_bars_per_year(config.interval),
+    )
+
+
 def run_backtest(config: Config, strategy_variant: str = 'basic',
                  params: StrategyParams = None, verbose: bool = True) -> tuple[BacktestStats, list[dict]]:
     if params is None:
@@ -47,16 +65,7 @@ def run_backtest(config: Config, strategy_variant: str = 'basic',
     if verbose:
         print(f"Loaded {len(df)} candles: {df.index[0]} — {df.index[-1]}")
 
-    bt = Backtester(
-        initial_capital=config.initial_capital,
-        risk_pct=0.01,
-        max_leverage=20,
-        commission_rate=0.0004,
-        slippage_rate=0.0002,
-        funding_rate=0.0001,
-        funding_interval_bars=8,
-        bars_per_year=interval_to_bars_per_year(config.interval),
-    )
+    bt = _build_backtester(config)
 
     stats, trades = bt.run(df, strategy_variant, params)
 
@@ -140,15 +149,7 @@ def run_monthly_analysis(config: Config, strategy_variant: str = 'basic',
         if len(group) < params.atr_period + 2:
             continue
 
-        bt = Backtester(
-            initial_capital=config.initial_capital,
-            risk_pct=0.01,
-            commission_rate=0.0004,
-            slippage_rate=0.0002,
-            funding_rate=0.0001,
-            funding_interval_bars=8,
-            bars_per_year=interval_to_bars_per_year(config.interval),
-        )
+        bt = _build_backtester(config)
         stats, trades = bt.run(group, strategy_variant, params)
         monthly_results[str(period)] = {
             'return_pct': round(stats.total_return_pct, 2),
@@ -234,16 +235,7 @@ def run_optimization(config: Config, strategy_variant: str = 'basic',
             trailing_stop_pct=param_dict.get('trailing_stop_pct', 2.0),
         )
 
-        bt = Backtester(
-            initial_capital=config.initial_capital,
-            risk_pct=0.01,
-            commission_rate=0.0004,
-            slippage_rate=0.0002,
-            funding_rate=0.0001,
-            funding_interval_bars=8,
-            leverage=config.leverage,
-            bars_per_year=interval_to_bars_per_year(config.interval),
-        )
+        bt = _build_backtester(config)
 
         try:
             stats, trades = bt.run(df, strategy_variant, params)
@@ -330,6 +322,8 @@ def main():
     parser.add_argument('--capital', type=float, default=None, help='Initial capital')
     parser.add_argument('--leverage', type=int, default=None, help='Leverage multiplier')
     parser.add_argument('--commission', type=float, default=None, help='Commission rate')
+    parser.add_argument('--slippage', type=float, default=None, help='Slippage rate')
+    parser.add_argument('--risk-pct', type=float, default=None, help='Risk per trade, fraction of capital (e.g. 0.01 = 1%%)')
     parser.add_argument('--monthly', action='store_true', help='Run monthly breakdown')
     parser.add_argument('--optimize', action='store_true', help='Run hyperparameter optimization')
     parser.add_argument('--max-evals', type=int, default=None, help='Max optimization evaluations')
@@ -353,6 +347,10 @@ def main():
         config.parser.set('backtest', 'leverage', str(args.leverage))
     if args.commission:
         config.parser.set('backtest', 'commission', str(args.commission))
+    if args.slippage:
+        config.parser.set('backtest', 'slippage', str(args.slippage))
+    if args.risk_pct:
+        config.parser.set('backtest', 'risk_pct', str(args.risk_pct))
 
     params = StrategyParams(
         key_value=args.key_value or config.getint('strategy', 'key_value', 8),
@@ -372,11 +370,11 @@ def main():
           f"TP={params.take_profit_multiplier}x, SL={params.stop_loss_multiplier}x, "
           f"TS={params.trailing_stop_pct}%")
     print(f"Capital:    ${config.initial_capital:,.0f}")
-    print(f"Max Leverage: 20x")
-    print(f"Risk/Trade: 1% of capital (at stop loss)")
-    print(f"Commission: 0.04% (taker)")
-    print(f"Slippage:   0.02%")
-    print(f"Funding:    0.01% / 8h")
+    print(f"Max Leverage: {config.leverage}x")
+    print(f"Risk/Trade: {config.risk_pct*100:.2f}% of capital (at stop loss)")
+    print(f"Commission: {config.commission*100:.3f}% (taker)")
+    print(f"Slippage:   {config.slippage*100:.3f}%")
+    print(f"Funding:    {config.funding_rate*100:.3f}% / {config.funding_interval_bars}h")
     print()
 
     if args.monthly:

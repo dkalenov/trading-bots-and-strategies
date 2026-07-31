@@ -14,6 +14,7 @@ import pandas as pd
 from dataclasses import dataclass, field
 from typing import Optional
 from strategy import UTBotCore, SuperTrendFilter, RSIFilter, Signal, StrategyParams
+from utils import calculate_atr_from_df, compute_position_size
 
 
 @dataclass
@@ -94,7 +95,7 @@ class Backtester:
         if params is None:
             params = StrategyParams()
 
-        atr_arr = self._calculate_atr(df, params.atr_period)
+        atr_arr = calculate_atr_from_df(df, params.atr_period)
 
         match strategy_variant:
             case 'basic':
@@ -108,42 +109,17 @@ class Backtester:
             case _:
                 raise ValueError(f"Unknown strategy variant: {strategy_variant}")
 
-    def _calculate_atr(self, df: pd.DataFrame, period: int) -> np.ndarray:
-        highs = df['High'].values
-        lows = df['Low'].values
-        closes = df['Close'].values
-        tr = np.maximum(
-            highs[1:] - lows[1:],
-            np.maximum(
-                np.abs(highs[1:] - closes[:-1]),
-                np.abs(lows[1:] - closes[:-1])
-            )
-        )
-        atr = np.full(len(closes), np.nan)
-        if len(tr) >= period:
-            atr[period] = np.mean(tr[:period])
-            for i in range(period + 1, len(closes)):
-                atr[i] = (atr[i - 1] * (period - 1) + tr[i - 1]) / period
-        return atr
-
     def _open_position(self, entry_price, timestamp, side, sl, tp, atr, capital):
-        # Calculate position size based on stop loss distance
-        # We want: when price hits SL, loss = risk_pct * capital
-        sl_distance = abs(entry_price - sl)
-        sl_distance_pct = sl_distance / entry_price
-
-        # Max loss at stop = risk_pct * capital
-        max_loss = capital * self.risk_pct
-
-        # Position size: quantity = max_loss / sl_distance
-        # But capped by max_leverage
-        quantity_by_risk = max_loss / sl_distance if sl_distance > 0 else 0
-        notional_by_risk = quantity_by_risk * entry_price
-        max_notional = capital * self.max_leverage
-
-        # Take the smaller of risk-based and leverage-capped
-        notional = min(notional_by_risk, max_notional)
-        quantity = notional / entry_price
+        # Position size: risk_pct of capital per trade, capped by leverage.
+        # Uses the SAME formula as the live bot (utils.compute_position_size) —
+        # previously this file, live_testnet.py, and testnet_once.py each had
+        # their own inconsistent version of this calculation.
+        quantity = compute_position_size(
+            equity=capital, risk_pct=self.risk_pct,
+            stop_distance=abs(entry_price - sl),
+            entry_price=entry_price, leverage=self.max_leverage,
+        )
+        notional = quantity * entry_price
 
         # Entry slippage: assume market order
         slippage_cost = notional * self.slippage_rate
@@ -181,10 +157,11 @@ class Backtester:
         else:
             gross_pnl = (position['entry_price'] - exit_price) * quantity
 
-        # Funding cost: charged on borrowed amount (notional - margin)
+        # Funding cost: Binance charges funding on the FULL notional value of
+        # a perpetual position every interval, regardless of leverage used —
+        # leverage only affects margin/liquidation, not the funding calc.
         funding_periods = bars_held / self.funding_interval_bars
-        borrowed = notional * (1 - 1 / self.max_leverage)
-        funding_cost = borrowed * self.funding_rate * funding_periods
+        funding_cost = notional * self.funding_rate * funding_periods
 
         # Total costs
         total_commission = position['entry_commission'] + exit_commission
@@ -276,23 +253,23 @@ class Backtester:
 
                 if position['side'] == 'LONG':
                     if low <= position['stop_loss']:
-                        exit_price = position['stop_loss']
+                        exit_price = position['stop_loss'] * (1 - self.slippage_rate)
                         exit_reason = 'STOP_LOSS'
                     elif high >= position['take_profit']:
-                        exit_price = position['take_profit']
+                        exit_price = position['take_profit'] * (1 - self.slippage_rate)
                         exit_reason = 'TAKE_PROFIT'
                     elif signal == Signal.SELL:
-                        exit_price = close
+                        exit_price = close * (1 - self.slippage_rate)
                         exit_reason = 'SIGNAL_SELL'
                 else:
                     if high >= position['stop_loss']:
-                        exit_price = position['stop_loss']
+                        exit_price = position['stop_loss'] * (1 + self.slippage_rate)
                         exit_reason = 'STOP_LOSS'
                     elif low <= position['take_profit']:
-                        exit_price = position['take_profit']
+                        exit_price = position['take_profit'] * (1 + self.slippage_rate)
                         exit_reason = 'TAKE_PROFIT'
                     elif signal == Signal.BUY:
-                        exit_price = close
+                        exit_price = close * (1 + self.slippage_rate)
                         exit_reason = 'SIGNAL_BUY'
 
                 if exit_price is not None:
@@ -366,18 +343,18 @@ class Backtester:
 
                 if position['side'] == 'LONG':
                     if low <= position['stop_loss']:
-                        exit_price, exit_reason = position['stop_loss'], 'STOP_LOSS'
+                        exit_price, exit_reason = position['stop_loss'] * (1 - self.slippage_rate), 'STOP_LOSS'
                     elif high >= position['take_profit']:
-                        exit_price, exit_reason = position['take_profit'], 'TAKE_PROFIT'
+                        exit_price, exit_reason = position['take_profit'] * (1 - self.slippage_rate), 'TAKE_PROFIT'
                     elif signal == Signal.SELL:
-                        exit_price, exit_reason = close, 'SIGNAL_SELL'
+                        exit_price, exit_reason = close * (1 - self.slippage_rate), 'SIGNAL_SELL'
                 else:
                     if high >= position['stop_loss']:
-                        exit_price, exit_reason = position['stop_loss'], 'STOP_LOSS'
+                        exit_price, exit_reason = position['stop_loss'] * (1 + self.slippage_rate), 'STOP_LOSS'
                     elif low <= position['take_profit']:
-                        exit_price, exit_reason = position['take_profit'], 'TAKE_PROFIT'
+                        exit_price, exit_reason = position['take_profit'] * (1 + self.slippage_rate), 'TAKE_PROFIT'
                     elif signal == Signal.BUY:
-                        exit_price, exit_reason = close, 'SIGNAL_BUY'
+                        exit_price, exit_reason = close * (1 + self.slippage_rate), 'SIGNAL_BUY'
 
                 if exit_price is not None:
                     trade = self._close_position(position, exit_price, timestamp, exit_reason, bars_held)
@@ -448,18 +425,18 @@ class Backtester:
 
                 if position['side'] == 'LONG':
                     if low <= position['stop_loss']:
-                        exit_price, exit_reason = position['stop_loss'], 'STOP_LOSS'
+                        exit_price, exit_reason = position['stop_loss'] * (1 - self.slippage_rate), 'STOP_LOSS'
                     elif high >= position['take_profit']:
-                        exit_price, exit_reason = position['take_profit'], 'TAKE_PROFIT'
+                        exit_price, exit_reason = position['take_profit'] * (1 - self.slippage_rate), 'TAKE_PROFIT'
                     elif signal == Signal.SELL:
-                        exit_price, exit_reason = close, 'SIGNAL_SELL'
+                        exit_price, exit_reason = close * (1 - self.slippage_rate), 'SIGNAL_SELL'
                 else:
                     if high >= position['stop_loss']:
-                        exit_price, exit_reason = position['stop_loss'], 'STOP_LOSS'
+                        exit_price, exit_reason = position['stop_loss'] * (1 + self.slippage_rate), 'STOP_LOSS'
                     elif low <= position['take_profit']:
-                        exit_price, exit_reason = position['take_profit'], 'TAKE_PROFIT'
+                        exit_price, exit_reason = position['take_profit'] * (1 + self.slippage_rate), 'TAKE_PROFIT'
                     elif signal == Signal.BUY:
-                        exit_price, exit_reason = close, 'SIGNAL_BUY'
+                        exit_price, exit_reason = close * (1 + self.slippage_rate), 'SIGNAL_BUY'
 
                 if exit_price is not None:
                     trade = self._close_position(position, exit_price, timestamp, exit_reason, bars_held)
@@ -531,26 +508,26 @@ class Backtester:
 
                 if position['side'] == 'LONG':
                     if low <= position['stop_loss']:
-                        exit_price, exit_reason = position['stop_loss'], 'STOP_LOSS'
+                        exit_price, exit_reason = position['stop_loss'] * (1 - self.slippage_rate), 'STOP_LOSS'
                     elif high >= position['take_profit']:
-                        exit_price, exit_reason = position['take_profit'], 'TAKE_PROFIT'
+                        exit_price, exit_reason = position['take_profit'] * (1 - self.slippage_rate), 'TAKE_PROFIT'
                     elif signal == Signal.SELL:
-                        exit_price, exit_reason = close, 'SIGNAL_SELL'
+                        exit_price, exit_reason = close * (1 - self.slippage_rate), 'SIGNAL_SELL'
                     else:
                         trailing_stop_price = peak_price * (1 - params.trailing_stop_pct / 100)
                         if low < trailing_stop_price and peak_price > position['entry_price']:
-                            exit_price, exit_reason = trailing_stop_price, 'TRAILING_STOP'
+                            exit_price, exit_reason = trailing_stop_price * (1 - self.slippage_rate), 'TRAILING_STOP'
                 else:
                     if high >= position['stop_loss']:
-                        exit_price, exit_reason = position['stop_loss'], 'STOP_LOSS'
+                        exit_price, exit_reason = position['stop_loss'] * (1 + self.slippage_rate), 'STOP_LOSS'
                     elif low <= position['take_profit']:
-                        exit_price, exit_reason = position['take_profit'], 'TAKE_PROFIT'
+                        exit_price, exit_reason = position['take_profit'] * (1 + self.slippage_rate), 'TAKE_PROFIT'
                     elif signal == Signal.BUY:
-                        exit_price, exit_reason = close, 'SIGNAL_BUY'
+                        exit_price, exit_reason = close * (1 + self.slippage_rate), 'SIGNAL_BUY'
                     else:
                         trailing_stop_price = peak_price * (1 + params.trailing_stop_pct / 100)
                         if high > trailing_stop_price and peak_price < position['entry_price']:
-                            exit_price, exit_reason = trailing_stop_price, 'TRAILING_STOP'
+                            exit_price, exit_reason = trailing_stop_price * (1 + self.slippage_rate), 'TRAILING_STOP'
 
                 if exit_price is not None:
                     trade = self._close_position(position, exit_price, timestamp, exit_reason, bars_held)
