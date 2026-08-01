@@ -29,7 +29,7 @@ DEFAULT_CONFIG = {
     },
     'backtest': {
         'initial_capital': '100000',
-        'commission': '0.0004',
+        'commission': '0.00055',  # Bybit standard non-VIP USDT-perp taker fee
         'slippage': '0.0002',
         'leverage': '20',
         'risk_pct': '1.0',
@@ -92,7 +92,7 @@ class Config:
 
     @property
     def commission(self):
-        return self.getfloat('backtest', 'commission', 0.0004)
+        return self.getfloat('backtest', 'commission', 0.00055)
 
     @property
     def slippage(self):

@@ -439,6 +439,15 @@ def run_live(symbol='BTCUSDT', interval='1h', variant='basic',
         print("\n  ERROR: Set BYBIT_TESTNET_API_KEY and BYBIT_TESTNET_API_SECRET env vars")
         sys.exit(1)
 
+    if debug and not dry_run:
+        print("\n  ERROR: --debug cannot be combined with --live.")
+        print("  --debug ignores the strategy signal and force-opens alternating")
+        print("  positions every candle purely to test order placement/connectivity.")
+        print("  It must never be used to place real orders. Run --debug alone")
+        print("  (dry-run) to test connectivity, or --live alone to trade the")
+        print("  actual strategy signal.")
+        sys.exit(1)
+
     filters = get_symbol_filters(symbol, base_url)
     print(f"  Filters: step={10**-filters['step_size']}, tick={10**-filters['tick_size']}, "
           f"min_qty={filters['min_qty']}, min_notional={filters['min_notional']}")
@@ -494,115 +503,130 @@ def run_live(symbol='BTCUSDT', interval='1h', variant='basic',
     debug_side = [1]
 
     def on_tick(close):
-        """Process every price tick — check for BB crossover signals."""
-        nonlocal last_upper, last_lower, last_middle, last_bb_width
+        """Display-only. We deliberately do NOT evaluate the strategy here.
 
-        # Update BB with new close (rolling)
-        # For simplicity, we use the last known BB values
-        # BB is recalculated on candle close
-        bb_width = abs(last_upper - last_lower)
-        if bb_width <= 0:
-            return
-
-        if variant == 'rsi_filter':
-            signal = strategy.update(close, last_upper, last_middle, last_lower, rsi[-1])
-        elif variant in ('squeeze',):
-            bb_widths_arr = np.array([bb_width])  # simplified
-            signal = strategy.update(close, last_upper, last_middle, last_lower, bb_widths_arr, 0)
-        else:
-            signal = strategy.update(close, last_upper, last_middle, last_lower)
-
-        if signal == Signal.HOLD:
-            return
-
+        The backtester generates at most one signal per closed candle (using
+        that candle's final close). If we called strategy.update() on every
+        incoming tick, we'd mutate the strategy's internal crossover state
+        many times before the candle actually closes, so live signals would
+        react to intra-candle noise the backtest never saw — a real behaviour
+        mismatch between what was tested and what would trade live. All
+        decisions are made once per candle in on_candle_close() instead.
+        """
         now = time.time()
-        if now - last_signal_time[0] < 10:
+        if now - last_signal_time[0] < 30:
             return
-
-        pos = get_position(symbol, base_url)
-        has_position = pos['size'] != 0
+        last_signal_time[0] = now
         ts = datetime.now().strftime('%H:%M:%S')
-
-        if signal in (Signal.BUY, Signal.SELL) and not has_position:
-            direction = 1 if signal == Signal.BUY else -1
-            side_entry = 'Buy' if direction == 1 else 'Sell'
-            side_close = 'Sell' if direction == 1 else 'Buy'
-
-            entry_price = close
-            sl = entry_price - direction * bb_width * stop_loss_mult * 0.5
-            tp = entry_price + direction * bb_width * take_profit_mult * 0.5
-
-            balance = get_account_balance(base_url) if not dry_run else 100000
-            quantity = compute_quantity(balance, risk_pct, bb_width, entry_price, leverage, filters)
-
-            if quantity <= 0:
-                print(f"  [{ts}] {side_entry} SIGNAL rejected: qty=0")
-                return
-
-            notional = quantity * entry_price
-            print(f"\n  [{ts}] {side_entry} SIGNAL")
-            print(f"    Entry:     {entry_price:.2f}")
-            print(f"    SL:        {sl:.2f} ({abs(entry_price-sl)/entry_price*100:.2f}%)")
-            print(f"    TP:        {tp:.2f} ({abs(tp-entry_price)/entry_price*100:.2f}%)")
-            print(f"    Quantity:  {fmt_qty(quantity, filters['step_size'])}")
-            print(f"    Notional:  ${notional:.2f}")
-            print(f"    BB Width:  {bb_width:.2f}")
-
-            if not dry_run:
-                try:
-                    cancel_all_orders(symbol, base_url)
-                except Exception as e:
-                    print(f"    Cancel error: {e}")
-
-                try:
-                    order = place_market_order(symbol, side_entry, quantity,
-                                               filters['step_size'], base_url)
-                    fill_price = float(order.get('avgPrice', entry_price))
-                    if fill_price > 0:
-                        entry_price = fill_price
-                        sl = entry_price - direction * bb_width * stop_loss_mult * 0.5
-                        tp = entry_price + direction * bb_width * take_profit_mult * 0.5
-                        print(f"    Fill:      {fill_price:.2f}")
-                except Exception as e:
-                    print(f"    Entry ERROR: {e}")
-                    return
-
-                try:
-                    place_stop_loss(symbol, side_close, sl, quantity,
-                                    filters['tick_size'], filters['step_size'], base_url)
-                    print(f"    SL placed: {sl:.2f}")
-                except Exception as e:
-                    print(f"    SL ERROR: {e}")
-
-                try:
-                    place_take_profit(symbol, side_close, tp, quantity,
-                                      filters['tick_size'], filters['step_size'], base_url)
-                    print(f"    TP placed: {tp:.2f}")
-                except Exception as e:
-                    print(f"    TP ERROR: {e}")
-
-            last_signal_time[0] = time.time()
+        print(f"  [{ts}] price={close:.2f}", end='\r')
 
     def on_candle_close():
-        """Recalculate BB indicators on candle close. Force trade in debug mode."""
-        nonlocal last_upper, last_lower, last_middle, last_bb_width
+        """Recalculate indicators on the newly closed candle and evaluate
+        exactly one signal from it — this mirrors the backtester's bar-by-bar
+        loop (signal computed from bar i's close, using bands/RSI that include
+        bar i). Debug mode short-circuits into a forced alternating trade for
+        connectivity testing only, and never runs the real strategy signal."""
+        nonlocal last_upper, last_lower, last_middle, last_bb_width, last_close
 
         try:
             df_new = fetch_klines(symbol, interval, bb_timeperiod + 50, data_url)
-            if len(df_new) >= bb_timeperiod + 1:
-                closes_new = df_new['Close'].values
-                u, m, l = calculate_bollinger_bands(closes_new, bb_timeperiod, bb_nbdevup, bb_nbdevdn)
-                last_upper = u[-1]
-                last_middle = m[-1]
-                last_lower = l[-1]
-                last_bb_width = abs(last_upper - last_lower)
-        except Exception:
-            pass
-
-        if not debug:
+        except Exception as e:
+            print(f"  [WARN] fetch_klines failed: {e}")
+            return
+        if len(df_new) < bb_timeperiod + max(params.rsi_period, 1) + 1:
             return
 
-        # Debug mode: force open on every candle
+        closes_new = df_new['Close'].values
+        u, m, l = calculate_bollinger_bands(closes_new, bb_timeperiod, bb_nbdevup, bb_nbdevdn)
+        rsi_new = calculate_rsi(closes_new, params.rsi_period)
+        last_close = closes_new[-1]
+        last_upper, last_middle, last_lower = u[-1], m[-1], l[-1]
+        last_bb_width = abs(last_upper - last_lower)
+
+        if not debug:
+            if last_bb_width <= 0:
+                return
+
+            if variant == 'rsi_filter':
+                signal = strategy.update(last_close, last_upper, last_middle, last_lower, rsi_new[-1])
+            elif variant == 'squeeze':
+                bb_widths_full = (u - l) / np.where(m != 0, m, 1)
+                signal = strategy.update(last_close, last_upper, last_middle, last_lower,
+                                          bb_widths_full, len(bb_widths_full) - 1)
+            else:
+                signal = strategy.update(last_close, last_upper, last_middle, last_lower)
+
+            if signal == Signal.HOLD:
+                return
+
+            pos = get_position(symbol, base_url)
+            has_position = pos['size'] != 0
+            ts = datetime.now().strftime('%H:%M:%S')
+
+            if signal in (Signal.BUY, Signal.SELL) and not has_position:
+                direction = 1 if signal == Signal.BUY else -1
+                side_entry = 'Buy' if direction == 1 else 'Sell'
+                side_close = 'Sell' if direction == 1 else 'Buy'
+
+                entry_price = last_close
+                bb_width = last_bb_width
+                sl = entry_price - direction * bb_width * stop_loss_mult * 0.5
+                tp = entry_price + direction * bb_width * take_profit_mult * 0.5
+
+                balance = get_account_balance(base_url) if not dry_run else 100000
+                quantity = compute_quantity(balance, risk_pct, bb_width, entry_price, leverage, filters)
+
+                if quantity <= 0:
+                    print(f"  [{ts}] {side_entry} SIGNAL rejected: qty=0")
+                    return
+
+                notional = quantity * entry_price
+                print(f"\n  [{ts}] {side_entry} SIGNAL")
+                print(f"    Entry:     {entry_price:.2f}")
+                print(f"    SL:        {sl:.2f} ({abs(entry_price-sl)/entry_price*100:.2f}%)")
+                print(f"    TP:        {tp:.2f} ({abs(tp-entry_price)/entry_price*100:.2f}%)")
+                print(f"    Quantity:  {fmt_qty(quantity, filters['step_size'])}")
+                print(f"    Notional:  ${notional:.2f}")
+                print(f"    BB Width:  {bb_width:.2f}")
+
+                if not dry_run:
+                    try:
+                        cancel_all_orders(symbol, base_url)
+                    except Exception as e:
+                        print(f"    Cancel error: {e}")
+
+                    try:
+                        order = place_market_order(symbol, side_entry, quantity,
+                                                   filters['step_size'], base_url)
+                        fill_price = float(order.get('avgPrice', entry_price))
+                        if fill_price > 0:
+                            entry_price = fill_price
+                            sl = entry_price - direction * bb_width * stop_loss_mult * 0.5
+                            tp = entry_price + direction * bb_width * take_profit_mult * 0.5
+                            print(f"    Fill:      {fill_price:.2f}")
+                    except Exception as e:
+                        print(f"    Entry ERROR: {e}")
+                        return
+
+                    try:
+                        place_stop_loss(symbol, side_close, sl, quantity,
+                                        filters['tick_size'], filters['step_size'], base_url)
+                        print(f"    SL placed: {sl:.2f}")
+                    except Exception as e:
+                        print(f"    SL ERROR: {e}")
+
+                    try:
+                        place_take_profit(symbol, side_close, tp, quantity,
+                                          filters['tick_size'], filters['step_size'], base_url)
+                        print(f"    TP placed: {tp:.2f}")
+                    except Exception as e:
+                        print(f"    TP ERROR: {e}")
+
+            return
+
+        # Debug mode: force open on every candle (connectivity test only —
+        # ignores the strategy signal entirely; --live is blocked above, so
+        # this can only ever run against dry_run or testnet).
         pos = get_position(symbol, base_url)
         has_position = pos['size'] != 0
         close = last_close

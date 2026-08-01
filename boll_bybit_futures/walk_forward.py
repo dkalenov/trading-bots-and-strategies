@@ -101,7 +101,7 @@ def optimize_on_train(df_train: pd.DataFrame, strategy_variant: str,
         bt = Backtester(
             initial_capital=initial_capital,
             risk_pct=0.01,
-            commission_rate=0.0004,
+            commission_rate=0.00055,  # Bybit standard non-VIP taker fee
             slippage_rate=0.0002,
             funding_rate=0.0001,
             funding_interval_bars=8,
@@ -139,7 +139,7 @@ def run_single_window(df_train, df_test, strategy_variant, params, bars_per_year
     bt = Backtester(
         initial_capital=initial_capital,
         risk_pct=0.01,
-        commission_rate=0.0004,
+        commission_rate=0.00055,  # Bybit standard non-VIP taker fee
         slippage_rate=0.0002,
         funding_rate=0.0001,
         funding_interval_bars=8,
@@ -240,7 +240,7 @@ def walk_forward(symbol: str, interval: str, start_date: str, end_date: str,
         )
 
         default_bt = Backtester(
-            initial_capital=100000, risk_pct=0.01, commission_rate=0.0004,
+            initial_capital=100000, risk_pct=0.01, commission_rate=0.00055,  # Bybit standard non-VIP taker fee
             slippage_rate=0.0002, funding_rate=0.0001, funding_interval_bars=8,
             max_leverage=20, bars_per_year=bars_per_year,
         )

@@ -152,9 +152,11 @@ class Backtester:
         else:
             gross_pnl = (position['entry_price'] - exit_price) * quantity
 
+        # Funding is paid on the full position notional (not just the margin/
+        # "borrowed" part) — this matches how Bybit and other perpetual
+        # exchanges actually charge funding, regardless of leverage used.
         funding_periods = bars_held / self.funding_interval_bars
-        borrowed = notional * (1 - 1 / self.max_leverage)
-        funding_cost = borrowed * self.funding_rate * funding_periods
+        funding_cost = notional * self.funding_rate * funding_periods
 
         total_commission = position['entry_commission'] + exit_commission
         total_slippage = position['entry_slippage'] + exit_slippage
