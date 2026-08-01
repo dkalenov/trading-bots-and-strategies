@@ -106,6 +106,73 @@ def cancel_all_orders(symbol, base_url=TESTNET_BASE):
         pass
 
 
+def set_leverage(symbol, leverage, base_url=TESTNET_BASE):
+    """Actually apply the --leverage setting on Bybit. Previously this value
+    was only printed to the console and never sent to the exchange, so the
+    account kept whatever leverage was last set manually/by default."""
+    try:
+        bybit_request('POST', '/v5/position/set-leverage', {
+            'category': 'linear', 'symbol': symbol,
+            'buyLeverage': str(leverage), 'sellLeverage': str(leverage),
+        }, base_url)
+    except Exception as e:
+        # retCode 110043 = "leverage not modified" (already set) — harmless
+        if '110043' not in str(e):
+            print(f"  WARNING: could not set leverage: {e}")
+
+
+def set_trading_stop(symbol, stop_loss, take_profit, base_url=TESTNET_BASE):
+    """
+    Set exchange-side stop-loss / take-profit on the current position via
+    Bybit's /v5/position/trading-stop endpoint. This makes SL/TP a resting
+    order on Bybit's side — it fires even if this process crashes, loses its
+    WebSocket connection, or the REST poll is delayed. This is the piece that
+    was previously completely missing: the bot used to only close on the next
+    opposite pattern signal, with no protective stop at all.
+
+    positionIdx=0 assumes one-way mode (not hedge mode). If the account uses
+    hedge mode, positionIdx must be 1 (long) / 2 (short) instead.
+    """
+    return bybit_request('POST', '/v5/position/trading-stop', {
+        'category': 'linear', 'symbol': symbol,
+        'stopLoss': str(stop_loss), 'takeProfit': str(take_profit),
+        'tpslMode': 'Full', 'positionIdx': 0,
+    }, base_url)
+
+
+_instrument_cache = {}
+
+
+def get_instrument_info(symbol, base_url=MAINNET_BASE):
+    """Fetch and cache qty/price precision so orders and SL/TP aren't rejected
+    for violating the symbol's step size (previously qty was blindly
+    round()-ed to 3 decimals regardless of the actual instrument rules)."""
+    if symbol in _instrument_cache:
+        return _instrument_cache[symbol]
+    try:
+        result = bybit_request('GET', '/v5/market/instruments-info',
+                               {'category': 'linear', 'symbol': symbol}, base_url)
+        info = result.get('list', [{}])[0]
+        lot = info.get('lotSizeFilter', {})
+        price_filter = info.get('priceFilter', {})
+        data = {
+            'qty_step': float(lot.get('qtyStep', 0.001)),
+            'min_qty': float(lot.get('minOrderQty', 0.001)),
+            'tick_size': float(price_filter.get('tickSize', 0.1)),
+        }
+    except Exception as e:
+        print(f"  WARNING: could not fetch instrument info for {symbol}, using defaults: {e}")
+        data = {'qty_step': 0.001, 'min_qty': 0.001, 'tick_size': 0.1}
+    _instrument_cache[symbol] = data
+    return data
+
+
+def round_step(value, step):
+    if step <= 0:
+        return value
+    return round(round(value / step) * step, 10)
+
+
 def fetch_klines(symbol, interval, limit=200, base_url=MAINNET_BASE):
     bybit_interval = BYBIT_INTERVAL_MAP.get(interval, interval)
     result = bybit_request('GET', '/v5/market/kline', {
@@ -224,6 +291,9 @@ def run_live(symbol='BTCUSDT', interval='1h', sl_atr=2.0, tp_atr=4.0,
         print("\n  ERROR: Set BYBIT_TESTNET_API_KEY env var")
         sys.exit(1)
 
+    if not dry_run:
+        set_leverage(symbol, leverage, base_url)
+
     # Warmup
     warmup_limit = 250 if use_trend_filter else 100
     df = fetch_klines(symbol, interval, warmup_limit, base_url)
@@ -237,7 +307,6 @@ def run_live(symbol='BTCUSDT', interval='1h', sl_atr=2.0, tp_atr=4.0,
     last_atr = df['ATR'].iloc[-1] if 'ATR' in df.columns else 0
     print(f"  Warmup: {len(df)} bars, ATR={last_atr:.4f}")
 
-    last_signal = [0]
     last_atr_val = [last_atr]
 
     def on_tick(close):
@@ -273,20 +342,31 @@ def run_live(symbol='BTCUSDT', interval='1h', sl_atr=2.0, tp_atr=4.0,
                     # Alternate Buy/Sell
                     debug_side = 'Buy' if int(ts.split(':')[1]) % 2 == 0 else 'Sell'
                     atr = last_atr_val[0]
+                    inst = get_instrument_info(symbol, base_url)
                     entry_price = df_new['Close'].iloc[-1]
+                    if debug_side == 'Buy':
+                        stop_loss = entry_price - sl_atr * atr
+                        take_profit = entry_price + tp_atr * atr
+                    else:
+                        stop_loss = entry_price + sl_atr * atr
+                        take_profit = entry_price - tp_atr * atr
+                    stop_loss = round_step(stop_loss, inst['tick_size'])
+                    take_profit = round_step(take_profit, inst['tick_size'])
                     balance = get_balance(base_url) if not dry_run else 100000
                     sl_distance = sl_atr * atr
                     if sl_distance > 0:
                         risk_amount = balance * risk_pct
                         qty = risk_amount / sl_distance
-                        qty = round(qty, 3)
-                        if qty > 0:
-                            print(f"  [{ts}] [DEBUG] {debug_side} @ {entry_price:.2f} qty={qty} ATR={atr:.2f}")
+                        qty = round_step(qty, inst['qty_step'])
+                        if qty >= inst['min_qty']:
+                            print(f"  [{ts}] [DEBUG] {debug_side} @ {entry_price:.2f} qty={qty} "
+                                  f"SL={stop_loss:.2f} TP={take_profit:.2f} ATR={atr:.2f}")
                             if not dry_run:
                                 try:
                                     place_market_order(symbol, debug_side, qty, base_url)
+                                    set_trading_stop(symbol, stop_loss, take_profit, base_url)
                                 except Exception as e:
-                                    print(f"  [{ts}] Order error: {e}")
+                                    print(f"  [{ts}] Order/SL-TP error: {e}")
                     return
 
                 # Normal mode: only trade on signal
@@ -304,26 +384,40 @@ def run_live(symbol='BTCUSDT', interval='1h', sl_atr=2.0, tp_atr=4.0,
                         print(f"  [{ts}] Closed position")
 
                     atr = last_atr_val[0]
+                    inst = get_instrument_info(symbol, base_url)
                     if signal == 1:
                         side_entry = 'Buy'
                         entry_price = df_new['Close'].iloc[-1] * 1.0002
+                        stop_loss = entry_price - sl_atr * atr
+                        take_profit = entry_price + tp_atr * atr
                     else:
                         side_entry = 'Sell'
                         entry_price = df_new['Close'].iloc[-1] * 0.9998
+                        stop_loss = entry_price + sl_atr * atr
+                        take_profit = entry_price - tp_atr * atr
+                    stop_loss = round_step(stop_loss, inst['tick_size'])
+                    take_profit = round_step(take_profit, inst['tick_size'])
 
                     balance = get_balance(base_url) if not dry_run else 100000
                     sl_distance = sl_atr * atr
                     if sl_distance > 0:
                         risk_amount = balance * risk_pct
                         qty = risk_amount / sl_distance
-                        qty = round(qty, 3)
-                        if qty > 0:
-                            print(f"  [{ts}] {side_entry} @ {entry_price:.4f} qty={qty} ATR={atr:.4f}")
+                        qty = round_step(qty, inst['qty_step'])
+                        if qty >= inst['min_qty']:
+                            print(f"  [{ts}] {side_entry} @ {entry_price:.4f} qty={qty} "
+                                  f"SL={stop_loss:.4f} TP={take_profit:.4f} ATR={atr:.4f}")
                             if not dry_run:
                                 try:
                                     place_market_order(symbol, side_entry, qty, base_url)
+                                    # Register SL/TP on the exchange immediately after entry.
+                                    # This is the fix: previously nothing enforced SL/TP live —
+                                    # the position would only close on the next opposite signal.
+                                    set_trading_stop(symbol, stop_loss, take_profit, base_url)
                                 except Exception as e:
-                                    print(f"  [{ts}] Order error: {e}")
+                                    print(f"  [{ts}] Order/SL-TP error: {e}")
+                        else:
+                            print(f"  [{ts}] Skipped: qty {qty} below min_qty {inst['min_qty']}")
         except Exception as e:
             print(f"  Candle close error: {e}")
 

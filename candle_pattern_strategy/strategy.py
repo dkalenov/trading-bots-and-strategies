@@ -202,6 +202,11 @@ def detect_patterns(df, atr_period=14, doji_th=0.15,
         hammer, inverted_hammer, morning_star, evening_star,
         tws, tbc, harami_cross
     ]
+    # NOTE: harami_cross direction is intentionally 0 (non-directional). A harami
+    # cross is a reversal-context pattern whose bias depends on the preceding
+    # trend, which this function does not know. As coded, it is detected and
+    # labeled but NEVER produces a BUY/SELL signal (signal stays 0) or a trade.
+    # It is effectively diagnostic-only in the current implementation.
     pattern_directions = [1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 0]
 
     signal = pd.Series(0, index=df.index, dtype=int)
@@ -246,8 +251,12 @@ def apply_filters(df, ema_fast=50, ema_slow=200, min_strength=0.0,
     df = df.copy()
 
     # EMA trend filter
-    df['EMA_fast'] = df['Close'].ewm(span=ema_fast).mean()
-    df['EMA_slow'] = df['Close'].ewm(span=ema_slow).mean()
+    # adjust=False uses the standard recursive EMA formula (matches TradingView /
+    # exchange charts). pandas' default (adjust=True) weights early bars
+    # differently and can diverge by ~0.3% of price for several hundred bars
+    # after warmup, which is enough to occasionally flip the trend classification.
+    df['EMA_fast'] = df['Close'].ewm(span=ema_fast, adjust=False).mean()
+    df['EMA_slow'] = df['Close'].ewm(span=ema_slow, adjust=False).mean()
 
     # Only trade with trend
     bull_trend = (df['Close'] > df['EMA_fast']) & (df['EMA_fast'] > df['EMA_slow'])

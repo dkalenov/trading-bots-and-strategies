@@ -115,17 +115,28 @@ def download_klines(symbol, interval, start_date, end_date, klines_dir='klines')
 
 class Backtester:
     def __init__(self, initial_capital=10000, risk_pct=0.01,
-                 leverage=20, commission=0.0004, slippage=0.0002):
+                 leverage=10, commission=0.00055, slippage=0.0002,
+                 funding_rate_per_8h=0.0001):
+        """
+        commission: 0.00055 = Bybit's standard (non-VIP) USDT-perpetual taker
+            fee as of 2026. Orders here are always market orders (taker).
+        funding_rate_per_8h: approximate perpetual funding cost charged every
+            8h while a position is held. 0.0001 = 0.01%/8h is a commonly-cited
+            "neutral" average for BTCUSDT — NOT real historical funding data
+            (which this environment can't fetch). Treat funding_cost in the
+            trade stats as a rough order-of-magnitude estimate, not ground truth.
+        """
         self.initial_capital = initial_capital
         self.risk_pct = risk_pct
         self.leverage = leverage
         self.commission = commission
         self.slippage = slippage
+        self.funding_rate_per_8h = funding_rate_per_8h
 
     def run(self, df, sl_atr=2.0, tp_atr=4.0, min_strength=1.3,
             atr_period=14, min_body_atr=0.15,
             use_trend_filter=True, ema_fast=50, ema_slow=200,
-            min_atr_pct=0.3, patterns_only=None):
+            min_atr_pct=0.3, patterns_only=None, next_bar_entry=True):
         """
         Run backtest with pattern signals and optional filters.
 
@@ -141,6 +152,14 @@ class Backtester:
             ema_slow: Slow EMA period
             min_atr_pct: Min ATR as % of price
             patterns_only: List of pattern names to keep (None = all)
+            next_bar_entry: If True (default, realistic), a signal detected on
+                bar i's CLOSE is executed at bar i+1's OPEN — you can only act
+                on a candle once it has fully closed, so the earliest price
+                you could actually transact at is the next bar's open, not
+                the just-printed close of the signal bar. If False, entry
+                happens at bar i's own close (the old behavior) — an
+                optimistic zero-latency assumption kept here only so the two
+                can be compared directly.
         """
         # Detect patterns
         df = detect_patterns(df, atr_period=atr_period, min_body_atr=min_body_atr)
@@ -161,8 +180,10 @@ class Backtester:
         equity = [capital]
 
         warmup = max(ema_slow + 5 if use_trend_filter else atr_period + 2, 5)
+        pending_entry = None  # (direction, atr, pattern) queued from the previous bar's close
 
         for i in range(warmup, len(df)):
+            open_ = float(df['Open'].iloc[i])
             close = float(df['Close'].iloc[i])
             high = float(df['High'].iloc[i])
             low = float(df['Low'].iloc[i])
@@ -170,8 +191,46 @@ class Backtester:
             strength = float(df['Signal_strength'].iloc[i])
             atr = float(df['ATR'].iloc[i])
             timestamp = df.index[i]
+            pattern_i = str(df['Pattern'].iloc[i])
 
-            # Check exit
+            # Execute a signal queued from the PREVIOUS bar's close, filled at
+            # THIS bar's open — the earliest price actually available once you
+            # know the previous candle's pattern/ATR for certain.
+            if next_bar_entry and position is None and pending_entry is not None and capital > 100:
+                p_dir, p_atr, p_pattern = pending_entry
+                if p_dir == 1:
+                    entry_price = open_ * (1 + self.slippage)
+                    sl = entry_price - sl_atr * p_atr
+                    tp = entry_price + tp_atr * p_atr
+                    side = 'LONG'
+                else:
+                    entry_price = open_ * (1 - self.slippage)
+                    sl = entry_price + sl_atr * p_atr
+                    tp = entry_price - tp_atr * p_atr
+                    side = 'SHORT'
+
+                sl_distance = abs(entry_price - sl)
+                if sl_distance > 0:
+                    max_loss = capital * self.risk_pct
+                    quantity = max_loss / sl_distance
+                    notional = quantity * entry_price
+                    max_notional = capital * self.leverage
+                    if notional > max_notional:
+                        quantity = max_notional / entry_price
+                        notional = max_notional
+                    if notional >= 5:
+                        position = {
+                            'side': side, 'entry_price': entry_price, 'entry_time': timestamp,
+                            'entry_bar': i, 'stop_loss': sl, 'take_profit': tp,
+                            'quantity': quantity, 'notional': notional,
+                            'entry_commission': notional * self.commission,
+                            'pattern': p_pattern,
+                        }
+            pending_entry = None
+
+            # Check exit (covers a position that already existed, AND one
+            # just opened above this same bar — both can validly hit SL/TP
+            # against this bar's high/low, since entry happened at the open)
             if position is not None:
                 exit_price = None
                 exit_reason = ''
@@ -200,7 +259,12 @@ class Backtester:
 
                     exit_commission = notional * self.commission
                     exit_slippage = notional * self.slippage
-                    net_pnl = gross_pnl - position['entry_commission'] - exit_commission - exit_slippage
+
+                    hours_held = (timestamp - position['entry_time']).total_seconds() / 3600
+                    funding_periods = int(hours_held // 8)
+                    funding_cost = notional * self.funding_rate_per_8h * funding_periods
+
+                    net_pnl = gross_pnl - position['entry_commission'] - exit_commission - exit_slippage - funding_cost
 
                     trades.append({
                         'entry_time': position['entry_time'],
@@ -209,6 +273,7 @@ class Backtester:
                         'entry_price': position['entry_price'],
                         'exit_price': exit_price,
                         'pnl': net_pnl,
+                        'funding_cost': funding_cost,
                         'exit_reason': exit_reason,
                         'pattern': position['pattern'],
                         'bars_held': i - position['entry_bar'],
@@ -216,8 +281,12 @@ class Backtester:
                     capital += net_pnl
                     position = None
 
-            # Check entry
-            if position is None and signal != 0 and capital > 100:
+            # Signal handling: queue for next bar's open (realistic), or fill
+            # immediately at this bar's own close (old, optimistic behavior)
+            if next_bar_entry:
+                if position is None and signal != 0:
+                    pending_entry = (signal, atr, pattern_i)
+            elif position is None and signal != 0 and capital > 100:
                 if signal == 1:
                     entry_price = close * (1 + self.slippage)
                     sl = entry_price - sl_atr * atr
@@ -230,36 +299,28 @@ class Backtester:
                     side = 'SHORT'
 
                 sl_distance = abs(entry_price - sl)
-                if sl_distance <= 0:
-                    equity.append(capital)
-                    continue
+                if sl_distance > 0:
+                    max_loss = capital * self.risk_pct
+                    quantity = max_loss / sl_distance
+                    notional = quantity * entry_price
+                    max_notional = capital * self.leverage
+                    if notional > max_notional:
+                        quantity = max_notional / entry_price
+                        notional = max_notional
 
-                max_loss = capital * self.risk_pct
-                quantity = max_loss / sl_distance
-                notional = quantity * entry_price
-                max_notional = capital * self.leverage
-                if notional > max_notional:
-                    quantity = max_notional / entry_price
-                    notional = max_notional
-
-                if notional < 5:
-                    equity.append(capital)
-                    continue
-
-                entry_commission = notional * self.commission
-
-                position = {
-                    'side': side,
-                    'entry_price': entry_price,
-                    'entry_time': timestamp,
-                    'entry_bar': i,
-                    'stop_loss': sl,
-                    'take_profit': tp,
-                    'quantity': quantity,
-                    'notional': notional,
-                    'entry_commission': entry_commission,
-                    'pattern': str(df['Pattern'].iloc[i]),
-                }
+                    if notional >= 5:
+                        position = {
+                            'side': side,
+                            'entry_price': entry_price,
+                            'entry_time': timestamp,
+                            'entry_bar': i,
+                            'stop_loss': sl,
+                            'take_profit': tp,
+                            'quantity': quantity,
+                            'notional': notional,
+                            'entry_commission': notional * self.commission,
+                            'pattern': pattern_i,
+                        }
 
             # Track equity
             unrealized = 0
@@ -285,7 +346,10 @@ class Backtester:
                 gross_pnl = (exit_price - position['entry_price']) * position['quantity']
             else:
                 gross_pnl = (position['entry_price'] - exit_price) * position['quantity']
-            net_pnl = gross_pnl - position['entry_commission'] - position['notional'] * self.commission - position['notional'] * self.slippage
+            hours_held = (df.index[-1] - position['entry_time']).total_seconds() / 3600
+            funding_periods = int(hours_held // 8)
+            funding_cost = position['notional'] * self.funding_rate_per_8h * funding_periods
+            net_pnl = gross_pnl - position['entry_commission'] - position['notional'] * self.commission - position['notional'] * self.slippage - funding_cost
             trades.append({
                 'entry_time': position['entry_time'],
                 'exit_time': df.index[-1],
@@ -293,6 +357,7 @@ class Backtester:
                 'entry_price': position['entry_price'],
                 'exit_price': exit_price,
                 'pnl': net_pnl,
+                'funding_cost': funding_cost,
                 'exit_reason': 'END_OF_DATA',
                 'pattern': position['pattern'],
                 'bars_held': len(df) - 1 - position['entry_bar'],
@@ -324,6 +389,7 @@ class Backtester:
         total_win = sum(t['pnl'] for t in winners)
         total_loss = abs(sum(t['pnl'] for t in losers))
         stats['profit_factor'] = total_win / total_loss if total_loss > 0 else float('inf')
+        stats['total_funding_cost'] = sum(t.get('funding_cost', 0) for t in trades)
 
         # Sharpe
         returns = np.diff(equity) / np.array(equity[:-1])
@@ -360,6 +426,8 @@ def print_stats(stats):
     print(f"  Winning:          {stats.get('winning_trades', 0)}")
     print(f"  Losing:           {stats.get('losing_trades', 0)}")
     print(f"  Profit Factor:    {stats['profit_factor']:.2f}")
+    if 'total_funding_cost' in stats:
+        print(f"  Est. Funding Cost:-${stats['total_funding_cost']:,.2f}  (approx., not real history)")
     if 'pattern_breakdown' in stats:
         print(f"\n  Pattern Breakdown:")
         for pat, count in stats['pattern_breakdown'].items():
@@ -383,10 +451,14 @@ if __name__ == '__main__':
     parser.add_argument('--tp-atr', type=float, default=4.0, help='TP = N x ATR')
     parser.add_argument('--min-strength', type=float, default=1.3)
     parser.add_argument('--capital', type=float, default=10000)
+    parser.add_argument('--leverage', type=int, default=10, help='Max leverage cap (rarely binds — position size is risk-based)')
+    parser.add_argument('--commission', type=float, default=0.00055, help='Taker fee, default = Bybit standard rate')
     parser.add_argument('--no-trend-filter', action='store_true', help='Disable EMA trend filter')
     parser.add_argument('--patterns-only', nargs='+', default=None,
                         help='Only trade these patterns (e.g. three_white_soldiers morning_star)')
     parser.add_argument('--baseline', action='store_true', help='Run without filters (baseline)')
+    parser.add_argument('--old-entry-timing', action='store_true',
+                        help='Fill at the signal bar\'s own close instead of the next bar\'s open (old, optimistic behavior — kept for comparison)')
 
     args = parser.parse_args()
 
@@ -396,15 +468,19 @@ if __name__ == '__main__':
 
     if args.baseline:
         # Baseline: no filters
-        bt = Backtester(initial_capital=args.capital, risk_pct=0.01, leverage=20)
+        bt = Backtester(initial_capital=args.capital, risk_pct=0.01,
+                        leverage=args.leverage, commission=args.commission)
         stats, trades = bt.run(df, sl_atr=0.75, tp_atr=0.75, min_strength=0.0,
-                               use_trend_filter=False, min_atr_pct=0)
+                               use_trend_filter=False, min_atr_pct=0,
+                               next_bar_entry=not args.old_entry_timing)
         print_stats(stats)
     else:
         # Default: optimized config
-        bt = Backtester(initial_capital=args.capital, risk_pct=0.01, leverage=20)
+        bt = Backtester(initial_capital=args.capital, risk_pct=0.01,
+                        leverage=args.leverage, commission=args.commission)
         stats, trades = bt.run(df, sl_atr=args.sl_atr, tp_atr=args.tp_atr,
                                min_strength=args.min_strength,
                                use_trend_filter=not args.no_trend_filter,
-                               patterns_only=args.patterns_only)
+                               patterns_only=args.patterns_only,
+                               next_bar_entry=not args.old_entry_timing)
         print_stats(stats)
