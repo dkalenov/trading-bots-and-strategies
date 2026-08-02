@@ -122,3 +122,38 @@ def load_or_download(
     df.to_csv(csv_path, index=False)
     print(f"[data_loader] saved {len(df)} rows -> {csv_path}")
     return df
+
+
+def load_multi_symbol_csv(path: str) -> pd.DataFrame:
+    """
+    Load a single combined CSV holding many symbols at once — columns
+    Date, Open, High, Low, Close, Volume, Symbol (case-insensitive,
+    any column order). Returns one DataFrame normalized to this
+    project's schema (date, open, high, low, close, volume, symbol),
+    with 'date' parsed to UTC-aware timestamps and rows sorted
+    chronologically within each symbol.
+
+    Use this for bulk historical exports you already have on disk,
+    as an alternative to load_or_download's one-symbol-at-a-time
+    Binance download.
+    """
+    df = pd.read_csv(path)
+    df.columns = [c.strip().lower() for c in df.columns]
+
+    required = {"date", "open", "high", "low", "close", "volume", "symbol"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(
+            f"{path}: missing required column(s) {sorted(missing)}. "
+            f"Found columns: {list(df.columns)}"
+        )
+
+    df["date"] = pd.to_datetime(df["date"], utc=True)
+    df = df.sort_values(["symbol", "date"]).reset_index(drop=True)
+    return df
+
+
+def iter_symbols(df: pd.DataFrame):
+    """Yield (symbol, sub_dataframe) pairs from a load_multi_symbol_csv() result."""
+    for symbol, sub in df.groupby("symbol", sort=True):
+        yield symbol, sub.drop(columns=["symbol"]).reset_index(drop=True)

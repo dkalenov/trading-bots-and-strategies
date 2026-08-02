@@ -109,7 +109,8 @@ curve and `pnl` column reflect.
 | `src/indicators.py` | ATR (used for the `atr` stop mode) |
 | `src/backtest.py` | Backtest engine: execution, stop-loss/take-profit, position sizing, metrics |
 | `src/plotting.py` | Price chart with entries/exits, equity curve chart |
-| `run_backtest.py` | CLI: runs the whole pipeline end-to-end |
+| `run_backtest.py` | CLI: runs the whole pipeline end-to-end for one symbol |
+| `run_multi_backtest.py` | CLI: same pipeline across many symbols, with an aggregated comparison report |
 | `examples/quickstart.ipynb` | Minimal notebook walkthrough |
 
 ## Quick start
@@ -135,6 +136,72 @@ This will:
   take-profit, ◆ = closed on an opposite signal).
 
 Run `python run_backtest.py --help` for all options.
+
+## Testing across many symbols (recommended before trusting any result)
+
+A strategy that only looks good on one hand-picked symbol is much more
+likely to be overfit or lucky than one that holds up broadly. Run it
+across many pairs at once and look at the *distribution* of outcomes,
+not just your favorite one:
+
+```bash
+python run_multi_backtest.py \
+    --symbols BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,LINKUSDT \
+    --interval 1h --start 2024-11 --end 2025-02 \
+    --risk-per-trade 0.01 --stop-mode structure --reward-risk 2.0 --max-leverage 1.0
+```
+
+This runs the full pipeline independently per symbol (own trade log,
+own charts, own starting capital — **not** a combined portfolio) and
+writes, under `output_batch/`:
+
+- `<SYMBOL>/trades.csv`, `<SYMBOL>/price_signals.png`, `<SYMBOL>/equity_curve.png` per symbol
+- `summary.csv` — every metric for every symbol, one row each
+- `SUMMARY.md` — the same thing as a readable markdown table, plus
+  median return/drawdown across symbols and a note on how many symbols
+  ended up profitable
+
+Symbols with no signals in the date range, or that fail to download,
+are skipped and listed separately rather than breaking the run.
+
+**Already have bulk historical data on disk?** Skip downloading
+entirely with `--input-csv`, pointing at one combined CSV with columns
+`date, open, high, low, close, volume, symbol` (case-insensitive, any
+order):
+
+```bash
+python run_multi_backtest.py \
+    --input-csv my_bulk_klines.csv --interval 4h \
+    --risk-per-trade 0.01 --stop-mode structure --reward-risk 2.0
+```
+
+With `--input-csv` and no `--symbols`, every symbol found in the file
+is used — this is how `results/` in this repo was produced (328
+symbols from one bulk export). Use `--symbols` to restrict to a list,
+or `--max-symbols N` to just cap how many are processed. With many
+symbols, only the top/bottom `--plot-top-n` (default 5) by return get
+charts — set it to `0` to chart everyone, or `--no-plot` to skip charts
+entirely and just get the tables (much faster for a first pass over
+hundreds of symbols).
+
+Run `python run_multi_backtest.py --help` for all options.
+
+## Example: real results across 328 symbols
+
+`results/2024-05_2025-10_4h_328symbols/` in this repo is exactly this
+pipeline run on a real bulk 4h export (328 Binance USDT-margined pairs,
+2024-05 to 2025-10, ~1.4 years) with `--risk-per-trade 0.01
+--stop-mode structure --reward-risk 2.0 --max-leverage 1.0`. Open
+`SUMMARY.md` there for the full picture — headline numbers:
+
+- 180 / 328 symbols (54.9%) finished with positive return over the period
+- median return **+1.39%**, mean **+3.45%** — i.e. modestly positive but
+  with a long tail: a handful of symbols drove much of the average
+- median max drawdown **-12.3%**, ranging from -4% to -30% depending on symbol
+- this is one 1.4-year sample on one strategy variant — not a
+  guarantee, and not evidence the parameters here are optimal for any
+  specific symbol going forward. Re-run on your own date ranges and
+  parameter choices before drawing conclusions.
 
 ## Using your own data
 
