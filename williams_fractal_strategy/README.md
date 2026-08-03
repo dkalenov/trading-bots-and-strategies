@@ -203,6 +203,16 @@ pipeline run on a real bulk 4h export (328 Binance USDT-margined pairs,
   specific symbol going forward. Re-run on your own date ranges and
   parameter choices before drawing conclusions.
 
+**Want to try it on a bigger universe without downloading it yourself?**
+A cleaned 4h klines export, 331 symbols, 2024–2025, is shared here:
+[Google Drive — 4h klines 2024-2025, cleaned, 331 symbols](https://drive.google.com/file/d/1n9ptYNeIDsDIHdpSHU0jZA0SDe0o55BR/view?usp=sharing).
+Download it and point `run_multi_backtest.py` at it with `--input-csv`
+(see "Testing across many symbols" above). This is a third-party link,
+not hosted or verified by this repo — sanity-check the data yourself
+(row counts, date ranges, no gaps) before trusting results from it,
+the same way this project's own README tells you to sanity-check any
+data source.
+
 ## Using your own data
 
 Any CSV with `date, open, high, low, close, volume` columns works:
