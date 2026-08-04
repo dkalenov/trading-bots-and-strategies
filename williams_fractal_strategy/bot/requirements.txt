@@ -1,0 +1,5 @@
+# Additional dependencies for the live/testnet bot (bot/), on top of
+# the root requirements.txt (numpy, pandas, matplotlib, requests) which
+# the bot also needs for signal generation (../src).
+aiohttp>=3.9
+websockets>=12.0
