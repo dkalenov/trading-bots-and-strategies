@@ -1,14 +1,14 @@
-# Live bot — Williams Fractal breakout on Binance USDT-M Futures
+# Live bot - Williams Fractal breakout on Binance USDT-M Futures
 
 A live/testnet trading bot for the fractal breakout strategy in
-`../src` — same signal logic, same stop/take-profit parameters as
+`../src` - same signal logic, same stop/take-profit parameters as
 `../run_backtest.py`, wired to a real (or simulated) exchange via
 WebSocket market data and a REST order-placement gateway.
 
 > **Disclaimer:** Educational project. Not financial advice. Futures
 > trading with leverage carries a high risk of loss, including total
-> and rapid loss of capital. Verify everything on testnet — repeatedly,
-> under different conditions — before ever pointing this at a funded
+> and rapid loss of capital. Verify everything on testnet - repeatedly,
+> under different conditions - before ever pointing this at a funded
 > live account. Telegram/notifications are deliberately not included
 > here; add your own if you want them.
 
@@ -16,18 +16,18 @@ WebSocket market data and a REST order-placement gateway.
 
 The module names below deliberately follow the same top-level naming
 you'd recognize from a larger production bot (`main` / `db` /
-`config` / `risk` / `gateway` / ...) — but this project only includes
+`config` / `risk` / `gateway` / ...) - but this project only includes
 what a single-strategy bot actually needs to trade for real. No
 multi-strategy registry, no PostgreSQL server to run, no notification
-system, no health-check subsystem — clone it and it runs.
+system, no health-check subsystem - clone it and it runs.
 
 | File | Purpose |
 |---|---|
 | `main.py` | Entry point + orchestration: signal → size → entry → protection → fill handling → reconciliation |
-| `config.py` | Settings from environment / `.env` — one `EXECUTION_MODE` flag (`dry_run` / `testnet` / `live`) fully determines which endpoints are used |
-| `db.py` | **SQLite**, not PostgreSQL — zero setup, single file, still gives you real persistence and a trade history table |
+| `config.py` | Settings from environment / `.env` - one `EXECUTION_MODE` flag (`dry_run` / `testnet` / `live`) fully determines which endpoints are used |
+| `db.py` | **SQLite**, not PostgreSQL - zero setup, single file, still gives you real persistence and a trade history table |
 | `models.py` | Shared dataclasses (`PositionState`, `SizingResult`, `TradeRecord`) |
-| `strategy.py` | Turns a bar window into a signal — imports `../src/fractals.py` unchanged |
+| `strategy.py` | Turns a bar window into a signal - imports `../src/fractals.py` unchanged |
 | `risk.py` | Stop/take-profit price + risk-based position sizing (mirrors `../src/backtest.py`) |
 | `gateway.py` | Real Binance USDT-M Futures REST client (signed requests) |
 | `dry_run_gateway.py` | In-memory simulated exchange — same method surface as `gateway.py`, no network |
@@ -44,7 +44,7 @@ system, no health-check subsystem — clone it and it runs.
    kline event — a still-forming candle is never acted on).
 2. `main.py` calls `strategy.check_signal()`, which runs
    `../src/fractals.generate_signals()` over the rolling window and
-   reads the signal on the newest bar — the exact same function the
+   reads the signal on the newest bar - the exact same function the
    backtest uses.
 3. If there's a signal and no open position for that symbol (checked
    in `db.py`), `risk.compute_sizing()` resolves the stop price
@@ -61,7 +61,7 @@ system, no health-check subsystem — clone it and it runs.
    triggers; `main.py` records the closed trade in `db.py`'s history
    table, clears the open position, and cancels the sibling order.
 6. Every `POLL_RECONCILE_SECONDS`, `main.py` re-checks the exchange's
-   actual position against `db.py` and fixes drift — this is what
+   actual position against `db.py` and fixes drift - this is what
    saves you if the bot was offline when a stop filled.
 
 ## Quick start
@@ -72,7 +72,7 @@ pip install -r ../requirements.txt -r requirements.txt
 cp .env.example .env
 ```
 
-### Step 1 — no network at all
+### Step 1 - no network at all
 
 ```bash
 EXECUTION_MODE=dry_run python3 scripts/verify_live_pipeline.py
@@ -83,10 +83,10 @@ signal → sizing → order-placement code: checks that a stop-loss lands
 below entry and a take-profit lands above it (for a LONG), that sizing
 respects the exchange's min_qty/min_notional, that a simulated fill
 correctly closes the position, and that the closed trade lands in the
-SQLite trade history. No API keys, no internet — if this fails,
+SQLite trade history. No API keys, no internet - if this fails,
 nothing downstream will work either.
 
-### Step 2 — real testnet smoke test
+### Step 2 - real testnet smoke test
 
 Edit `.env`:
 ```
