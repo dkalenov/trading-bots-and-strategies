@@ -137,13 +137,13 @@ python3 -c "from db import Database; d = Database('bot.db'); [print(r) for r in 
 ## What could not be verified from this environment
 
 This was built and tested in a sandbox with no network access to
-Binance at all (confirmed directly — Binance's API domains return
+Binance at all (confirmed directly - Binance's API domains return
 connection failures through the egress proxy here). Everything that
 can be verified without a live exchange connection has been: signal
 generation, sizing math (min_qty/min_notional bump, stepSize
 rounding), order-placement call shape (stop below/take above entry
 for LONG, and the mirror for SHORT), fill-event handling, and SQLite
-trade-history recording — all exercised end to end through
+trade-history recording - all exercised end to end through
 `scripts/verify_live_pipeline.py` against the in-memory simulator.
 
 What that script *cannot* verify: actual Binance testnet connectivity,
