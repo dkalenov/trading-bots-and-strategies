@@ -122,7 +122,7 @@ automatically on disconnect.
 
 ## Configuration
 
-All settings are environment variables — see `.env.example` for the
+All settings are environment variables - see `.env.example` for the
 full list with defaults. The risk/stop/take-profit parameters
 (`RISK_PER_TRADE`, `STOP_MODE`, `REWARD_RISK_RATIO`, `MAX_LEVERAGE`,
 ...) share names and meaning with `../run_backtest.py`'s CLI flags —
