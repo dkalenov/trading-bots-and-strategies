@@ -1,9 +1,9 @@
 """
 In-memory simulated exchange client — same async method surface as
-gateway.Gateway (new_order, cancel_order, open_orders,
-change_leverage, position_risk, listen key methods, ...), so the bot
-engine can use either one interchangeably without an if/else anywhere
-in the trading logic itself.
+gateway.Gateway (new_order, new_algo_order, cancel_order, open_orders,
+open_algo_orders, cancel_algo_order, change_leverage, position_risk,
+listen key methods, ...), so the bot engine can use either one
+interchangeably without an if/else anywhere in the trading logic itself.
 
 Used for EXECUTION_MODE=dry_run: no network access at all, which is
 also exactly what makes it possible to verify the bot's order-
@@ -24,9 +24,11 @@ class SimOrder:
     order_id: int
     symbol: str
     side: str            # BUY | SELL
-    type: str             # MARKET | STOP_MARKET | TAKE_PROFIT_MARKET
+    type: str             # MARKET | LIMIT | STOP_MARKET | TAKE_PROFIT_MARKET
     stop_price: Decimal | None
     close_position: bool
+    reduce_only: bool = False
+    quantity: Decimal | None = None
     status: str = "NEW"   # NEW | FILLED | CANCELED
 
 
@@ -74,23 +76,31 @@ class DryRunGateway:
         for oid, o in list(self._open_orders.get(symbol, {}).items()):
             if o.status != "NEW" or o.stop_price is None:
                 continue
-            triggered = (
-                (o.type == "STOP_MARKET" and (
+            is_close = o.close_position or o.reduce_only
+            triggered = False
+            if o.type == "STOP_MARKET" and is_close:
+                triggered = (
                     (pos.direction == 1 and price <= o.stop_price) or
                     (pos.direction == -1 and price >= o.stop_price)
-                )) or
-                (o.type == "TAKE_PROFIT_MARKET" and (
+                )
+            elif o.type == "TAKE_PROFIT_MARKET" and is_close:
+                triggered = (
                     (pos.direction == 1 and price >= o.stop_price) or
                     (pos.direction == -1 and price <= o.stop_price)
-                ))
-            )
+                )
+            elif o.type == "LIMIT" and is_close:
+                triggered = (
+                    (pos.direction == 1 and price >= o.stop_price) or
+                    (pos.direction == -1 and price <= o.stop_price)
+                )
             if triggered:
                 o.status = "FILLED"
                 self._open_orders[symbol].pop(oid, None)
                 for other_id, other in list(self._open_orders.get(symbol, {}).items()):
                     other.status = "CANCELED"
                 self._open_orders[symbol] = {}
-                pnl = (price - pos.entry_price) * pos.quantity * pos.direction
+                close_qty = o.quantity if o.quantity and o.quantity > 0 else pos.quantity
+                pnl = (price - pos.entry_price) * close_qty * pos.direction
                 self._balance += pnl
                 self._positions[symbol] = SimPosition(symbol, 0, Decimal("0"), Decimal("0"))
                 events.append({
@@ -135,6 +145,24 @@ class DryRunGateway:
         return out
 
     async def new_order(self, **params) -> dict:
+        result = self._place_sim_order(**params)
+        return {"orderId": result["orderId"], "symbol": result["symbol"],
+                "side": result["side"], "type": result["type"],
+                "status": result["status"], "stopPrice": result.get("stopPrice", ""),
+                "closePosition": "true" if result.get("close_position") else "false",
+                "reduceOnly": "true" if result.get("reduce_only") else "false"}
+
+    async def new_algo_order(self, **params) -> dict:
+        result = self._place_sim_order(**params)
+        return {"algoId": result["orderId"], "symbol": result["symbol"],
+                "side": result["side"], "type": result["type"],
+                "algoType": "CONDITIONAL", "status": result["status"],
+                "stopPrice": result.get("stopPrice", ""), "triggerPrice": result.get("stopPrice", ""),
+                "quantity": params.get("quantity", ""), "reduceOnly": "true",
+                "workingType": params.get("workingType", "CONTRACT_PRICE"),
+                "positionSide": params.get("positionSide", "BOTH")}
+
+    def _place_sim_order(self, **params) -> dict:
         symbol = params["symbol"]
         side = params["side"]
         order_type = params["type"]
@@ -157,14 +185,17 @@ class DryRunGateway:
                 "status": "FILLED", "avgPrice": str(price), "executedQty": str(qty),
             }
 
-        # STOP_MARKET / TAKE_PROFIT_MARKET — resting, closePosition style
-        stop_price = Decimal(str(params["stopPrice"]))
+        stop_price = Decimal(str(params.get("stopPrice") or params.get("triggerPrice") or params.get("price", "0")))
+        close_position = params.get("closePosition") == "true"
+        reduce_only = params.get("reduceOnly") == "true"
+        qty = Decimal(str(params.get("quantity", "0")))
+        is_algo = params.get("algoType") == "CONDITIONAL"
         order = SimOrder(
             order_id=oid, symbol=symbol, side=side, type=order_type,
-            stop_price=stop_price, close_position=params.get("closePosition") == "true",
+            stop_price=stop_price, close_position=close_position,
+            reduce_only=reduce_only or is_algo, quantity=qty if qty > 0 else None,
         )
         self._open_orders.setdefault(symbol, {})[oid] = order
-        # immediately check in case the trigger condition is already true
         self._check_triggers(symbol)
         return {"orderId": oid, "symbol": symbol, "side": side, "type": order_type,
                 "status": "NEW", "stopPrice": str(stop_price)}
@@ -191,8 +222,18 @@ class DryRunGateway:
                         "orderId": o.order_id, "symbol": o.symbol, "side": o.side,
                         "type": o.type, "stopPrice": str(o.stop_price), "status": o.status,
                         "closePosition": "true" if o.close_position else "false",
+                        "reduceOnly": "true" if o.reduce_only else "false",
                     })
         return out
+
+    async def open_algo_orders(self, symbol: str | None = None) -> list[dict]:
+        return await self.open_orders(symbol)
+
+    async def cancel_algo_order(self, symbol: str, algo_id: int) -> dict:
+        o = self._open_orders.get(symbol, {}).pop(algo_id, None)
+        if o:
+            o.status = "CANCELED"
+        return {"symbol": symbol, "algoId": algo_id, "status": "CANCELED"}
 
     async def start_listen_key(self) -> str:
         return "dryrun-listen-key"
@@ -202,3 +243,12 @@ class DryRunGateway:
 
     async def close_listen_key(self) -> None:
         return None
+
+    async def wait_for_order_fill(self, symbol: str, order_id: int, timeout: float = 30.0) -> dict:
+        o = self._open_orders.get(symbol, {}).get(order_id)
+        if o and o.status == "FILLED":
+            return {"orderId": order_id, "status": "FILLED", "avgPrice": str(self._prices.get(symbol, "0"))}
+        for oid, o in list(self._open_orders.get(symbol, {}).items()):
+            if o.status == "FILLED":
+                return {"orderId": oid, "status": "FILLED", "avgPrice": str(self._prices.get(symbol, "0"))}
+        return {"orderId": order_id, "status": "FILLED", "avgPrice": str(self._prices.get(symbol, "0"))}

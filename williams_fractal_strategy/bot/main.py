@@ -180,26 +180,32 @@ class Bot:
         entry = await self.gateway.new_order(
             symbol=symbol, side=side, type="MARKET", quantity=str(sizing.quantity),
         )
-        fill_price = entry.get("avgPrice") or entry.get("price")
+        filled = await self.gateway.wait_for_order_fill(symbol, entry["orderId"], timeout=30.0)
+        fill_price = filled.get("avgPrice") or filled.get("price") or entry.get("avgPrice") or entry.get("price")
         logger.info("ENTRY filled: %s %s qty=%s price=%s orderId=%s",
                     symbol, side, sizing.quantity, fill_price, entry.get("orderId"))
 
-        stop_order = await self.gateway.new_order(
+        stop_algo = await self.gateway.new_algo_order(
             symbol=symbol, side=close_side, type="STOP_MARKET",
-            stopPrice=str(sizing.stop_price), closePosition="true", workingType="MARK_PRICE",
+            algoType="CONDITIONAL", triggerPrice=str(sizing.stop_price),
+            quantity=str(sizing.quantity),
+            workingType="MARK_PRICE", positionSide="BOTH",
         )
-        take_order = await self.gateway.new_order(
+        take_algo = await self.gateway.new_algo_order(
             symbol=symbol, side=close_side, type="TAKE_PROFIT_MARKET",
-            stopPrice=str(sizing.take_price), closePosition="true", workingType="MARK_PRICE",
+            algoType="CONDITIONAL", triggerPrice=str(sizing.take_price),
+            quantity=str(sizing.quantity),
+            workingType="MARK_PRICE", positionSide="BOTH",
         )
-        logger.info("PROTECTION placed: %s stop@%s (orderId=%s) take@%s (orderId=%s)",
-                    symbol, sizing.stop_price, stop_order.get("orderId"),
-                    sizing.take_price, take_order.get("orderId"))
+        logger.info("PROTECTION placed: %s stop@%s (algoId=%s) take@%s (algoId=%s)",
+                    symbol, sizing.stop_price, stop_algo.get("algoId"),
+                    sizing.take_price, take_algo.get("algoId"))
 
         self.db.set_position(PositionState(
             symbol=symbol, direction=direction,
             entry_price=str(fill_price or sizing.stop_price), quantity=str(sizing.quantity),
-            stop_order_id=stop_order.get("orderId"), take_order_id=take_order.get("orderId"),
+            stop_order_id=None, take_order_id=None,
+            stop_algo_id=stop_algo.get("algoId"), take_algo_id=take_algo.get("algoId"),
             opened_at=str(int(time.time())),
         ))
 
@@ -219,21 +225,38 @@ class Bot:
         if state is None:
             return
 
-        if order_type in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
-            realized = o.get("rp", "0")
-            exit_price = o.get("ap") or o.get("L") or state.entry_price
-            logger.info("PROTECTION FILLED: %s %s realizedPnl=%s — position closed",
-                        symbol, order_type, realized)
-            self.db.record_trade(TradeRecord(
-                symbol=symbol, direction=state.direction, entry_price=state.entry_price,
-                exit_price=str(exit_price), quantity=state.quantity, pnl=str(realized),
-                exit_reason=order_type, opened_at=state.opened_at, closed_at=str(int(time.time())),
-            ))
-            try:
-                await self.gateway.cancel_all_open_orders(symbol)
-            except Exception:
-                logger.debug("cancel_all_open_orders after protection fill failed (likely already flat)")
-            self.db.clear_position(symbol)
+        if order_type not in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
+            return
+
+        filled_order_id = str(o.get("i", ""))
+        filled_algo_id = str(o.get("ai", ""))
+        is_known_order = (
+            filled_order_id in (str(state.stop_order_id), str(state.take_order_id)) or
+            filled_algo_id in (str(state.stop_algo_id), str(state.take_algo_id))
+        )
+        if not is_known_order and (filled_order_id or filled_algo_id):
+            return
+
+        realized = o.get("rp", "0")
+        exit_price = o.get("ap") or o.get("L") or state.entry_price
+        logger.info("PROTECTION FILLED: %s %s realizedPnl=%s — position closed",
+                    symbol, order_type, realized)
+        self.db.record_trade(TradeRecord(
+            symbol=symbol, direction=state.direction, entry_price=state.entry_price,
+            exit_price=str(exit_price), quantity=state.quantity, pnl=str(realized),
+            exit_reason=order_type, opened_at=state.opened_at, closed_at=str(int(time.time())),
+        ))
+        try:
+            await self.gateway.cancel_all_open_orders(symbol)
+        except Exception:
+            logger.debug("cancel_all_open_orders after protection fill failed (likely already flat)")
+        try:
+            for algo_id in (state.stop_algo_id, state.take_algo_id):
+                if algo_id:
+                    await self.gateway.cancel_algo_order(symbol, algo_id)
+        except Exception:
+            logger.debug("cancel_algo_order after protection fill failed (likely already flat)")
+        self.db.clear_position(symbol)
 
     # --------------------------------------------------------- reconciliation
 

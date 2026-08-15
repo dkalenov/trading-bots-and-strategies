@@ -15,6 +15,8 @@ class PositionState:
     quantity: str
     stop_order_id: int | None = None
     take_order_id: int | None = None
+    stop_algo_id: int | None = None
+    take_algo_id: int | None = None
     opened_at: str = ""
 
 

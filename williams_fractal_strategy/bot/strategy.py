@@ -17,7 +17,7 @@ import sys
 from dataclasses import dataclass
 from decimal import Decimal
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 import pandas as pd  # noqa: E402
 from fractals import generate_signals  # noqa: E402

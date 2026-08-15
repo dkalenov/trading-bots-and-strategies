@@ -124,6 +124,26 @@ class Gateway:
     async def new_order(self, **params) -> dict:
         return await self._request("POST", "/fapi/v1/order", signed=True, params=params)
 
+    async def get_order(self, symbol: str, order_id: int) -> dict:
+        return await self._request(
+            "GET", "/fapi/v1/order", signed=True, params={"symbol": symbol, "orderId": order_id}
+        )
+
+    async def wait_for_order_fill(self, symbol: str, order_id: int, timeout: float = 30.0) -> dict:
+        import asyncio
+        deadline = asyncio.get_event_loop().time() + timeout
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                o = await self.get_order(symbol, order_id)
+                if o.get("status") == "FILLED":
+                    return o
+                if o.get("status") in ("CANCELED", "EXPIRED", "REJECTED"):
+                    raise BinanceAPIError(400, None, f"order {order_id} {o.get('status')}")
+            except Exception:
+                raise
+            await asyncio.sleep(0.5)
+        raise BinanceAPIError(408, None, f"order {order_id} fill timeout after {timeout}s")
+
     async def cancel_order(self, symbol: str, order_id: int) -> dict:
         return await self._request(
             "DELETE", "/fapi/v1/order", signed=True, params={"symbol": symbol, "orderId": order_id}
@@ -141,14 +161,31 @@ class Gateway:
     async def all_positions(self) -> list[dict]:
         return await self._request("GET", "/fapi/v2/positionRisk", signed=True)
 
+    # ---- algo orders (Binance migrated STOP_MARKET / TAKE_PROFIT_MARKET
+    #      to /fapi/v1/algoOrder on 2025-12-09) ----
+
+    async def new_algo_order(self, **params) -> dict:
+        return await self._request("POST", "/fapi/v1/algoOrder", signed=True, params=params)
+
+    async def open_algo_orders(self, symbol: str | None = None) -> list[dict]:
+        params = {"symbol": symbol} if symbol else {}
+        data = await self._request("GET", "/fapi/v1/openAlgoOrders", signed=True, params=params)
+        return data.get("orders", []) if isinstance(data, dict) else (data or [])
+
+    async def cancel_algo_order(self, symbol: str, algo_id: int) -> dict:
+        return await self._request(
+            "DELETE", "/fapi/v1/algoOrder", signed=True,
+            params={"symbol": symbol, "algoId": algo_id},
+        )
+
     # ---- user data stream ----
 
     async def start_listen_key(self) -> str:
-        data = await self._request("POST", "/fapi/v1/listenKey", signed=False)
+        data = await self._request("POST", "/fapi/v1/listenKey", signed=True)
         return data["listenKey"]
 
     async def keepalive_listen_key(self) -> None:
-        await self._request("PUT", "/fapi/v1/listenKey", signed=False)
+        await self._request("PUT", "/fapi/v1/listenKey", signed=True)
 
     async def close_listen_key(self) -> None:
-        await self._request("DELETE", "/fapi/v1/listenKey", signed=False)
+        await self._request("DELETE", "/fapi/v1/listenKey", signed=True)

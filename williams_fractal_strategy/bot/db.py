@@ -35,6 +35,8 @@ CREATE TABLE IF NOT EXISTS positions (
     quantity TEXT NOT NULL,
     stop_order_id INTEGER,
     take_order_id INTEGER,
+    stop_algo_id INTEGER,
+    take_algo_id INTEGER,
     opened_at TEXT NOT NULL
 );
 
@@ -60,6 +62,16 @@ class Database:
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
+        self._migrate()
+
+    def _migrate(self) -> None:
+        cur = self._conn.execute("PRAGMA table_info(positions)")
+        cols = {row[1] for row in cur.fetchall()}
+        if "stop_algo_id" not in cols:
+            self._conn.execute("ALTER TABLE positions ADD COLUMN stop_algo_id INTEGER")
+        if "take_algo_id" not in cols:
+            self._conn.execute("ALTER TABLE positions ADD COLUMN take_algo_id INTEGER")
+        self._conn.commit()
 
     def close(self) -> None:
         self._conn.close()
@@ -73,20 +85,24 @@ class Database:
         return PositionState(
             symbol=row["symbol"], direction=row["direction"], entry_price=row["entry_price"],
             quantity=row["quantity"], stop_order_id=row["stop_order_id"],
-            take_order_id=row["take_order_id"], opened_at=row["opened_at"],
+            take_order_id=row["take_order_id"],
+            stop_algo_id=row["stop_algo_id"], take_algo_id=row["take_algo_id"],
+            opened_at=row["opened_at"],
         )
 
     def set_position(self, p: PositionState) -> None:
         self._conn.execute(
             """INSERT INTO positions (symbol, direction, entry_price, quantity, stop_order_id,
-                                       take_order_id, opened_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)
+                                       take_order_id, stop_algo_id, take_algo_id, opened_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(symbol) DO UPDATE SET
                  direction=excluded.direction, entry_price=excluded.entry_price,
                  quantity=excluded.quantity, stop_order_id=excluded.stop_order_id,
-                 take_order_id=excluded.take_order_id, opened_at=excluded.opened_at""",
+                 take_order_id=excluded.take_order_id,
+                 stop_algo_id=excluded.stop_algo_id, take_algo_id=excluded.take_algo_id,
+                 opened_at=excluded.opened_at""",
             (p.symbol, p.direction, p.entry_price, p.quantity, p.stop_order_id,
-             p.take_order_id, p.opened_at),
+             p.take_order_id, p.stop_algo_id, p.take_algo_id, p.opened_at),
         )
         self._conn.commit()
 
