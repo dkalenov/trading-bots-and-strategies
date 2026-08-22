@@ -1,0 +1,16 @@
+{
+  "total_trades": 21814,
+  "win_rate_pct": 14.98,
+  "profit_factor": 0.985,
+  "total_pnl_usd": -42.58,
+  "return_on_notional_pct": -0.02,
+  "start_capital_usd": 10000.0,
+  "final_equity_usd": 9957.42,
+  "return_on_start_capital_pct": -0.426,
+  "max_drawdown_pct": -7.2,
+  "profitable_symbols": 162,
+  "total_symbols_traded": 328,
+  "period_start": "2025-03-02 00:00:00+00:00",
+  "period_end": "2025-09-21 00:00:00+00:00",
+  "open_positions_unresolved_at_end": 14
+}
